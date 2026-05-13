@@ -1,0 +1,11 @@
+[package]
+name = "hardware_accel_tester"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+bytemuck = { version = "1.25", features = ["derive"] }
+eframe = { version = "0.34.2", default-features = true }
+pollster = "0.4"
+wgpu = "29.0.3"
