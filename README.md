@@ -2,7 +2,7 @@
 
 Native desktop tool for comparing CPU matrix multiplication against GPU compute.
 
-The primary implementation is now Rust + `wgpu` + `egui`. The earlier Python Direct3D prototype remains in `hardware_accel_tester.py` as a fallback/reference implementation.
+The primary implementation is now Rust + `wgpu` + `egui`. The earlier Python Direct3D prototype remains archived in `archive/hardware_accel_tester.py` as a fallback/reference implementation.
 
 ## Run
 
