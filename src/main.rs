@@ -2,7 +2,7 @@ use std::{
     fmt,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
@@ -25,8 +25,8 @@ const CPU_ESTIMATE_BASE_SAMPLE_SIZE: usize = 512;
 const CPU_ESTIMATE_MID_SAMPLE_SIZE: usize = 768;
 const CPU_ESTIMATE_MAX_SAMPLE_SIZE: usize = 1024;
 const VALIDATION_SAMPLE_POINTS: usize = 256;
-const GPU_CANCELABLE_CHUNK_ROWS: usize = 64;
-const GPU_BLOCKED_ROW_TARGET: usize = 128;
+const GPU_CANCELABLE_CHUNK_ROWS: usize = 512;
+const GPU_BLOCKED_ROW_TARGET: usize = 4096;
 const GPU_BLOCKED_COL_TARGET: usize = 4096;
 const GPU_WAIT_POLL_MS: u64 = 1;
 const FORCE_BLOCKED_GPU_ENV: &str = "HARDWARE_ACCEL_TEST_FORCE_BLOCKED_GPU";
@@ -350,6 +350,11 @@ struct GpuTiming {
     output: Vec<f32>,
 }
 
+struct BlockGpuTiming {
+    compute_ms: Option<f64>,
+    output: Vec<f32>,
+}
+
 struct SingleProgressTracker {
     tx: Option<Sender<WorkerEvent>>,
     started: Instant,
@@ -390,6 +395,49 @@ impl SingleProgressTracker {
         self.emit(force);
     }
 
+    fn start_cpu_ticker(
+        &mut self,
+        completed_blocks: Arc<AtomicUsize>,
+        total_blocks: usize,
+    ) -> Option<ProgressTicker> {
+        let tx = self.tx.clone()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let started = self.started;
+        let gpu_estimate_s = self.gpu_estimate_s;
+        let gpu_progress = self.gpu_progress;
+        let total_blocks = total_blocks.max(1);
+        let handle = thread::spawn(move || {
+            while !worker_stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(PROGRESS_SAMPLE_MS));
+                if worker_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let cpu_progress = (completed_blocks.load(Ordering::Relaxed) as f32
+                    / total_blocks as f32)
+                    .clamp(0.0, 1.0);
+                let elapsed_s = started.elapsed().as_secs_f64();
+                let eta_s = if cpu_progress > 0.001 && cpu_progress < 1.0 {
+                    let cpu_total_estimate = elapsed_s / cpu_progress as f64;
+                    Some((cpu_total_estimate - elapsed_s).max(0.0) + gpu_estimate_s)
+                } else {
+                    Some(gpu_estimate_s)
+                };
+                let _ = tx.send(WorkerEvent::SingleProgress(SingleProgress {
+                    cpu_progress,
+                    gpu_progress,
+                    elapsed_s,
+                    eta_s,
+                    phase: "CPU computing".to_owned(),
+                }));
+            }
+        });
+        Some(ProgressTicker {
+            stop,
+            handle: Some(handle),
+        })
+    }
+
     fn emit(&mut self, force: bool) {
         let now = Instant::now();
         if !force && now.duration_since(self.last_emit) < Duration::from_millis(PROGRESS_SAMPLE_MS)
@@ -418,10 +466,40 @@ impl SingleProgressTracker {
                 Some(self.gpu_estimate_s)
             }
         } else if self.gpu_progress < 1.0 {
-            self.gpu_started
-                .map(|started| (self.gpu_estimate_s - started.elapsed().as_secs_f64()).max(0.0))
+            self.gpu_started.map(|started| {
+                let elapsed = started.elapsed().as_secs_f64();
+                if self.gpu_progress > 0.001 {
+                    let estimated_total = elapsed / self.gpu_progress as f64;
+                    (estimated_total - elapsed).max(0.0)
+                } else {
+                    self.gpu_estimate_s
+                }
+            })
         } else {
             None
+        }
+    }
+}
+
+struct ProgressTicker {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl ProgressTicker {
+    fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for ProgressTicker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
         }
     }
 }
@@ -561,7 +639,7 @@ impl GpuRunner {
             .ok_or_else(|| anyhow!("matrix byte length overflow"))?
             as wgpu::BufferAddress;
         if self.needs_blocked_path(byte_len) {
-            return self.multiply_blocked(n, n_u32, a, b, cancel, progress);
+            return self.multiply_blocked(n, n_u32, a, b, use_timestamps, cancel, progress);
         }
 
         let total_start = Instant::now();
@@ -769,6 +847,7 @@ impl GpuRunner {
         n_u32: u32,
         a: &[f32],
         b: &[f32],
+        use_timestamps: bool,
         cancel: Option<&AtomicBool>,
         mut progress: Option<&mut SingleProgressTracker>,
     ) -> Result<GpuTiming> {
@@ -785,6 +864,9 @@ impl GpuRunner {
             .unwrap_or(usize::MAX)
             .max(1);
         let mut completed_blocks = 0usize;
+        let timestamp_enabled = self.timestamp_query && use_timestamps;
+        let mut total_compute_ms = 0.0;
+        let mut compute_block_count = 0usize;
 
         if let Some(progress) = progress.as_deref_mut() {
             progress.gpu_started = Some(Instant::now());
@@ -804,7 +886,19 @@ impl GpuRunner {
                 self.check_gpu_canceled(cancel)?;
                 let rows = (n - row_offset).min(row_block);
                 let a_block = pack_row_block(a, n, row_offset, rows, cancel)?;
-                let c_block = self.multiply_block(n_u32, rows, cols, &a_block, &b_block, cancel)?;
+                let block = self.multiply_block(
+                    n_u32,
+                    rows,
+                    cols,
+                    &a_block,
+                    &b_block,
+                    timestamp_enabled,
+                    cancel,
+                )?;
+                if let Some(compute_ms) = block.compute_ms {
+                    total_compute_ms += compute_ms;
+                    compute_block_count += 1;
+                }
 
                 for row in 0..rows {
                     if row % 8 == 0 {
@@ -813,7 +907,7 @@ impl GpuRunner {
                     let output_start = (row_offset + row) * n + col_offset;
                     let block_start = row * cols;
                     output[output_start..output_start + cols]
-                        .copy_from_slice(&c_block[block_start..block_start + cols]);
+                        .copy_from_slice(&block.output[block_start..block_start + cols]);
                 }
                 completed_blocks += 1;
                 if let Some(progress) = progress.as_deref_mut() {
@@ -826,10 +920,12 @@ impl GpuRunner {
             progress.set_gpu_progress(1.0, true);
         }
 
+        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+        let compute_ms = (compute_block_count > 0).then_some(total_compute_ms);
         Ok(GpuTiming {
-            compute_ms: None,
-            total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
-            transfer_sync_ms: None,
+            compute_ms,
+            total_ms,
+            transfer_sync_ms: compute_ms.map(|ms| (total_ms - ms).max(0.0)),
             output,
         })
     }
@@ -841,8 +937,9 @@ impl GpuRunner {
         cols: usize,
         a_block: &[f32],
         b_block: &[f32],
+        use_timestamps: bool,
         cancel: Option<&AtomicBool>,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<BlockGpuTiming> {
         let rows_u32 = u32::try_from(rows).context("row block exceeds GPU shader limits")?;
         let cols_u32 = u32::try_from(cols).context("column block exceeds GPU shader limits")?;
         let a_bytes = buffer_len_bytes(a_block.len())?;
@@ -918,15 +1015,48 @@ impl GpuRunner {
             ],
         });
 
+        let timestamp_enabled = self.timestamp_query && use_timestamps;
+        let query_set = timestamp_enabled.then(|| {
+            self.device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("Blocked GPU compute timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: 2,
+            })
+        });
+        let timestamp_resolve = timestamp_enabled.then(|| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Blocked timestamp resolve"),
+                size: 16,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        });
+        let timestamp_readback = timestamp_enabled.then(|| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Blocked timestamp readback"),
+                size: 16,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        });
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Blocked matrix multiplication encoder"),
             });
         {
+            let timestamp_writes =
+                query_set
+                    .as_ref()
+                    .map(|query_set| wgpu::ComputePassTimestampWrites {
+                        query_set,
+                        beginning_of_pass_write_index: Some(0),
+                        end_of_pass_write_index: Some(1),
+                    });
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Blocked matrix multiplication pass"),
-                timestamp_writes: None,
+                timestamp_writes,
             });
             pass.set_pipeline(&self.blocked_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
@@ -936,12 +1066,31 @@ impl GpuRunner {
                 1,
             );
         }
+        if let (Some(query_set), Some(resolve), Some(readback)) =
+            (&query_set, &timestamp_resolve, &timestamp_readback)
+        {
+            encoder.resolve_query_set(query_set, 0..2, resolve, 0);
+            encoder.copy_buffer_to_buffer(resolve, 0, readback, 0, 16);
+        }
         encoder.copy_buffer_to_buffer(&c_buffer, 0, &readback_buffer, 0, c_bytes);
 
         let submission = self.queue.submit([encoder.finish()]);
         self.wait_for_submission(submission, cancel, "waiting for blocked GPU matrix chunk")?;
-        read_f32_buffer_cancelable(&self.device, &readback_buffer, c_elements, cancel)
-            .context("reading blocked GPU result buffer")
+        let output = read_f32_buffer_cancelable(&self.device, &readback_buffer, c_elements, cancel)
+            .context("reading blocked GPU result buffer")?;
+        let compute_ms = if let Some(readback) = &timestamp_readback {
+            read_timestamps(&self.device, readback, 1, cancel)
+                .ok()
+                .and_then(|timestamps| timestamps.into_iter().next())
+                .map(|[start, end]| {
+                    let delta = end.saturating_sub(start);
+                    (delta as f64 * self.queue.get_timestamp_period() as f64) / 1_000_000.0
+                })
+        } else {
+            None
+        };
+
+        Ok(BlockGpuTiming { compute_ms, output })
     }
 
     fn needs_blocked_path(&self, matrix_byte_len: u64) -> bool {
@@ -1057,8 +1206,6 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
 fn gpu_dispatch_chunk_rows(size: usize) -> usize {
     if size <= 1024 {
         size.max(1)
-    } else if size <= 2048 {
-        64
     } else {
         GPU_CANCELABLE_CHUNK_ROWS.min(size).max(1)
     }
@@ -1375,48 +1522,86 @@ fn cpu_multiply_cancelable(
     let mut c = vec![0.0_f32; size * size];
     let tile = 32usize;
     let blocks_per_dim = size.div_ceil(tile);
-    let total_blocks = (blocks_per_dim * blocks_per_dim * blocks_per_dim).max(1) as f32;
-    let mut completed_blocks = 0usize;
+    let total_blocks = (blocks_per_dim * blocks_per_dim * blocks_per_dim).max(1);
+    let completed_blocks = Arc::new(AtomicUsize::new(0));
     let start = Instant::now();
 
     if let Some(progress) = progress.as_deref_mut() {
         progress.set_phase("CPU computing", true);
         progress.set_cpu_progress(0.0, true);
     }
+    let ticker = progress.as_deref_mut().and_then(|progress| {
+        progress.start_cpu_ticker(Arc::clone(&completed_blocks), total_blocks)
+    });
 
-    for ii in (0..size).step_by(tile) {
-        check_canceled(cancel)?;
-        let i_end = (ii + tile).min(size);
-        for kk in (0..size).step_by(tile) {
-            check_canceled(cancel)?;
-            let k_end = (kk + tile).min(size);
-            for jj in (0..size).step_by(tile) {
-                check_canceled(cancel)?;
-                let j_end = (jj + tile).min(size);
-                for i in ii..i_end {
-                    let c_row = i * size;
-                    let a_row = i * size;
-                    for k in kk..k_end {
-                        let a_val = a[a_row + k];
-                        let b_row = k * size;
-                        for j in jj..j_end {
-                            c[c_row + j] += a_val * b[b_row + j];
+    let worker_count = cpu_worker_count(size);
+    let rows_per_worker = size.div_ceil(worker_count);
+    let result = thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::new();
+        for (worker_index, c_rows) in c.chunks_mut(rows_per_worker * size).enumerate() {
+            let row_start = worker_index * rows_per_worker;
+            let row_end = row_start + c_rows.len() / size;
+            let completed_blocks = Arc::clone(&completed_blocks);
+            handles.push(scope.spawn(move || -> Result<()> {
+                for ii in (row_start..row_end).step_by(tile) {
+                    check_canceled(cancel)?;
+                    let i_end = (ii + tile).min(row_end);
+                    for kk in (0..size).step_by(tile) {
+                        check_canceled(cancel)?;
+                        let k_end = (kk + tile).min(size);
+                        for jj in (0..size).step_by(tile) {
+                            check_canceled(cancel)?;
+                            let j_end = (jj + tile).min(size);
+                            for i in ii..i_end {
+                                let c_row = (i - row_start) * size;
+                                let a_row = i * size;
+                                for k in kk..k_end {
+                                    let a_val = a[a_row + k];
+                                    let b_row = k * size;
+                                    for j in jj..j_end {
+                                        c_rows[c_row + j] += a_val * b[b_row + j];
+                                    }
+                                }
+                            }
+                            completed_blocks.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
-                completed_blocks += 1;
-                if let Some(progress) = progress.as_deref_mut() {
-                    progress.set_cpu_progress(completed_blocks as f32 / total_blocks, false);
-                }
-            }
+                Ok(())
+            }));
         }
+
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| anyhow!("CPU worker thread panicked"))??;
+        }
+        Ok(())
+    });
+
+    if let Some(ticker) = ticker {
+        ticker.stop();
     }
+    result?;
 
     if let Some(progress) = progress.as_deref_mut() {
         progress.set_cpu_progress(1.0, true);
     }
 
     Ok((c, start.elapsed().as_secs_f64() * 1000.0))
+}
+
+fn cpu_worker_count(size: usize) -> usize {
+    if size < 256 {
+        return 1;
+    }
+
+    thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .saturating_sub(1)
+        .max(1)
+        .min(size)
 }
 
 fn estimate_cpu_multiply_ms(
@@ -2894,8 +3079,46 @@ mod tests {
     #[test]
     fn gpu_chunking_is_adaptive() {
         assert_eq!(gpu_dispatch_chunk_rows(128), 128);
-        assert_eq!(gpu_dispatch_chunk_rows(2048), 64);
+        assert_eq!(gpu_dispatch_chunk_rows(2048), GPU_CANCELABLE_CHUNK_ROWS);
         assert_eq!(gpu_dispatch_chunk_rows(4096), GPU_CANCELABLE_CHUNK_ROWS);
+    }
+
+    #[test]
+    fn cpu_worker_count_leaves_room_for_system() {
+        assert_eq!(cpu_worker_count(64), 1);
+        let available = thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        assert!(cpu_worker_count(4096) <= available);
+        if available > 1 {
+            assert!(cpu_worker_count(4096) < available);
+        }
+    }
+
+    #[test]
+    fn gpu_eta_uses_real_progress_after_gpu_starts() {
+        let adapter = AdapterInfo {
+            index: 0,
+            name: "Test GPU".to_owned(),
+            backend: wgpu::Backend::Dx12,
+            device_type: wgpu::DeviceType::DiscreteGpu,
+            vendor: 0,
+            device: 0,
+            driver: String::new(),
+            timestamp_query: true,
+            dedicated_vram_bytes: None,
+            dedicated_system_memory_bytes: None,
+            shared_system_memory_bytes: None,
+        };
+        let mut tracker = SingleProgressTracker::new(8192, &adapter, None);
+        tracker.cpu_progress = 1.0;
+        tracker.gpu_progress = 0.25;
+        tracker.gpu_estimate_s = 0.1;
+        tracker.gpu_started = Some(Instant::now() - Duration::from_secs(4));
+
+        let eta = tracker.eta_s().unwrap();
+
+        assert!((11.5..=12.5).contains(&eta));
     }
 
     #[test]
