@@ -26,7 +26,10 @@ const CPU_ESTIMATE_MID_SAMPLE_SIZE: usize = 768;
 const CPU_ESTIMATE_MAX_SAMPLE_SIZE: usize = 1024;
 const VALIDATION_SAMPLE_POINTS: usize = 256;
 const GPU_CANCELABLE_CHUNK_ROWS: usize = 16;
+const GPU_BLOCKED_ROW_TARGET: usize = 16;
+const GPU_BLOCKED_COL_TARGET: usize = 1024;
 const GPU_WAIT_POLL_MS: u64 = 1;
+const FORCE_BLOCKED_GPU_ENV: &str = "HARDWARE_ACCEL_TEST_FORCE_BLOCKED_GPU";
 
 const MATMUL_SHADER: &str = r#"
 const TILE: u32 = 16u;
@@ -93,6 +96,70 @@ fn main(
 }
 "#;
 
+const BLOCKED_MATMUL_SHADER: &str = r#"
+const TILE: u32 = 16u;
+
+struct BlockParams {
+    n: u32,
+    rows: u32,
+    cols: u32,
+    _pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
+@group(0) @binding(3) var<uniform> params: BlockParams;
+
+var<workgroup> tile_a: array<array<f32, 16>, 16>;
+var<workgroup> tile_b: array<array<f32, 16>, 16>;
+
+@compute @workgroup_size(16, 16, 1)
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>
+) {
+    let row = gid.y;
+    let col = gid.x;
+    var sum = 0.0;
+
+    var tile = 0u;
+    loop {
+        if (tile >= params.n) {
+            break;
+        }
+
+        let a_col = tile + lid.x;
+        let b_row = tile + lid.y;
+
+        if (row < params.rows && a_col < params.n) {
+            tile_a[lid.y][lid.x] = a[row * params.n + a_col];
+        } else {
+            tile_a[lid.y][lid.x] = 0.0;
+        }
+
+        if (b_row < params.n && col < params.cols) {
+            tile_b[lid.y][lid.x] = b[b_row * params.cols + col];
+        } else {
+            tile_b[lid.y][lid.x] = 0.0;
+        }
+
+        workgroupBarrier();
+
+        for (var k = 0u; k < TILE; k = k + 1u) {
+            sum = sum + tile_a[lid.y][k] * tile_b[k][lid.x];
+        }
+
+        workgroupBarrier();
+        tile = tile + TILE;
+    }
+
+    if (row < params.rows && col < params.cols) {
+        c[row * params.cols + col] = sum;
+    }
+}
+"#;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Params {
@@ -100,6 +167,15 @@ struct Params {
     row_offset: u32,
     row_count: u32,
     _pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct BlockParams {
+    n: u32,
+    rows: u32,
+    cols: u32,
+    _pad: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -411,8 +487,11 @@ struct GpuRunner {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
+    blocked_pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     timestamp_query: bool,
+    max_storage_buffer_binding_size: u64,
+    max_buffer_size: u64,
 }
 
 impl GpuRunner {
@@ -432,11 +511,12 @@ impl GpuRunner {
             wgpu::Features::empty()
         };
 
+        let requested_limits =
+            wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
         let mut descriptor = wgpu::DeviceDescriptor::default();
         descriptor.label = Some("Hardware Acceleration Tester device");
         descriptor.required_features = required_features;
-        descriptor.required_limits =
-            wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
+        descriptor.required_limits = requested_limits.clone();
 
         let (device, queue) = pollster::block_on(adapter.request_device(&descriptor))
             .context("requesting wgpu device")?;
@@ -444,6 +524,10 @@ impl GpuRunner {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Tiled matrix multiplication shader"),
             source: wgpu::ShaderSource::Wgsl(MATMUL_SHADER.into()),
+        });
+        let blocked_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Blocked matrix multiplication shader"),
+            source: wgpu::ShaderSource::Wgsl(BLOCKED_MATMUL_SHADER.into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -479,13 +563,24 @@ impl GpuRunner {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
+        let blocked_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Blocked matrix multiplication compute pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &blocked_shader,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
 
         let runner = Self {
             device,
             queue,
             pipeline,
+            blocked_pipeline,
             bind_group_layout,
             timestamp_query,
+            max_storage_buffer_binding_size: requested_limits.max_storage_buffer_binding_size,
+            max_buffer_size: requested_limits.max_buffer_size,
         };
         runner.warm_up()?;
         Ok(runner)
@@ -521,6 +616,10 @@ impl GpuRunner {
             .checked_mul(std::mem::size_of::<f32>())
             .ok_or_else(|| anyhow!("matrix byte length overflow"))?
             as wgpu::BufferAddress;
+        if self.needs_blocked_path(byte_len) {
+            return self.multiply_blocked(n, n_u32, a, b, cancel);
+        }
+
         let total_start = Instant::now();
 
         let a_buffer = self
@@ -704,6 +803,214 @@ impl GpuRunner {
         })
     }
 
+    fn multiply_blocked(
+        &self,
+        n: usize,
+        n_u32: u32,
+        a: &[f32],
+        b: &[f32],
+        cancel: Option<&AtomicBool>,
+    ) -> Result<GpuTiming> {
+        let elements = n
+            .checked_mul(n)
+            .ok_or_else(|| anyhow!("matrix size overflow"))?;
+        let total_start = Instant::now();
+        let (row_block, col_block) = self.block_dimensions(n)?;
+        let mut output = vec![0.0_f32; elements];
+
+        for col_offset in (0..n).step_by(col_block) {
+            self.check_gpu_canceled(cancel)?;
+            let cols = (n - col_offset).min(col_block);
+            let b_block = pack_column_block(b, n, col_offset, cols, cancel)?;
+
+            for row_offset in (0..n).step_by(row_block) {
+                self.check_gpu_canceled(cancel)?;
+                let rows = (n - row_offset).min(row_block);
+                let a_block = pack_row_block(a, n, row_offset, rows, cancel)?;
+                let c_block = self.multiply_block(n_u32, rows, cols, &a_block, &b_block, cancel)?;
+
+                for row in 0..rows {
+                    if row % 8 == 0 {
+                        check_canceled(cancel)?;
+                    }
+                    let output_start = (row_offset + row) * n + col_offset;
+                    let block_start = row * cols;
+                    output[output_start..output_start + cols]
+                        .copy_from_slice(&c_block[block_start..block_start + cols]);
+                }
+            }
+        }
+
+        Ok(GpuTiming {
+            compute_ms: None,
+            total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+            transfer_sync_ms: None,
+            output,
+        })
+    }
+
+    fn multiply_block(
+        &self,
+        n: u32,
+        rows: usize,
+        cols: usize,
+        a_block: &[f32],
+        b_block: &[f32],
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Vec<f32>> {
+        let rows_u32 = u32::try_from(rows).context("row block exceeds GPU shader limits")?;
+        let cols_u32 = u32::try_from(cols).context("column block exceeds GPU shader limits")?;
+        let a_bytes = buffer_len_bytes(a_block.len())?;
+        let b_bytes = buffer_len_bytes(b_block.len())?;
+        let c_elements = rows
+            .checked_mul(cols)
+            .ok_or_else(|| anyhow!("output block size overflow"))?;
+        let c_bytes = buffer_len_bytes(c_elements)?;
+        self.ensure_block_buffer_fits("A row block", a_bytes)?;
+        self.ensure_block_buffer_fits("B column block", b_bytes)?;
+        self.ensure_block_buffer_fits("C output block", c_bytes)?;
+
+        let a_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Blocked matrix A rows"),
+                contents: bytemuck::cast_slice(a_block),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let b_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Blocked matrix B columns"),
+                contents: bytemuck::cast_slice(b_block),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let c_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Blocked matrix C output"),
+            size: c_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Blocked matrix C readback"),
+            size: c_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let params = BlockParams {
+            n,
+            rows: rows_u32,
+            cols: cols_u32,
+            _pad: 0,
+        };
+        let params_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Blocked matrix params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Blocked matrix multiplication bind group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: a_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: b_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: c_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Blocked matrix multiplication encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Blocked matrix multiplication pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.blocked_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(
+                cols_u32.div_ceil(TILE_SIZE),
+                rows_u32.div_ceil(TILE_SIZE),
+                1,
+            );
+        }
+        encoder.copy_buffer_to_buffer(&c_buffer, 0, &readback_buffer, 0, c_bytes);
+
+        let submission = self.queue.submit([encoder.finish()]);
+        self.wait_for_submission(submission, cancel, "waiting for blocked GPU matrix chunk")?;
+        read_f32_buffer_cancelable(&self.device, &readback_buffer, c_elements, cancel)
+            .context("reading blocked GPU result buffer")
+    }
+
+    fn needs_blocked_path(&self, matrix_byte_len: u64) -> bool {
+        std::env::var_os(FORCE_BLOCKED_GPU_ENV).is_some()
+            || matrix_byte_len > self.max_storage_buffer_binding_size
+            || matrix_byte_len > self.max_buffer_size
+    }
+
+    fn block_dimensions(&self, n: usize) -> Result<(usize, usize)> {
+        let limit_bytes = self
+            .max_storage_buffer_binding_size
+            .min(self.max_buffer_size)
+            .max(std::mem::size_of::<f32>() as u64);
+        let limit_floats = (limit_bytes / std::mem::size_of::<f32>() as u64) as usize;
+        let max_rows_or_cols = (limit_floats / n).max(1);
+        let rows = align_block_extent(GPU_BLOCKED_ROW_TARGET.min(max_rows_or_cols));
+        let cols = align_block_extent(GPU_BLOCKED_COL_TARGET.min(max_rows_or_cols));
+
+        let a_bytes = buffer_len_bytes(
+            rows.checked_mul(n)
+                .ok_or_else(|| anyhow!("A block overflow"))?,
+        )?;
+        let b_bytes = buffer_len_bytes(
+            n.checked_mul(cols)
+                .ok_or_else(|| anyhow!("B block overflow"))?,
+        )?;
+        let c_bytes = buffer_len_bytes(
+            rows.checked_mul(cols)
+                .ok_or_else(|| anyhow!("C block overflow"))?,
+        )?;
+        self.ensure_block_buffer_fits("A row block", a_bytes)?;
+        self.ensure_block_buffer_fits("B column block", b_bytes)?;
+        self.ensure_block_buffer_fits("C output block", c_bytes)?;
+        Ok((rows, cols))
+    }
+
+    fn ensure_block_buffer_fits(&self, label: &str, bytes: u64) -> Result<()> {
+        if bytes > self.max_storage_buffer_binding_size {
+            return Err(anyhow!(
+                "{label} requires {}, above this adapter's storage binding limit of {}",
+                format_bytes(bytes),
+                format_bytes(self.max_storage_buffer_binding_size)
+            ));
+        }
+        if bytes > self.max_buffer_size {
+            return Err(anyhow!(
+                "{label} requires {}, above this adapter's buffer size limit of {}",
+                format_bytes(bytes),
+                format_bytes(self.max_buffer_size)
+            ));
+        }
+        Ok(())
+    }
+
     fn wait_for_submission(
         &self,
         _submission: wgpu::SubmissionIndex,
@@ -770,6 +1077,57 @@ fn gpu_dispatch_chunk_rows(size: usize) -> usize {
     } else {
         GPU_CANCELABLE_CHUNK_ROWS.min(size).max(1)
     }
+}
+
+fn align_block_extent(value: usize) -> usize {
+    if value >= TILE_SIZE as usize {
+        (value / TILE_SIZE as usize).max(1) * TILE_SIZE as usize
+    } else {
+        value.max(1)
+    }
+}
+
+fn buffer_len_bytes(elements: usize) -> Result<u64> {
+    elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .map(|bytes| bytes as u64)
+        .ok_or_else(|| anyhow!("buffer byte length overflow"))
+}
+
+fn pack_row_block(
+    source: &[f32],
+    size: usize,
+    row_offset: usize,
+    rows: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<f32>> {
+    let mut block = Vec::with_capacity(rows * size);
+    for row in 0..rows {
+        if row % 8 == 0 {
+            check_canceled(cancel)?;
+        }
+        let start = (row_offset + row) * size;
+        block.extend_from_slice(&source[start..start + size]);
+    }
+    Ok(block)
+}
+
+fn pack_column_block(
+    source: &[f32],
+    size: usize,
+    col_offset: usize,
+    cols: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<f32>> {
+    let mut block = Vec::with_capacity(size * cols);
+    for row in 0..size {
+        if row % 32 == 0 {
+            check_canceled(cancel)?;
+        }
+        let start = row * size + col_offset;
+        block.extend_from_slice(&source[start..start + cols]);
+    }
+    Ok(block)
 }
 
 fn read_f32_buffer_cancelable(
@@ -2556,6 +2914,31 @@ mod tests {
         assert_eq!(gpu_dispatch_chunk_rows(128), 128);
         assert_eq!(gpu_dispatch_chunk_rows(2048), 64);
         assert_eq!(gpu_dispatch_chunk_rows(4096), GPU_CANCELABLE_CHUNK_ROWS);
+    }
+
+    #[test]
+    fn blocked_packers_keep_expected_layout() {
+        let source = vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
+        ];
+
+        assert_eq!(
+            pack_row_block(&source, 4, 1, 2, None).unwrap(),
+            vec![5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+        );
+        assert_eq!(
+            pack_column_block(&source, 4, 1, 2, None).unwrap(),
+            vec![2.0, 3.0, 6.0, 7.0, 10.0, 11.0, 14.0, 15.0]
+        );
+    }
+
+    #[test]
+    fn block_extent_alignment_keeps_nonzero_small_values() {
+        assert_eq!(align_block_extent(1), 1);
+        assert_eq!(align_block_extent(15), 15);
+        assert_eq!(align_block_extent(16), 16);
+        assert_eq!(align_block_extent(31), 16);
+        assert_eq!(align_block_extent(1025), 1024);
     }
 
     #[test]
