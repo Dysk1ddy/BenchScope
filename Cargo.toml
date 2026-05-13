@@ -9,3 +9,4 @@ bytemuck = { version = "1.25", features = ["derive"] }
 eframe = { version = "0.34.2", default-features = true }
 pollster = "0.4"
 wgpu = "29.0.3"
+windows = { version = "0.62.2", features = ["Win32_Graphics_Dxgi"] }

@@ -46,6 +46,7 @@ Select a specific adapter:
 - GPU adapter selection when multiple backends or devices are available.
 - Timing columns for CPU, GPU compute-only, GPU total with transfer, and transfer/sync overhead.
 - Timestamp-query based GPU compute timing when supported by the selected adapter.
+- Pre-run warning when the estimated GPU working set exceeds the selected adapter's reported VRAM/shared-memory limit, with an explicit run-anyway override.
 - Correctness validation against CPU output.
 - Cancelable 1-minute repeat test for CPU or GPU mode.
 

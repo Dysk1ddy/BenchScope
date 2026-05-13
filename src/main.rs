@@ -1,20 +1,22 @@
 use std::{
     fmt,
     sync::{
+        Arc,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
-        Arc,
     },
     thread,
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use bytemuck::{Pod, Zeroable};
 use eframe::egui;
 use wgpu::util::DeviceExt;
 
-const DEFAULT_SIZES: &[usize] = &[128, 256, 512, 1024, 2048];
+const DEFAULT_SIZES: &[usize] = &[
+    4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384,
+];
 const TILE_SIZE: u32 = 16;
 const REPEAT_SECONDS: f64 = 60.0;
 
@@ -101,6 +103,9 @@ struct AdapterInfo {
     device: u32,
     driver: String,
     timestamp_query: bool,
+    dedicated_vram_bytes: Option<u64>,
+    dedicated_system_memory_bytes: Option<u64>,
+    shared_system_memory_bytes: Option<u64>,
 }
 
 impl AdapterInfo {
@@ -112,6 +117,16 @@ impl AdapterInfo {
             self.backend
         )
     }
+}
+
+#[derive(Clone, Debug)]
+struct DxgiMemoryInfo {
+    name: String,
+    vendor: u32,
+    device: u32,
+    dedicated_vram_bytes: u64,
+    dedicated_system_memory_bytes: u64,
+    shared_system_memory_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -160,6 +175,24 @@ enum WorkerEvent {
     RepeatDone(Result<RepeatProgress, String>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunAction {
+    Single,
+    Repeat,
+}
+
+#[derive(Clone, Debug)]
+struct PendingVramWarning {
+    action: RunAction,
+    size: usize,
+    adapter: AdapterInfo,
+    validate_output: bool,
+    repeat_mode: RepeatMode,
+    estimated_gpu_bytes: u64,
+    limit_bytes: u64,
+    limit_label: String,
+}
+
 #[derive(Debug)]
 struct GpuTiming {
     compute_ms: Option<f64>,
@@ -196,8 +229,8 @@ impl GpuRunner {
         let mut descriptor = wgpu::DeviceDescriptor::default();
         descriptor.label = Some("Hardware Acceleration Tester device");
         descriptor.required_features = required_features;
-        descriptor.required_limits = wgpu::Limits::downlevel_defaults()
-            .using_resolution(adapter.limits());
+        descriptor.required_limits =
+            wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
 
         let (device, queue) = pollster::block_on(adapter.request_device(&descriptor))
             .context("requesting wgpu device")?;
@@ -258,13 +291,7 @@ impl GpuRunner {
         self.multiply(1, &a, &b, false).map(|_| ())
     }
 
-    fn multiply(
-        &self,
-        n: usize,
-        a: &[f32],
-        b: &[f32],
-        use_timestamps: bool,
-    ) -> Result<GpuTiming> {
+    fn multiply(&self, n: usize, a: &[f32], b: &[f32], use_timestamps: bool) -> Result<GpuTiming> {
         let elements = n
             .checked_mul(n)
             .ok_or_else(|| anyhow!("matrix size overflow"))?;
@@ -275,16 +302,20 @@ impl GpuRunner {
         let byte_len = (elements * std::mem::size_of::<f32>()) as wgpu::BufferAddress;
         let total_start = Instant::now();
 
-        let a_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Matrix A"),
-            contents: bytemuck::cast_slice(a),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let b_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Matrix B"),
-            contents: bytemuck::cast_slice(b),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+        let a_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Matrix A"),
+                contents: bytemuck::cast_slice(a),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let b_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Matrix B"),
+                contents: bytemuck::cast_slice(b),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
         let c_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Matrix C GPU output"),
             size: byte_len,
@@ -303,11 +334,13 @@ impl GpuRunner {
             _pad1: 0,
             _pad2: 0,
         };
-        let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Matrix params"),
-            contents: bytemuck::bytes_of(&params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let params_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Matrix params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Matrix multiplication bind group"),
@@ -364,13 +397,14 @@ impl GpuRunner {
             });
 
         {
-            let timestamp_writes = query_set.as_ref().map(|query_set| {
-                wgpu::ComputePassTimestampWrites {
-                    query_set,
-                    beginning_of_pass_write_index: Some(0),
-                    end_of_pass_write_index: Some(1),
-                }
-            });
+            let timestamp_writes =
+                query_set
+                    .as_ref()
+                    .map(|query_set| wgpu::ComputePassTimestampWrites {
+                        query_set,
+                        beginning_of_pass_write_index: Some(0),
+                        end_of_pass_write_index: Some(1),
+                    });
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Matrix multiplication pass"),
                 timestamp_writes,
@@ -435,7 +469,11 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-fn read_f32_buffer(device: &wgpu::Device, buffer: &wgpu::Buffer, elements: usize) -> Result<Vec<f32>> {
+fn read_f32_buffer(
+    device: &wgpu::Device,
+    buffer: &wgpu::Buffer,
+    elements: usize,
+) -> Result<Vec<f32>> {
     let slice = buffer.slice(..);
     let (tx, rx) = mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |result| {
@@ -481,12 +519,14 @@ fn read_timestamps(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<[u64;
 fn enumerate_adapters() -> Vec<AdapterInfo> {
     let instance = wgpu::Instance::default();
     let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+    let dxgi_memory = query_dxgi_memory_info();
     adapters
         .into_iter()
         .enumerate()
         .map(|(index, adapter)| {
             let info = adapter.get_info();
             let features = adapter.features();
+            let memory = match_dxgi_memory_info(&info, &dxgi_memory);
             AdapterInfo {
                 index,
                 name: info.name,
@@ -496,8 +536,86 @@ fn enumerate_adapters() -> Vec<AdapterInfo> {
                 device: info.device,
                 driver: info.driver,
                 timestamp_query: features.contains(wgpu::Features::TIMESTAMP_QUERY),
+                dedicated_vram_bytes: memory.map(|memory| memory.dedicated_vram_bytes),
+                dedicated_system_memory_bytes: memory
+                    .map(|memory| memory.dedicated_system_memory_bytes),
+                shared_system_memory_bytes: memory.map(|memory| memory.shared_system_memory_bytes),
             }
         })
+        .collect()
+}
+
+#[cfg(windows)]
+fn query_dxgi_memory_info() -> Vec<DxgiMemoryInfo> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+
+    let mut infos = Vec::new();
+    let factory = unsafe { CreateDXGIFactory1::<IDXGIFactory1>() };
+    let Ok(factory) = factory else {
+        return infos;
+    };
+
+    for index in 0..128 {
+        let adapter = unsafe { factory.EnumAdapters1(index) };
+        let Ok(adapter) = adapter else {
+            break;
+        };
+        if let Ok(desc) = unsafe { adapter.GetDesc1() } {
+            infos.push(DxgiMemoryInfo {
+                name: String::from_utf16_lossy(&desc.Description)
+                    .trim_end_matches('\0')
+                    .trim()
+                    .to_owned(),
+                vendor: desc.VendorId,
+                device: desc.DeviceId,
+                dedicated_vram_bytes: desc.DedicatedVideoMemory as u64,
+                dedicated_system_memory_bytes: desc.DedicatedSystemMemory as u64,
+                shared_system_memory_bytes: desc.SharedSystemMemory as u64,
+            });
+        }
+    }
+
+    infos
+}
+
+#[cfg(not(windows))]
+fn query_dxgi_memory_info() -> Vec<DxgiMemoryInfo> {
+    Vec::new()
+}
+
+fn match_dxgi_memory_info<'a>(
+    info: &wgpu::AdapterInfo,
+    memory_infos: &'a [DxgiMemoryInfo],
+) -> Option<&'a DxgiMemoryInfo> {
+    if info.device != 0 {
+        if let Some(memory) = memory_infos
+            .iter()
+            .find(|memory| memory.vendor == info.vendor && memory.device == info.device)
+        {
+            return Some(memory);
+        }
+    }
+
+    let adapter_name = normalize_adapter_name(&info.name);
+    memory_infos
+        .iter()
+        .find(|memory| {
+            memory.vendor == info.vendor && normalize_adapter_name(&memory.name) == adapter_name
+        })
+        .or_else(|| {
+            memory_infos.iter().find(|memory| {
+                memory.vendor == info.vendor
+                    && (normalize_adapter_name(&memory.name).contains(&adapter_name)
+                        || adapter_name.contains(&normalize_adapter_name(&memory.name)))
+            })
+        })
+}
+
+fn normalize_adapter_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
         .collect()
 }
 
@@ -712,6 +830,7 @@ struct HardwareAccelApp {
     cancel: Option<Arc<AtomicBool>>,
     running: bool,
     repeat_running: bool,
+    pending_vram_warning: Option<PendingVramWarning>,
 }
 
 impl HardwareAccelApp {
@@ -725,7 +844,7 @@ impl HardwareAccelApp {
         let mut app = Self {
             adapters,
             selected_adapter,
-            size_text: DEFAULT_SIZES[1].to_string(),
+            size_text: DEFAULT_SIZES[6].to_string(),
             validate_output: true,
             repeat_mode: RepeatMode::Gpu,
             results: Vec::new(),
@@ -737,6 +856,7 @@ impl HardwareAccelApp {
             cancel: None,
             running: false,
             repeat_running: false,
+            pending_vram_warning: None,
         };
         app.log("Application started");
         if app.adapters.is_empty() {
@@ -753,6 +873,12 @@ impl HardwareAccelApp {
                     empty_to_unknown(&adapter.driver),
                     if adapter.timestamp_query { "yes" } else { "no" }
                 ));
+                if let Some((limit, label)) = adapter_memory_limit_bytes(&adapter) {
+                    app.log(format!(
+                        "  memory limit estimate: {} ({label})",
+                        format_bytes(limit)
+                    ));
+                }
             }
         }
         app
@@ -771,8 +897,8 @@ impl HardwareAccelApp {
         if size == 0 {
             return Err(anyhow!("matrix size must be positive"));
         }
-        if size > 8192 {
-            return Err(anyhow!("matrix size is too large for this first version"));
+        if size > 16384 {
+            return Err(anyhow!("matrix size is capped at 16384 for this version"));
         }
         Ok(size)
     }
@@ -785,6 +911,10 @@ impl HardwareAccelApp {
     }
 
     fn start_single(&mut self) {
+        self.start_single_checked(false);
+    }
+
+    fn start_single_checked(&mut self, ignore_vram_warning: bool) {
         let size = match self.selected_size() {
             Ok(size) => size,
             Err(err) => {
@@ -802,8 +932,25 @@ impl HardwareAccelApp {
             }
         };
 
+        if !ignore_vram_warning {
+            if let Some(warning) = self.vram_warning_for(
+                RunAction::Single,
+                size,
+                adapter.clone(),
+                self.validate_output,
+                self.repeat_mode,
+            ) {
+                self.status = "VRAM warning: confirm before running this benchmark".to_owned();
+                self.pending_vram_warning = Some(warning);
+                return;
+            }
+        }
+
+        self.launch_single(size, adapter, self.validate_output);
+    }
+
+    fn launch_single(&mut self, size: usize, adapter: AdapterInfo, validate: bool) {
         let tx = self.tx.clone();
-        let validate = self.validate_output;
         self.running = true;
         self.progress = 0.1;
         self.status = format!("Running {size}x{size} benchmark...");
@@ -815,6 +962,10 @@ impl HardwareAccelApp {
     }
 
     fn start_repeat(&mut self) {
+        self.start_repeat_checked(false);
+    }
+
+    fn start_repeat_checked(&mut self, ignore_vram_warning: bool) {
         let size = match self.selected_size() {
             Ok(size) => size,
             Err(err) => {
@@ -832,10 +983,27 @@ impl HardwareAccelApp {
             }
         };
 
+        if !ignore_vram_warning {
+            if let Some(warning) = self.vram_warning_for(
+                RunAction::Repeat,
+                size,
+                adapter.clone(),
+                self.validate_output,
+                self.repeat_mode,
+            ) {
+                self.status = "VRAM warning: confirm before starting the repeat test".to_owned();
+                self.pending_vram_warning = Some(warning);
+                return;
+            }
+        }
+
+        self.launch_repeat(size, adapter, self.repeat_mode);
+    }
+
+    fn launch_repeat(&mut self, size: usize, adapter: AdapterInfo, mode: RepeatMode) {
         let tx = self.tx.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
-        let mode = self.repeat_mode;
         self.cancel = Some(cancel);
         self.running = true;
         self.repeat_running = true;
@@ -857,6 +1025,50 @@ impl HardwareAccelApp {
             .map_err(|err| format!("{err:#}"));
             let _ = tx.send(WorkerEvent::RepeatDone(result));
         });
+    }
+
+    fn vram_warning_for(
+        &self,
+        action: RunAction,
+        size: usize,
+        adapter: AdapterInfo,
+        validate_output: bool,
+        repeat_mode: RepeatMode,
+    ) -> Option<PendingVramWarning> {
+        let estimated_gpu_bytes = gpu_working_set_bytes(size)?;
+        let (limit_bytes, limit_label) = adapter_memory_limit_bytes(&adapter)?;
+        (estimated_gpu_bytes > limit_bytes).then(|| PendingVramWarning {
+            action,
+            size,
+            adapter,
+            validate_output,
+            repeat_mode,
+            estimated_gpu_bytes,
+            limit_bytes,
+            limit_label: limit_label.to_owned(),
+        })
+    }
+
+    fn continue_pending_vram_warning(&mut self) {
+        let Some(warning) = self.pending_vram_warning.take() else {
+            return;
+        };
+        self.log(format!(
+            "User chose to run {}x{} despite estimated GPU memory {} exceeding {} ({})",
+            warning.size,
+            warning.size,
+            format_bytes(warning.estimated_gpu_bytes),
+            warning.limit_label,
+            format_bytes(warning.limit_bytes)
+        ));
+        match warning.action {
+            RunAction::Single => {
+                self.launch_single(warning.size, warning.adapter, warning.validate_output)
+            }
+            RunAction::Repeat => {
+                self.launch_repeat(warning.size, warning.adapter, warning.repeat_mode)
+            }
+        }
     }
 
     fn cancel_repeat(&mut self) {
@@ -913,7 +1125,11 @@ impl HardwareAccelApp {
                             if !progress.canceled {
                                 self.progress = 1.0;
                             }
-                            let state = if progress.canceled { "canceled" } else { "complete" };
+                            let state = if progress.canceled {
+                                "canceled"
+                            } else {
+                                "complete"
+                            };
                             self.status = format!(
                                 "Repeat test {state}: {} iteration(s), avg {} ms",
                                 progress.iterations,
@@ -989,6 +1205,17 @@ impl eframe::App for HardwareAccelApp {
                             "unavailable"
                         }
                     ));
+                    if let Some((limit, label)) = adapter_memory_limit_bytes(adapter) {
+                        ui.small(format!("Memory limit estimate: {} ({label})", format_bytes(limit)));
+                    } else {
+                        ui.small("Memory limit estimate: unavailable for this adapter/backend");
+                    }
+                    ui.small(format!(
+                        "Reported memory: VRAM {}, dedicated system {}, shared {}",
+                        format_optional_bytes(adapter.dedicated_vram_bytes),
+                        format_optional_bytes(adapter.dedicated_system_memory_bytes),
+                        format_optional_bytes(adapter.shared_system_memory_bytes)
+                    ));
                 }
 
                 if ui.button("Refresh GPUs").clicked() && !self.running {
@@ -1010,14 +1237,44 @@ impl eframe::App for HardwareAccelApp {
                 ui.text_edit_singleline(&mut self.size_text);
                 ui.checkbox(&mut self.validate_output, "Validate GPU output");
 
-                let memory_mb = self
-                    .selected_size()
-                    .ok()
-                    .map(memory_estimate_mb)
-                    .unwrap_or(0.0);
-                ui.small(format!(
-                    "Approx. matrix buffers: {memory_mb:.1} MB for A, B, and C"
-                ));
+                if let Ok(size) = self.selected_size() {
+                    if let (Some(matrix_bytes), Some(gpu_bytes)) =
+                        (matrix_buffers_bytes(size, 3), gpu_working_set_bytes(size))
+                    {
+                        ui.small(format!(
+                            "A/B/C: {}; GPU run estimate: {}",
+                            format_bytes(matrix_bytes),
+                            format_bytes(gpu_bytes)
+                        ));
+
+                        if let Some(adapter) = self.adapters.get(self.selected_adapter) {
+                            if let Some((limit, label)) = adapter_memory_limit_bytes(adapter) {
+                                if gpu_bytes > limit {
+                                    ui.colored_label(
+                                        egui::Color32::RED,
+                                        format!(
+                                            "Estimated GPU memory exceeds {label}: {} > {}.",
+                                            format_bytes(gpu_bytes),
+                                            format_bytes(limit)
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if size >= 4096 {
+                        ui.colored_label(
+                            egui::Color32::YELLOW,
+                            "Large sizes can take a long time on CPU and require substantial GPU memory.",
+                        );
+                    }
+                    if size == 16384 {
+                        ui.colored_label(
+                            egui::Color32::YELLOW,
+                            "16K uses about 3 GB for A/B/C alone before readback and driver overhead.",
+                        );
+                    }
+                }
 
                 ui.add_enabled_ui(!self.running && !self.adapters.is_empty(), |ui| {
                     if ui.button("Run benchmark").clicked() {
@@ -1044,54 +1301,146 @@ impl eframe::App for HardwareAccelApp {
             });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
+            let available_height = ui.available_height();
+            let log_height = (available_height * 0.18).clamp(110.0, 150.0);
+            let results_height = (available_height - log_height - 56.0).max(260.0);
+
             ui.heading("Results");
             ui.add_space(6.0);
-            egui::ScrollArea::both().show(ui, |ui| {
-                egui::Grid::new("results_grid")
-                    .striped(true)
-                    .num_columns(8)
-                    .show(ui, |ui| {
-                        ui.strong("Size");
-                        ui.strong("CPU ms");
-                        ui.strong("GPU compute ms");
-                        ui.strong("GPU total ms");
-                        ui.strong("Transfer/sync ms");
-                        ui.strong("Speedup");
-                        ui.strong("Adapter");
-                        ui.strong("Validation");
-                        ui.end_row();
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), results_height),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            egui::Grid::new("results_grid")
+                                .striped(true)
+                                .num_columns(8)
+                                .show(ui, |ui| {
+                                    ui.strong("Size");
+                                    ui.strong("CPU ms");
+                                    ui.strong("GPU compute ms");
+                                    ui.strong("GPU total ms");
+                                    ui.strong("Transfer/sync ms");
+                                    ui.strong("Speedup");
+                                    ui.strong("Adapter");
+                                    ui.strong("Validation");
+                                    ui.end_row();
 
-                        for result in &self.results {
-                            ui.label(format!("{}x{}", result.size, result.size));
-                            ui.label(format_ms(Some(result.cpu_ms)));
-                            ui.label(format_ms(result.gpu_compute_ms));
-                            ui.label(format_ms(Some(result.gpu_total_ms)));
-                            ui.label(format_ms(result.transfer_sync_ms));
-                            ui.label(format_speedup(result.speedup));
-                            ui.label(&result.adapter);
-                            ui.label(&result.validation);
-                            ui.end_row();
-                        }
-                    });
-            });
+                                    for result in &self.results {
+                                        ui.label(format!("{}x{}", result.size, result.size));
+                                        ui.label(format_ms(Some(result.cpu_ms)));
+                                        ui.label(format_ms(result.gpu_compute_ms));
+                                        ui.label(format_ms(Some(result.gpu_total_ms)));
+                                        ui.label(format_ms(result.transfer_sync_ms));
+                                        ui.label(format_speedup(result.speedup));
+                                        ui.label(&result.adapter);
+                                        ui.label(&result.validation);
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                },
+            );
 
             ui.separator();
             ui.heading("Log");
             egui::ScrollArea::vertical()
                 .stick_to_bottom(true)
-                .max_height(220.0)
+                .max_height(log_height)
                 .show(ui, |ui| {
                     for line in &self.log {
                         ui.monospace(line);
                     }
                 });
         });
+
+        if let Some(warning) = self.pending_vram_warning.clone() {
+            egui::Window::new("VRAM limit exceeded")
+                .collapsible(false)
+                .resizable(false)
+                .show(&ctx, |ui| {
+                    ui.label(format!(
+                        "{}x{} is estimated to need {} of GPU memory.",
+                        warning.size,
+                        warning.size,
+                        format_bytes(warning.estimated_gpu_bytes)
+                    ));
+                    ui.label(format!(
+                        "The selected adapter's {} is {}.",
+                        warning.limit_label,
+                        format_bytes(warning.limit_bytes)
+                    ));
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "Running anyway may fail, trigger driver paging, or make the result misleading.",
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.pending_vram_warning = None;
+                            self.status = "Run canceled before exceeding the VRAM estimate".to_owned();
+                            self.log("Canceled run after VRAM warning");
+                        }
+                        if ui.button("Run anyway").clicked() {
+                            self.continue_pending_vram_warning();
+                        }
+                    });
+                });
+        }
     }
 }
 
-fn memory_estimate_mb(size: usize) -> f64 {
-    let bytes = size as f64 * size as f64 * 4.0 * 3.0;
-    bytes / (1024.0 * 1024.0)
+fn matrix_buffers_bytes(size: usize, matrix_count: u64) -> Option<u64> {
+    let size = size as u64;
+    size.checked_mul(size)?
+        .checked_mul(std::mem::size_of::<f32>() as u64)?
+        .checked_mul(matrix_count)
+}
+
+fn gpu_working_set_bytes(size: usize) -> Option<u64> {
+    matrix_buffers_bytes(size, 4)
+}
+
+fn adapter_memory_limit_bytes(adapter: &AdapterInfo) -> Option<(u64, &'static str)> {
+    let dedicated = adapter.dedicated_vram_bytes.unwrap_or(0);
+    let shared = adapter.shared_system_memory_bytes.unwrap_or(0);
+    match adapter.device_type {
+        wgpu::DeviceType::DiscreteGpu if dedicated > 0 => Some((dedicated, "dedicated VRAM")),
+        wgpu::DeviceType::IntegratedGpu
+        | wgpu::DeviceType::Cpu
+        | wgpu::DeviceType::VirtualGpu
+        | wgpu::DeviceType::Other
+            if dedicated + shared > 0 =>
+        {
+            Some((dedicated + shared, "reported GPU/shared memory"))
+        }
+        _ if dedicated > 0 => Some((dedicated, "dedicated VRAM")),
+        _ => None,
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes / KIB)
+    } else {
+        format!("{bytes:.0} B")
+    }
+}
+
+fn format_optional_bytes(bytes: Option<u64>) -> String {
+    bytes
+        .map(format_bytes)
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 fn format_ms(value: Option<f64>) -> String {
@@ -1121,11 +1470,7 @@ fn device_type_label(value: wgpu::DeviceType) -> &'static str {
 }
 
 fn empty_to_unknown(value: &str) -> &str {
-    if value.is_empty() {
-        "unknown"
-    } else {
-        value
-    }
+    if value.is_empty() { "unknown" } else { value }
 }
 
 fn run_cli(args: &[String]) -> Result<bool> {
@@ -1136,13 +1481,16 @@ fn run_cli(args: &[String]) -> Result<bool> {
         }
         for adapter in adapters {
             println!(
-                "[{}] {} | vendor {:04X} device {:04X} | driver {} | timestamp {}",
+                "[{}] {} | vendor {:04X} device {:04X} | driver {} | timestamp {} | memory {}",
                 adapter.index,
                 adapter.label(),
                 adapter.vendor,
                 adapter.device,
                 empty_to_unknown(&adapter.driver),
-                if adapter.timestamp_query { "yes" } else { "no" }
+                if adapter.timestamp_query { "yes" } else { "no" },
+                adapter_memory_limit_bytes(&adapter)
+                    .map(|(bytes, label)| format!("{} {}", format_bytes(bytes), label))
+                    .unwrap_or_else(|| "unknown".to_owned())
             );
         }
         return Ok(true);
@@ -1239,5 +1587,32 @@ mod tests {
         let cpu = vec![1.0, 2.0, 3.0, 4.0];
         let gpu = vec![1.0, 2.00001, 3.0, 4.0];
         assert!(validate(&cpu, &gpu, 2).starts_with("Passed"));
+    }
+
+    #[test]
+    fn gpu_working_set_counts_four_matrices() {
+        assert_eq!(gpu_working_set_bytes(16_384), Some(4 * 1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn integrated_memory_limit_includes_shared_memory() {
+        let adapter = AdapterInfo {
+            index: 0,
+            name: "Integrated Test GPU".to_owned(),
+            backend: wgpu::Backend::Dx12,
+            device_type: wgpu::DeviceType::IntegratedGpu,
+            vendor: 0,
+            device: 0,
+            driver: String::new(),
+            timestamp_query: true,
+            dedicated_vram_bytes: Some(128 * 1024 * 1024),
+            dedicated_system_memory_bytes: Some(0),
+            shared_system_memory_bytes: Some(8 * 1024 * 1024 * 1024),
+        };
+
+        assert_eq!(
+            adapter_memory_limit_bytes(&adapter),
+            Some((8_724_152_320, "reported GPU/shared memory"))
+        );
     }
 }

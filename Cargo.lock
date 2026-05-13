@@ -1351,6 +1351,7 @@ dependencies = [
  "eframe",
  "pollster",
  "wgpu",
+ "windows",
 ]
 
 [[package]]
