@@ -20,7 +20,10 @@ const DEFAULT_SIZES: &[usize] = &[
 const TILE_SIZE: u32 = 16;
 const CANCEL_CHECK_INTERVAL: usize = 1_048_576;
 const PROGRESS_SAMPLE_MS: u64 = 200;
-const CPU_ESTIMATE_SAMPLE_BLOCKS: usize = 2048;
+const CPU_ESTIMATE_MIN_SAMPLE_SIZE: usize = 128;
+const CPU_ESTIMATE_BASE_SAMPLE_SIZE: usize = 512;
+const CPU_ESTIMATE_MID_SAMPLE_SIZE: usize = 768;
+const CPU_ESTIMATE_MAX_SAMPLE_SIZE: usize = 1024;
 const VALIDATION_SAMPLE_POINTS: usize = 256;
 const GPU_CANCELABLE_CHUNK_ROWS: usize = 16;
 const GPU_WAIT_POLL_MS: u64 = 1;
@@ -1077,60 +1080,85 @@ fn estimate_cpu_multiply_ms(
     size: usize,
     a: &[f32],
     b: &[f32],
+    cpu_info: &CpuInfo,
     cancel: Option<&AtomicBool>,
     mut progress: Option<&mut SingleProgressTracker>,
 ) -> Result<f64> {
-    let tile = 32usize;
-    let blocks_per_dim = size.div_ceil(tile);
-    let total_blocks = (blocks_per_dim * blocks_per_dim * blocks_per_dim).max(1);
-    let sample_blocks = CPU_ESTIMATE_SAMPLE_BLOCKS.min(total_blocks);
-    let mut sampled_blocks = 0usize;
-    let mut sink = 0.0_f32;
-    let start = Instant::now();
-
     if let Some(progress) = progress.as_deref_mut() {
-        progress.set_phase("Estimating CPU baseline", true);
+        progress.set_phase(
+            format!("Estimating CPU baseline on {}", cpu_info.model),
+            true,
+        );
         progress.set_cpu_progress(0.0, true);
     }
 
-    'outer: for ii in (0..size).step_by(tile) {
-        check_canceled(cancel)?;
-        let i_end = (ii + tile).min(size);
-        for kk in (0..size).step_by(tile) {
-            check_canceled(cancel)?;
-            let k_end = (kk + tile).min(size);
-            for jj in (0..size).step_by(tile) {
-                check_canceled(cancel)?;
-                let j_end = (jj + tile).min(size);
-                for i in ii..i_end {
-                    let a_row = i * size;
-                    for k in kk..k_end {
-                        let a_val = a[a_row + k];
-                        let b_row = k * size;
-                        for j in jj..j_end {
-                            sink += a_val * b[b_row + j];
-                        }
-                    }
-                }
-                sampled_blocks += 1;
-                if let Some(progress) = progress.as_deref_mut() {
-                    progress.set_cpu_progress(sampled_blocks as f32 / sample_blocks as f32, false);
-                }
-                if sampled_blocks >= sample_blocks {
-                    break 'outer;
-                }
-            }
-        }
+    let sample_size = cpu_estimate_sample_size(size, cpu_info);
+    let sample_a = copy_top_left_submatrix(a, size, sample_size, cancel)?;
+    let sample_b = copy_top_left_submatrix(b, size, sample_size, cancel)?;
+
+    if sample_size > CPU_ESTIMATE_MIN_SAMPLE_SIZE {
+        let warm_size = CPU_ESTIMATE_MIN_SAMPLE_SIZE.min(sample_size);
+        let warm_a = copy_top_left_submatrix(&sample_a, sample_size, warm_size, cancel)?;
+        let warm_b = copy_top_left_submatrix(&sample_b, sample_size, warm_size, cancel)?;
+        let _ = cpu_multiply_cancelable(warm_size, &warm_a, &warm_b, cancel, None)?;
     }
 
-    std::hint::black_box(sink);
+    check_canceled(cancel)?;
+    let (_, elapsed_ms) = cpu_multiply_cancelable(sample_size, &sample_a, &sample_b, cancel, None)?;
+    let scale = (size as f64 / sample_size as f64).powi(3);
 
     if let Some(progress) = progress.as_deref_mut() {
         progress.set_cpu_progress(1.0, true);
     }
 
-    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-    Ok(elapsed_ms * total_blocks as f64 / sampled_blocks.max(1) as f64)
+    Ok(elapsed_ms * scale)
+}
+
+fn cpu_estimate_sample_size(size: usize, cpu_info: &CpuInfo) -> usize {
+    if size < 32 {
+        return size.max(1);
+    }
+
+    let model = cpu_info.model.to_ascii_lowercase();
+    let target = if model.contains("threadripper")
+        || model.contains("ryzen 9")
+        || model.contains("core(tm) i9")
+        || model.contains("core ultra 9")
+        || cpu_info.logical_processors >= 24
+    {
+        CPU_ESTIMATE_MAX_SAMPLE_SIZE
+    } else if model.contains("ryzen 7")
+        || model.contains("core(tm) i7")
+        || model.contains("core ultra 7")
+        || cpu_info.logical_processors >= 12
+    {
+        CPU_ESTIMATE_MID_SAMPLE_SIZE
+    } else {
+        CPU_ESTIMATE_BASE_SAMPLE_SIZE
+    };
+
+    let sample_size = target.min(size).max(CPU_ESTIMATE_MIN_SAMPLE_SIZE.min(size));
+    (sample_size / 32).max(1) * 32
+}
+
+fn copy_top_left_submatrix(
+    source: &[f32],
+    source_size: usize,
+    sample_size: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<f32>> {
+    if sample_size > source_size {
+        return Err(anyhow!("sample size exceeds source matrix size"));
+    }
+    let mut sample = Vec::with_capacity(sample_size * sample_size);
+    for row in 0..sample_size {
+        if row % 32 == 0 {
+            check_canceled(cancel)?;
+        }
+        let start = row * source_size;
+        sample.extend_from_slice(&source[start..start + sample_size]);
+    }
+    Ok(sample)
 }
 
 #[cfg(test)]
@@ -1265,7 +1293,8 @@ fn run_single_cancelable(
     progress.set_phase("Generating matrices", true);
     let (a, b) = generate_matrices_cancelable(size, Some(cancel))?;
     let (cpu_output, cpu_ms, cpu_estimated) = if estimate_cpu_time {
-        let cpu_ms = estimate_cpu_multiply_ms(size, &a, &b, Some(cancel), Some(&mut progress))?;
+        let cpu_ms =
+            estimate_cpu_multiply_ms(size, &a, &b, &cpu_info, Some(cancel), Some(&mut progress))?;
         (None, cpu_ms, true)
     } else {
         let (cpu_output, cpu_ms) =
@@ -2447,10 +2476,48 @@ mod tests {
     fn cpu_estimate_honors_cancellation() {
         let (a, b) = generate_matrices(4).unwrap();
         let cancel = AtomicBool::new(true);
+        let cpu_info = CpuInfo {
+            model: "Test CPU".to_owned(),
+            logical_processors: 8,
+        };
 
-        let err = estimate_cpu_multiply_ms(4, &a, &b, Some(&cancel), None).unwrap_err();
+        let err = estimate_cpu_multiply_ms(4, &a, &b, &cpu_info, Some(&cancel), None).unwrap_err();
 
         assert!(err.to_string().contains("canceled"));
+    }
+
+    #[test]
+    fn cpu_estimate_sample_size_uses_cpu_class() {
+        let high_end = CpuInfo {
+            model: "AMD Ryzen 9 7950X".to_owned(),
+            logical_processors: 32,
+        };
+        let mid = CpuInfo {
+            model: "13th Gen Intel(R) Core(TM) i7-1360P".to_owned(),
+            logical_processors: 16,
+        };
+        let base = CpuInfo {
+            model: "Unknown CPU".to_owned(),
+            logical_processors: 8,
+        };
+
+        assert_eq!(cpu_estimate_sample_size(4096, &high_end), 1024);
+        assert_eq!(cpu_estimate_sample_size(4096, &mid), 768);
+        assert_eq!(cpu_estimate_sample_size(4096, &base), 512);
+        assert_eq!(cpu_estimate_sample_size(64, &high_end), 64);
+        assert_eq!(cpu_estimate_sample_size(4, &high_end), 4);
+    }
+
+    #[test]
+    fn top_left_submatrix_copy_keeps_layout() {
+        let source = vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
+        ];
+
+        assert_eq!(
+            copy_top_left_submatrix(&source, 4, 2, None).unwrap(),
+            vec![1.0, 2.0, 5.0, 6.0]
+        );
     }
 
     #[test]
