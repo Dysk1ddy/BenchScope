@@ -19,13 +19,19 @@ const DEFAULT_SIZES: &[usize] = &[
 ];
 const TILE_SIZE: u32 = 16;
 const CANCEL_CHECK_INTERVAL: usize = 1_048_576;
+const PROGRESS_SAMPLE_MS: u64 = 200;
+const MAX_EXACT_CPU_SIZE: usize = 2048;
+const CPU_ESTIMATE_SAMPLE_BLOCKS: usize = 2048;
+const VALIDATION_SAMPLE_POINTS: usize = 256;
+const GPU_DISPATCH_CHUNK_ROWS: usize = 64;
+const GPU_WAIT_POLL_MS: u64 = 100;
 
 const MATMUL_SHADER: &str = r#"
 const TILE: u32 = 16u;
 
 struct Params {
     n: u32,
-    _pad0: u32,
+    row_offset: u32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -43,7 +49,7 @@ fn main(
     @builtin(global_invocation_id) gid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>
 ) {
-    let row = gid.y;
+    let row = gid.y + params.row_offset;
     let col = gid.x;
     var sum = 0.0;
 
@@ -88,7 +94,7 @@ fn main(
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Params {
     n: u32,
-    _pad0: u32,
+    row_offset: u32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -134,11 +140,21 @@ struct BenchmarkResult {
     size: usize,
     adapter: String,
     cpu_ms: f64,
+    cpu_estimated: bool,
     gpu_compute_ms: Option<f64>,
     gpu_total_ms: f64,
     transfer_sync_ms: Option<f64>,
     speedup: f64,
     validation: String,
+}
+
+#[derive(Clone, Debug)]
+struct SingleProgress {
+    cpu_progress: f32,
+    gpu_progress: f32,
+    elapsed_s: f64,
+    eta_s: Option<f64>,
+    phase: String,
 }
 
 #[derive(Clone, Debug)]
@@ -199,6 +215,7 @@ impl fmt::Display for RepeatDuration {
 
 #[derive(Debug)]
 enum WorkerEvent {
+    SingleProgress(SingleProgress),
     SingleDone(Result<BenchmarkResult, String>),
     RepeatProgress(RepeatProgress),
     RepeatDone(Result<RepeatProgress, String>),
@@ -229,6 +246,139 @@ struct GpuTiming {
     total_ms: f64,
     transfer_sync_ms: Option<f64>,
     output: Vec<f32>,
+}
+
+struct SingleProgressTracker {
+    tx: Option<Sender<WorkerEvent>>,
+    started: Instant,
+    last_emit: Instant,
+    cpu_progress: f32,
+    gpu_progress: f32,
+    phase: String,
+    gpu_estimate_s: f64,
+    gpu_started: Option<Instant>,
+}
+
+impl SingleProgressTracker {
+    fn new(size: usize, adapter: &AdapterInfo, tx: Option<Sender<WorkerEvent>>) -> Self {
+        Self {
+            tx,
+            started: Instant::now(),
+            last_emit: Instant::now() - Duration::from_secs(1),
+            cpu_progress: 0.0,
+            gpu_progress: 0.0,
+            phase: "Preparing benchmark".to_owned(),
+            gpu_estimate_s: estimate_gpu_seconds(size, adapter),
+            gpu_started: None,
+        }
+    }
+
+    fn set_phase(&mut self, phase: impl Into<String>, force: bool) {
+        self.phase = phase.into();
+        self.emit(force);
+    }
+
+    fn set_cpu_progress(&mut self, progress: f32, force: bool) {
+        self.cpu_progress = progress.clamp(0.0, 1.0);
+        self.emit(force);
+    }
+
+    fn set_gpu_progress(&mut self, progress: f32, force: bool) {
+        self.gpu_progress = progress.clamp(0.0, 1.0);
+        self.emit(force);
+    }
+
+    fn start_gpu_ticker(&mut self) -> Option<ProgressTicker> {
+        self.gpu_started = Some(Instant::now());
+        self.set_phase("GPU computing and readback", true);
+        let tx = self.tx.clone()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let started = self.started;
+        let gpu_started = self.gpu_started?;
+        let cpu_progress = self.cpu_progress;
+        let gpu_estimate_s = self.gpu_estimate_s;
+        let handle = thread::spawn(move || {
+            while !worker_stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(PROGRESS_SAMPLE_MS));
+                if worker_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let gpu_elapsed_s = gpu_started.elapsed().as_secs_f64();
+                let gpu_progress = (gpu_elapsed_s / gpu_estimate_s).clamp(0.0, 0.95) as f32;
+                let eta_s = Some((gpu_estimate_s - gpu_elapsed_s).max(0.0));
+                let _ = tx.send(WorkerEvent::SingleProgress(SingleProgress {
+                    cpu_progress,
+                    gpu_progress,
+                    elapsed_s: started.elapsed().as_secs_f64(),
+                    eta_s,
+                    phase: "GPU computing and readback".to_owned(),
+                }));
+            }
+        });
+        Some(ProgressTicker {
+            stop,
+            handle: Some(handle),
+        })
+    }
+
+    fn emit(&mut self, force: bool) {
+        let now = Instant::now();
+        if !force && now.duration_since(self.last_emit) < Duration::from_millis(PROGRESS_SAMPLE_MS)
+        {
+            return;
+        }
+        self.last_emit = now;
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(WorkerEvent::SingleProgress(SingleProgress {
+                cpu_progress: self.cpu_progress,
+                gpu_progress: self.gpu_progress,
+                elapsed_s: self.started.elapsed().as_secs_f64(),
+                eta_s: self.eta_s(),
+                phase: self.phase.clone(),
+            }));
+        }
+    }
+
+    fn eta_s(&self) -> Option<f64> {
+        if self.cpu_progress < 1.0 {
+            if self.cpu_progress > 0.001 {
+                let elapsed = self.started.elapsed().as_secs_f64();
+                let cpu_total_estimate = elapsed / self.cpu_progress as f64;
+                Some((cpu_total_estimate - elapsed).max(0.0) + self.gpu_estimate_s)
+            } else {
+                Some(self.gpu_estimate_s)
+            }
+        } else if self.gpu_progress < 1.0 {
+            self.gpu_started
+                .map(|started| (self.gpu_estimate_s - started.elapsed().as_secs_f64()).max(0.0))
+        } else {
+            None
+        }
+    }
+}
+
+struct ProgressTicker {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl ProgressTicker {
+    fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for ProgressTicker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 struct GpuRunner {
@@ -322,14 +472,29 @@ impl GpuRunner {
     }
 
     fn multiply(&self, n: usize, a: &[f32], b: &[f32], use_timestamps: bool) -> Result<GpuTiming> {
+        self.multiply_cancelable(n, a, b, use_timestamps, None)
+    }
+
+    fn multiply_cancelable(
+        &self,
+        n: usize,
+        a: &[f32],
+        b: &[f32],
+        use_timestamps: bool,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<GpuTiming> {
         let elements = n
             .checked_mul(n)
             .ok_or_else(|| anyhow!("matrix size overflow"))?;
         if a.len() != elements || b.len() != elements {
             return Err(anyhow!("matrix data length does not match {n}x{n}"));
         }
+        let n_u32 = u32::try_from(n).context("matrix size exceeds GPU shader limits")?;
 
-        let byte_len = (elements * std::mem::size_of::<f32>()) as wgpu::BufferAddress;
+        let byte_len = elements
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| anyhow!("matrix byte length overflow"))?
+            as wgpu::BufferAddress;
         let total_start = Instant::now();
 
         let a_buffer = self
@@ -359,8 +524,8 @@ impl GpuRunner {
             mapped_at_creation: false,
         });
         let params = Params {
-            n: n as u32,
-            _pad0: 0,
+            n: n_u32,
+            row_offset: 0,
             _pad1: 0,
             _pad2: 0,
         };
@@ -369,7 +534,7 @@ impl GpuRunner {
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Matrix params"),
                 contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -395,18 +560,22 @@ impl GpuRunner {
             ],
         });
 
+        let chunk_rows = GPU_DISPATCH_CHUNK_ROWS.min(n).max(1);
+        let chunk_count = n.div_ceil(chunk_rows);
         let timestamp_enabled = self.timestamp_query && use_timestamps;
+        let timestamp_query_count = (chunk_count * 2) as u32;
+        let timestamp_buffer_size = (timestamp_query_count as u64) * 8;
         let query_set = timestamp_enabled.then(|| {
             self.device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("GPU compute timestamps"),
                 ty: wgpu::QueryType::Timestamp,
-                count: 2,
+                count: timestamp_query_count,
             })
         });
         let timestamp_resolve = timestamp_enabled.then(|| {
             self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Timestamp resolve"),
-                size: 16,
+                size: timestamp_buffer_size,
                 usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             })
@@ -414,61 +583,85 @@ impl GpuRunner {
         let timestamp_readback = timestamp_enabled.then(|| {
             self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Timestamp readback"),
-                size: 16,
+                size: timestamp_buffer_size,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             })
         });
 
+        for (chunk_index, row_offset) in (0..n).step_by(chunk_rows).enumerate() {
+            self.check_gpu_canceled(cancel)?;
+            let rows_this_chunk = (n - row_offset).min(chunk_rows);
+            let params = Params {
+                n: n_u32,
+                row_offset: row_offset as u32,
+                _pad1: 0,
+                _pad2: 0,
+            };
+            self.queue
+                .write_buffer(&params_buffer, 0, bytemuck::bytes_of(&params));
+
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Matrix multiplication chunk encoder"),
+                });
+
+            {
+                let timestamp_writes =
+                    query_set
+                        .as_ref()
+                        .map(|query_set| wgpu::ComputePassTimestampWrites {
+                            query_set,
+                            beginning_of_pass_write_index: Some((chunk_index * 2) as u32),
+                            end_of_pass_write_index: Some((chunk_index * 2 + 1) as u32),
+                        });
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Matrix multiplication chunk pass"),
+                    timestamp_writes,
+                });
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                let groups_x = n_u32.div_ceil(TILE_SIZE);
+                let groups_y = (rows_this_chunk as u32).div_ceil(TILE_SIZE);
+                pass.dispatch_workgroups(groups_x, groups_y, 1);
+            }
+
+            let submission = self.queue.submit([encoder.finish()]);
+            self.wait_for_submission(submission, cancel, "waiting for GPU matrix chunk to finish")?;
+        }
+
+        self.check_gpu_canceled(cancel)?;
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Matrix multiplication encoder"),
+                label: Some("Matrix readback encoder"),
             });
-
-        {
-            let timestamp_writes =
-                query_set
-                    .as_ref()
-                    .map(|query_set| wgpu::ComputePassTimestampWrites {
-                        query_set,
-                        beginning_of_pass_write_index: Some(0),
-                        end_of_pass_write_index: Some(1),
-                    });
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Matrix multiplication pass"),
-                timestamp_writes,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            let groups = (n as u32).div_ceil(TILE_SIZE);
-            pass.dispatch_workgroups(groups, groups, 1);
-        }
-
         if let (Some(query_set), Some(resolve), Some(readback)) =
             (&query_set, &timestamp_resolve, &timestamp_readback)
         {
-            encoder.resolve_query_set(query_set, 0..2, resolve, 0);
-            encoder.copy_buffer_to_buffer(resolve, 0, readback, 0, 16);
+            encoder.resolve_query_set(query_set, 0..timestamp_query_count, resolve, 0);
+            encoder.copy_buffer_to_buffer(resolve, 0, readback, 0, timestamp_buffer_size);
         }
         encoder.copy_buffer_to_buffer(&c_buffer, 0, &readback_buffer, 0, byte_len);
 
         let submission = self.queue.submit([encoder.finish()]);
-        self.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(submission),
-                timeout: None,
-            })
-            .context("waiting for GPU submission")?;
+        self.wait_for_submission(submission, cancel, "waiting for GPU readback copy")?;
 
-        let output = read_f32_buffer(&self.device, &readback_buffer, elements)
+        let output = read_f32_buffer_cancelable(&self.device, &readback_buffer, elements, cancel)
             .context("reading GPU result buffer")?;
         let compute_ms = if let Some(readback) = &timestamp_readback {
-            read_timestamps(&self.device, readback)
+            read_timestamps(&self.device, readback, chunk_count, cancel)
                 .ok()
                 .map(|timestamps| {
-                    let delta = timestamps[1].saturating_sub(timestamps[0]);
-                    (delta as f64 * self.queue.get_timestamp_period() as f64) / 1_000_000.0
+                    let timestamp_period = self.queue.get_timestamp_period() as f64;
+                    timestamps
+                        .into_iter()
+                        .map(|[start, end]| {
+                            let delta = end.saturating_sub(start);
+                            (delta as f64 * timestamp_period) / 1_000_000.0
+                        })
+                        .sum::<f64>()
                 })
         } else {
             None
@@ -483,6 +676,34 @@ impl GpuRunner {
             transfer_sync_ms,
             output,
         })
+    }
+
+    fn wait_for_submission(
+        &self,
+        submission: wgpu::SubmissionIndex,
+        cancel: Option<&AtomicBool>,
+        context: &'static str,
+    ) -> Result<()> {
+        loop {
+            match self.device.poll(wgpu::PollType::Wait {
+                submission_index: Some(submission.clone()),
+                timeout: Some(Duration::from_millis(GPU_WAIT_POLL_MS)),
+            }) {
+                Ok(status) if status.wait_finished() => return Ok(()),
+                Ok(_) => self.check_gpu_canceled(cancel)?,
+                Err(wgpu::PollError::Timeout) => self.check_gpu_canceled(cancel)?,
+                Err(err) => return Err(anyhow!(err)).context(context),
+            }
+        }
+    }
+
+    fn check_gpu_canceled(&self, cancel: Option<&AtomicBool>) -> Result<()> {
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            self.device.destroy();
+            Err(anyhow!("Benchmark canceled while GPU work was running"))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -499,22 +720,18 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-fn read_f32_buffer(
+fn read_f32_buffer_cancelable(
     device: &wgpu::Device,
     buffer: &wgpu::Buffer,
     elements: usize,
+    cancel: Option<&AtomicBool>,
 ) -> Result<Vec<f32>> {
     let slice = buffer.slice(..);
     let (tx, rx) = mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = tx.send(result.map_err(|err| err.to_string()));
     });
-    device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .context("polling mapped result buffer")?;
-    rx.recv()
-        .context("waiting for result buffer map callback")?
-        .map_err(|err| anyhow!(err))?;
+    wait_for_map_callback(device, &rx, cancel, "polling mapped result buffer")?;
     let data = slice.get_mapped_range();
     let output = bytemuck::cast_slice::<u8, f32>(&data)
         .iter()
@@ -526,24 +743,53 @@ fn read_f32_buffer(
     Ok(output)
 }
 
-fn read_timestamps(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<[u64; 2]> {
+fn read_timestamps(
+    device: &wgpu::Device,
+    buffer: &wgpu::Buffer,
+    pair_count: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<[u64; 2]>> {
     let slice = buffer.slice(..);
     let (tx, rx) = mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = tx.send(result.map_err(|err| err.to_string()));
     });
-    device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .context("polling mapped timestamp buffer")?;
-    rx.recv()
-        .context("waiting for timestamp map callback")?
-        .map_err(|err| anyhow!(err))?;
+    wait_for_map_callback(device, &rx, cancel, "polling mapped timestamp buffer")?;
     let data = slice.get_mapped_range();
     let timestamps = bytemuck::cast_slice::<u8, u64>(&data);
-    let result = [timestamps[0], timestamps[1]];
+    let result = timestamps
+        .chunks_exact(2)
+        .take(pair_count)
+        .map(|pair| [pair[0], pair[1]])
+        .collect();
     drop(data);
     buffer.unmap();
     Ok(result)
+}
+
+fn wait_for_map_callback(
+    device: &wgpu::Device,
+    rx: &Receiver<Result<(), String>>,
+    cancel: Option<&AtomicBool>,
+    context: &'static str,
+) -> Result<()> {
+    loop {
+        match rx.try_recv() {
+            Ok(result) => return result.map_err(|err| anyhow!(err)),
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(anyhow!("map callback channel closed"));
+            }
+        }
+        check_canceled(cancel)?;
+        match device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(Duration::from_millis(GPU_WAIT_POLL_MS)),
+        }) {
+            Ok(_) | Err(wgpu::PollError::Timeout) => {}
+            Err(err) => return Err(anyhow!(err)).context(context),
+        }
+    }
 }
 
 fn enumerate_adapters() -> Vec<AdapterInfo> {
@@ -675,7 +921,8 @@ fn generate_matrices_cancelable(
 
 #[cfg(test)]
 fn cpu_multiply(size: usize, a: &[f32], b: &[f32]) -> (Vec<f32>, f64) {
-    cpu_multiply_cancelable(size, a, b, None).expect("uncancelable CPU multiply cannot be canceled")
+    cpu_multiply_cancelable(size, a, b, None, None)
+        .expect("uncancelable CPU multiply cannot be canceled")
 }
 
 fn cpu_multiply_cancelable(
@@ -683,10 +930,19 @@ fn cpu_multiply_cancelable(
     a: &[f32],
     b: &[f32],
     cancel: Option<&AtomicBool>,
+    mut progress: Option<&mut SingleProgressTracker>,
 ) -> Result<(Vec<f32>, f64)> {
     let mut c = vec![0.0_f32; size * size];
     let tile = 32usize;
+    let blocks_per_dim = size.div_ceil(tile);
+    let total_blocks = (blocks_per_dim * blocks_per_dim * blocks_per_dim).max(1) as f32;
+    let mut completed_blocks = 0usize;
     let start = Instant::now();
+
+    if let Some(progress) = progress.as_deref_mut() {
+        progress.set_phase("CPU computing", true);
+        progress.set_cpu_progress(0.0, true);
+    }
 
     for ii in (0..size).step_by(tile) {
         check_canceled(cancel)?;
@@ -708,11 +964,79 @@ fn cpu_multiply_cancelable(
                         }
                     }
                 }
+                completed_blocks += 1;
+                if let Some(progress) = progress.as_deref_mut() {
+                    progress.set_cpu_progress(completed_blocks as f32 / total_blocks, false);
+                }
             }
         }
     }
 
+    if let Some(progress) = progress.as_deref_mut() {
+        progress.set_cpu_progress(1.0, true);
+    }
+
     Ok((c, start.elapsed().as_secs_f64() * 1000.0))
+}
+
+fn estimate_cpu_multiply_ms(
+    size: usize,
+    a: &[f32],
+    b: &[f32],
+    cancel: Option<&AtomicBool>,
+    mut progress: Option<&mut SingleProgressTracker>,
+) -> Result<f64> {
+    let tile = 32usize;
+    let blocks_per_dim = size.div_ceil(tile);
+    let total_blocks = (blocks_per_dim * blocks_per_dim * blocks_per_dim).max(1);
+    let sample_blocks = CPU_ESTIMATE_SAMPLE_BLOCKS.min(total_blocks);
+    let mut sampled_blocks = 0usize;
+    let mut sink = 0.0_f32;
+    let start = Instant::now();
+
+    if let Some(progress) = progress.as_deref_mut() {
+        progress.set_phase("Estimating CPU baseline", true);
+        progress.set_cpu_progress(0.0, true);
+    }
+
+    'outer: for ii in (0..size).step_by(tile) {
+        check_canceled(cancel)?;
+        let i_end = (ii + tile).min(size);
+        for kk in (0..size).step_by(tile) {
+            check_canceled(cancel)?;
+            let k_end = (kk + tile).min(size);
+            for jj in (0..size).step_by(tile) {
+                check_canceled(cancel)?;
+                let j_end = (jj + tile).min(size);
+                for i in ii..i_end {
+                    let a_row = i * size;
+                    for k in kk..k_end {
+                        let a_val = a[a_row + k];
+                        let b_row = k * size;
+                        for j in jj..j_end {
+                            sink += a_val * b[b_row + j];
+                        }
+                    }
+                }
+                sampled_blocks += 1;
+                if let Some(progress) = progress.as_deref_mut() {
+                    progress.set_cpu_progress(sampled_blocks as f32 / sample_blocks as f32, false);
+                }
+                if sampled_blocks >= sample_blocks {
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    std::hint::black_box(sink);
+
+    if let Some(progress) = progress.as_deref_mut() {
+        progress.set_cpu_progress(1.0, true);
+    }
+
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    Ok(elapsed_ms * total_blocks as f64 / sampled_blocks.max(1) as f64)
 }
 
 #[cfg(test)]
@@ -758,9 +1082,68 @@ fn validate_cancelable(
     }
 }
 
+fn validate_sampled(
+    a: &[f32],
+    b: &[f32],
+    gpu: &[f32],
+    size: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<String> {
+    if gpu.len() != size * size {
+        return Ok(format!(
+            "Failed: GPU len {}, expected {}",
+            gpu.len(),
+            size * size
+        ));
+    }
+
+    let sample_count = VALIDATION_SAMPLE_POINTS.min(size * size).max(1);
+    let mut max_abs = 0.0_f32;
+    let mut max_rel = 0.0_f32;
+
+    for index in 0..sample_count {
+        check_canceled(cancel)?;
+        let row = sample_index(index, size, 0x9E37_79B9);
+        let col = sample_index(index, size, 0x85EB_CA6B);
+        let mut expected = 0.0_f32;
+        let a_row = row * size;
+        for k in 0..size {
+            expected += a[a_row + k] * b[k * size + col];
+        }
+        let actual = gpu[row * size + col];
+        let diff = (expected - actual).abs();
+        max_abs = max_abs.max(diff);
+        max_rel = max_rel.max(diff / expected.abs().max(1.0));
+    }
+
+    let abs_tol = 0.02_f32.max(size as f32 * 0.00005);
+    let rel_tol = 0.0025_f32;
+    if max_abs <= abs_tol || max_rel <= rel_tol {
+        Ok(format!(
+            "Sampled pass ({sample_count} points, max abs {max_abs:.5}, max rel {max_rel:.5})"
+        ))
+    } else {
+        Ok(format!(
+            "Sampled fail ({sample_count} points, max abs {max_abs:.5}, max rel {max_rel:.5})"
+        ))
+    }
+}
+
+fn sample_index(index: usize, size: usize, salt: usize) -> usize {
+    if size == 1 {
+        0
+    } else {
+        let mixed = index
+            .wrapping_mul(1_103_515_245usize)
+            .wrapping_add(12_345usize)
+            ^ salt;
+        mixed % size
+    }
+}
+
 fn run_single(size: usize, adapter: AdapterInfo, validate_output: bool) -> Result<BenchmarkResult> {
     let cancel = AtomicBool::new(false);
-    run_single_cancelable(size, adapter, validate_output, &cancel)
+    run_single_cancelable(size, adapter, validate_output, &cancel, None)
 }
 
 fn run_single_cancelable(
@@ -768,22 +1151,45 @@ fn run_single_cancelable(
     adapter: AdapterInfo,
     validate_output: bool,
     cancel: &AtomicBool,
+    progress_tx: Option<Sender<WorkerEvent>>,
 ) -> Result<BenchmarkResult> {
+    let mut progress = SingleProgressTracker::new(size, &adapter, progress_tx);
+    progress.set_phase("Generating matrices", true);
     let (a, b) = generate_matrices_cancelable(size, Some(cancel))?;
-    let (cpu_output, cpu_ms) = cpu_multiply_cancelable(size, &a, &b, Some(cancel))?;
+    let use_exact_cpu = size <= MAX_EXACT_CPU_SIZE;
+    let (cpu_output, cpu_ms, cpu_estimated) = if use_exact_cpu {
+        let (cpu_output, cpu_ms) =
+            cpu_multiply_cancelable(size, &a, &b, Some(cancel), Some(&mut progress))?;
+        (Some(cpu_output), cpu_ms, false)
+    } else {
+        let cpu_ms = estimate_cpu_multiply_ms(size, &a, &b, Some(cancel), Some(&mut progress))?;
+        (None, cpu_ms, true)
+    };
     check_canceled(Some(cancel))?;
+    progress.set_phase("Preparing GPU", true);
     let runner = GpuRunner::new(adapter.index)?;
     check_canceled(Some(cancel))?;
-    let gpu = runner.multiply(size, &a, &b, true)?;
+    let gpu_ticker = progress.start_gpu_ticker();
+    let gpu = runner.multiply_cancelable(size, &a, &b, true, Some(cancel))?;
+    if let Some(ticker) = gpu_ticker {
+        ticker.stop();
+    }
+    progress.set_gpu_progress(1.0, true);
     check_canceled_with(
         Some(cancel),
         "Benchmark canceled after the current GPU dispatch completed",
     )?;
     let validation = if validate_output {
-        validate_cancelable(&cpu_output, &gpu.output, size, Some(cancel))?
+        progress.set_phase("Validating GPU output", true);
+        if let Some(cpu_output) = cpu_output.as_deref() {
+            validate_cancelable(cpu_output, &gpu.output, size, Some(cancel))?
+        } else {
+            validate_sampled(&a, &b, &gpu.output, size, Some(cancel))?
+        }
     } else {
         "Skipped".to_owned()
     };
+    progress.set_phase("Benchmark complete", true);
     let speedup = if gpu.total_ms > 0.0 {
         cpu_ms / gpu.total_ms
     } else {
@@ -793,6 +1199,7 @@ fn run_single_cancelable(
         size,
         adapter: adapter.label(),
         cpu_ms,
+        cpu_estimated,
         gpu_compute_ms: gpu.compute_ms,
         gpu_total_ms: gpu.total_ms,
         transfer_sync_ms: gpu.transfer_sync_ms,
@@ -860,7 +1267,7 @@ fn run_repeat(
             },
             canceled,
         };
-        if force || now.duration_since(last_emit) >= Duration::from_millis(100) {
+        if force || now.duration_since(last_emit) >= Duration::from_millis(PROGRESS_SAMPLE_MS) {
             let _ = tx.send(WorkerEvent::RepeatProgress(progress.clone()));
             last_emit = now;
         }
@@ -870,7 +1277,12 @@ fn run_repeat(
     match mode {
         RepeatMode::Cpu => {
             while Instant::now() < deadline && !cancel.load(Ordering::Relaxed) {
-                let (_, elapsed_ms) = cpu_multiply_cancelable(size, &a, &b, Some(&cancel))?;
+                let (_, elapsed_ms) =
+                    match cpu_multiply_cancelable(size, &a, &b, Some(&cancel), None) {
+                        Ok(result) => result,
+                        Err(_) if cancel.load(Ordering::Relaxed) => break,
+                        Err(err) => return Err(err),
+                    };
                 latest_ms = elapsed_ms;
                 total_ms += elapsed_ms;
                 iterations += 1;
@@ -889,7 +1301,11 @@ fn run_repeat(
             let runner = GpuRunner::new(adapter.index)?;
             while Instant::now() < deadline && !cancel.load(Ordering::Relaxed) {
                 check_canceled(Some(&cancel))?;
-                let timing = runner.multiply(size, &a, &b, true)?;
+                let timing = match runner.multiply_cancelable(size, &a, &b, true, Some(&cancel)) {
+                    Ok(timing) => timing,
+                    Err(_) if cancel.load(Ordering::Relaxed) => break,
+                    Err(err) => return Err(err),
+                };
                 latest_ms = timing.total_ms;
                 total_ms += timing.total_ms;
                 if let Some(compute_ms) = timing.compute_ms {
@@ -932,6 +1348,9 @@ struct HardwareAccelApp {
     log: Vec<String>,
     status: String,
     progress: f32,
+    cpu_progress: f32,
+    gpu_progress: f32,
+    eta_text: String,
     rx: Receiver<WorkerEvent>,
     tx: Sender<WorkerEvent>,
     cancel: Option<Arc<AtomicBool>>,
@@ -959,6 +1378,9 @@ impl HardwareAccelApp {
             log: Vec::new(),
             status: "Ready".to_owned(),
             progress: 0.0,
+            cpu_progress: 0.0,
+            gpu_progress: 0.0,
+            eta_text: String::new(),
             rx,
             tx,
             cancel: None,
@@ -1064,12 +1486,16 @@ impl HardwareAccelApp {
         let worker_cancel = Arc::clone(&cancel);
         self.cancel = Some(cancel);
         self.running = true;
-        self.progress = 0.1;
+        self.progress = 0.0;
+        self.cpu_progress = 0.0;
+        self.gpu_progress = 0.0;
+        self.eta_text = "ETA: estimating".to_owned();
         self.status = format!("Running {size}x{size} benchmark...");
         self.log(format!("Starting benchmark on {}", adapter.label()));
         thread::spawn(move || {
-            let result = run_single_cancelable(size, adapter, validate, &worker_cancel)
-                .map_err(|err| format!("{err:#}"));
+            let result =
+                run_single_cancelable(size, adapter, validate, &worker_cancel, Some(tx.clone()))
+                    .map_err(|err| format!("{err:#}"));
             let _ = tx.send(WorkerEvent::SingleDone(result));
         });
     }
@@ -1216,6 +1642,18 @@ impl HardwareAccelApp {
     fn poll_worker_events(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
+                WorkerEvent::SingleProgress(progress) => {
+                    self.cpu_progress = progress.cpu_progress;
+                    self.gpu_progress = progress.gpu_progress;
+                    self.progress =
+                        ((progress.cpu_progress + progress.gpu_progress) / 2.0).clamp(0.0, 1.0);
+                    self.eta_text = format_eta(progress.eta_s);
+                    self.status = format!(
+                        "{} - elapsed {}",
+                        progress.phase,
+                        format_elapsed(progress.elapsed_s)
+                    );
+                }
                 WorkerEvent::SingleDone(result) => {
                     self.running = false;
                     self.repeat_running = false;
@@ -1223,10 +1661,13 @@ impl HardwareAccelApp {
                     match result {
                         Ok(result) => {
                             self.progress = 1.0;
+                            self.cpu_progress = 1.0;
+                            self.gpu_progress = 1.0;
+                            self.eta_text = "ETA: complete".to_owned();
                             self.status = "Benchmark complete".to_owned();
                             self.log(format!(
                                 "Benchmark complete: CPU {} ms, GPU total {} ms, GPU compute {} ms",
-                                format_ms(Some(result.cpu_ms)),
+                                format_cpu_ms(&result),
                                 format_ms(Some(result.gpu_total_ms)),
                                 format_ms(result.gpu_compute_ms)
                             ));
@@ -1235,8 +1676,10 @@ impl HardwareAccelApp {
                         Err(err) => {
                             if err.to_ascii_lowercase().contains("canceled") {
                                 self.progress = 0.0;
+                                self.eta_text = "ETA: canceled".to_owned();
                             } else {
                                 self.progress = 1.0;
+                                self.eta_text.clear();
                             }
                             self.status = err.clone();
                             self.log(err);
@@ -1246,6 +1689,8 @@ impl HardwareAccelApp {
                 WorkerEvent::RepeatProgress(progress) => {
                     self.progress =
                         (progress.elapsed_s / progress.duration_s).clamp(0.0, 1.0) as f32;
+                    self.eta_text =
+                        format_eta(Some((progress.duration_s - progress.elapsed_s).max(0.0)));
                     self.status = format!(
                         "{} repeat: {:.1}s, {} iteration(s), latest {} ms, avg {} ms, compute avg {} ms",
                         progress.mode,
@@ -1260,6 +1705,7 @@ impl HardwareAccelApp {
                     self.running = false;
                     self.repeat_running = false;
                     self.cancel = None;
+                    self.eta_text.clear();
                     match result {
                         Ok(progress) => {
                             if !progress.canceled {
@@ -1308,8 +1754,33 @@ impl eframe::App for HardwareAccelApp {
                 ui.heading("Hardware Acceleration Tester");
                 ui.separator();
                 ui.label(&self.status);
+                if !self.eta_text.is_empty() {
+                    ui.separator();
+                    ui.label(&self.eta_text);
+                }
             });
-            ui.add(egui::ProgressBar::new(self.progress).show_percentage());
+            if self.repeat_running {
+                ui.add(
+                    egui::ProgressBar::new(self.progress)
+                        .show_percentage()
+                        .text("Repeat elapsed"),
+                );
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label("CPU");
+                    ui.add(
+                        egui::ProgressBar::new(self.cpu_progress)
+                            .show_percentage()
+                            .desired_width(260.0),
+                    );
+                    ui.label("GPU");
+                    ui.add(
+                        egui::ProgressBar::new(self.gpu_progress)
+                            .show_percentage()
+                            .desired_width(260.0),
+                    );
+                });
+            }
         });
 
         egui::Panel::left("controls")
@@ -1405,7 +1876,7 @@ impl eframe::App for HardwareAccelApp {
                     if size >= 4096 {
                         ui.colored_label(
                             egui::Color32::YELLOW,
-                            "Large sizes can take a long time on CPU and require substantial GPU memory.",
+                            "Large sizes use a sampled CPU estimate and can still take a long time on GPU.",
                         );
                     }
                     if size == 16384 {
@@ -1487,7 +1958,7 @@ impl eframe::App for HardwareAccelApp {
 
                                     for result in &self.results {
                                         ui.label(format!("{}x{}", result.size, result.size));
-                                        ui.label(format_ms(Some(result.cpu_ms)));
+                                        ui.label(format_cpu_ms(result));
                                         ui.label(format_ms(result.gpu_compute_ms));
                                         ui.label(format_ms(Some(result.gpu_total_ms)));
                                         ui.label(format_ms(result.transfer_sync_ms));
@@ -1560,6 +2031,30 @@ fn gpu_working_set_bytes(size: usize) -> Option<u64> {
     matrix_buffers_bytes(size, 4)
 }
 
+fn estimate_gpu_seconds(size: usize, adapter: &AdapterInfo) -> f64 {
+    let n = size as f64;
+    let flops = 2.0 * n * n * n;
+    let throughput_flops = match adapter.device_type {
+        wgpu::DeviceType::DiscreteGpu => 8.0e12,
+        wgpu::DeviceType::IntegratedGpu => 7.0e11,
+        wgpu::DeviceType::VirtualGpu => 5.0e11,
+        wgpu::DeviceType::Cpu => 1.0e11,
+        wgpu::DeviceType::Other => 1.0e12,
+    };
+    let bandwidth_bytes = match adapter.device_type {
+        wgpu::DeviceType::DiscreteGpu => 12.0e9,
+        wgpu::DeviceType::IntegratedGpu => 25.0e9,
+        wgpu::DeviceType::VirtualGpu => 10.0e9,
+        wgpu::DeviceType::Cpu => 8.0e9,
+        wgpu::DeviceType::Other => 12.0e9,
+    };
+    let transfer_s = gpu_working_set_bytes(size)
+        .map(|bytes| bytes as f64 / bandwidth_bytes)
+        .unwrap_or(0.0);
+    let compute_s = flops / throughput_flops;
+    (compute_s + transfer_s).max(0.2)
+}
+
 fn adapter_memory_limit_bytes(adapter: &AdapterInfo) -> Option<(u64, &'static str)> {
     let dedicated = adapter.dedicated_vram_bytes.unwrap_or(0);
     let shared = adapter.shared_system_memory_bytes.unwrap_or(0);
@@ -1600,11 +2095,44 @@ fn format_optional_bytes(bytes: Option<u64>) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
+fn format_eta(value: Option<f64>) -> String {
+    match value {
+        Some(seconds) if seconds <= 0.5 => "ETA: <1s".to_owned(),
+        Some(seconds) => format!("ETA: {}", format_elapsed(seconds)),
+        None => "ETA: estimating".to_owned(),
+    }
+}
+
+fn format_elapsed(seconds: f64) -> String {
+    if seconds >= 3600.0 {
+        let hours = (seconds / 3600.0).floor();
+        let minutes = ((seconds % 3600.0) / 60.0).floor();
+        format!("{hours:.0}h {minutes:.0}m")
+    } else if seconds >= 60.0 {
+        let minutes = (seconds / 60.0).floor();
+        let secs = seconds % 60.0;
+        format!("{minutes:.0}m {secs:.0}s")
+    } else if seconds >= 10.0 {
+        format!("{seconds:.0}s")
+    } else {
+        format!("{seconds:.1}s")
+    }
+}
+
 fn format_ms(value: Option<f64>) -> String {
     match value {
         Some(value) if value >= 1000.0 => format!("{value:.1}"),
         Some(value) => format!("{value:.3}"),
         None => "N/A".to_owned(),
+    }
+}
+
+fn format_cpu_ms(result: &BenchmarkResult) -> String {
+    let value = format_ms(Some(result.cpu_ms));
+    if result.cpu_estimated {
+        format!("~{value}")
+    } else {
+        value
     }
 }
 
@@ -1679,7 +2207,7 @@ fn run_cli(args: &[String]) -> Result<bool> {
         println!("Running self-test on {}", adapter.label());
         let result = run_single(size, adapter, true)?;
         println!("Size: {}x{}", result.size, result.size);
-        println!("CPU: {} ms", format_ms(Some(result.cpu_ms)));
+        println!("CPU: {} ms", format_cpu_ms(&result));
         println!("GPU compute: {} ms", format_ms(result.gpu_compute_ms));
         println!("GPU total: {} ms", format_ms(Some(result.gpu_total_ms)));
         println!("Transfer/sync: {} ms", format_ms(result.transfer_sync_ms));
@@ -1744,6 +2272,45 @@ mod tests {
         let cpu = vec![1.0, 2.0, 3.0, 4.0];
         let gpu = vec![1.0, 2.00001, 3.0, 4.0];
         assert!(validate(&cpu, &gpu, 2).starts_with("Passed"));
+    }
+
+    #[test]
+    fn sampled_validation_accepts_exact_output() {
+        let (a, b) = generate_matrices(4).unwrap();
+        let (c, _) = cpu_multiply(4, &a, &b);
+
+        assert!(
+            validate_sampled(&a, &b, &c, 4, None)
+                .unwrap()
+                .starts_with("Sampled pass")
+        );
+    }
+
+    #[test]
+    fn cpu_estimate_honors_cancellation() {
+        let (a, b) = generate_matrices(4).unwrap();
+        let cancel = AtomicBool::new(true);
+
+        let err = estimate_cpu_multiply_ms(4, &a, &b, Some(&cancel), None).unwrap_err();
+
+        assert!(err.to_string().contains("canceled"));
+    }
+
+    #[test]
+    fn estimated_cpu_format_is_marked() {
+        let result = BenchmarkResult {
+            size: 4096,
+            adapter: "Test GPU".to_owned(),
+            cpu_ms: 1234.0,
+            cpu_estimated: true,
+            gpu_compute_ms: Some(10.0),
+            gpu_total_ms: 12.0,
+            transfer_sync_ms: Some(2.0),
+            speedup: 102.83,
+            validation: "Skipped".to_owned(),
+        };
+
+        assert_eq!(format_cpu_ms(&result), "~1234.0");
     }
 
     #[test]
