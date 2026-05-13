@@ -20,11 +20,10 @@ const DEFAULT_SIZES: &[usize] = &[
 const TILE_SIZE: u32 = 16;
 const CANCEL_CHECK_INTERVAL: usize = 1_048_576;
 const PROGRESS_SAMPLE_MS: u64 = 200;
-const MAX_EXACT_CPU_SIZE: usize = 2048;
 const CPU_ESTIMATE_SAMPLE_BLOCKS: usize = 2048;
 const VALIDATION_SAMPLE_POINTS: usize = 256;
-const GPU_DISPATCH_CHUNK_ROWS: usize = 64;
-const GPU_WAIT_POLL_MS: u64 = 100;
+const GPU_CANCELABLE_CHUNK_ROWS: usize = 16;
+const GPU_WAIT_POLL_MS: u64 = 1;
 
 const MATMUL_SHADER: &str = r#"
 const TILE: u32 = 16u;
@@ -32,7 +31,7 @@ const TILE: u32 = 16u;
 struct Params {
     n: u32,
     row_offset: u32,
-    _pad1: u32,
+    row_count: u32,
     _pad2: u32,
 }
 
@@ -51,6 +50,7 @@ fn main(
 ) {
     let row = gid.y + params.row_offset;
     let col = gid.x;
+    let row_in_chunk = gid.y < params.row_count;
     var sum = 0.0;
 
     var tile = 0u;
@@ -62,7 +62,7 @@ fn main(
         let a_col = tile + lid.x;
         let b_row = tile + lid.y;
 
-        if (row < params.n && a_col < params.n) {
+        if (row_in_chunk && row < params.n && a_col < params.n) {
             tile_a[lid.y][lid.x] = a[row * params.n + a_col];
         } else {
             tile_a[lid.y][lid.x] = 0.0;
@@ -84,7 +84,7 @@ fn main(
         tile = tile + TILE;
     }
 
-    if (row < params.n && col < params.n) {
+    if (row_in_chunk && row < params.n && col < params.n) {
         c[row * params.n + col] = sum;
     }
 }
@@ -95,7 +95,7 @@ fn main(
 struct Params {
     n: u32,
     row_offset: u32,
-    _pad1: u32,
+    row_count: u32,
     _pad2: u32,
 }
 
@@ -136,9 +136,31 @@ struct DxgiMemoryInfo {
 }
 
 #[derive(Clone, Debug)]
+struct CpuInfo {
+    model: String,
+    logical_processors: usize,
+}
+
+impl CpuInfo {
+    fn label(&self) -> String {
+        format!(
+            "{} ({} logical processor{})",
+            self.model,
+            self.logical_processors,
+            if self.logical_processors == 1 {
+                ""
+            } else {
+                "s"
+            }
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
 struct BenchmarkResult {
     size: usize,
     adapter: String,
+    cpu_model: String,
     cpu_ms: f64,
     cpu_estimated: bool,
     gpu_compute_ms: Option<f64>,
@@ -233,6 +255,7 @@ struct PendingVramWarning {
     size: usize,
     adapter: AdapterInfo,
     validate_output: bool,
+    estimate_cpu_time: bool,
     repeat_mode: RepeatMode,
     repeat_duration: RepeatDuration,
     estimated_gpu_bytes: u64,
@@ -526,7 +549,7 @@ impl GpuRunner {
         let params = Params {
             n: n_u32,
             row_offset: 0,
-            _pad1: 0,
+            row_count: 0,
             _pad2: 0,
         };
         let params_buffer = self
@@ -560,7 +583,7 @@ impl GpuRunner {
             ],
         });
 
-        let chunk_rows = GPU_DISPATCH_CHUNK_ROWS.min(n).max(1);
+        let chunk_rows = gpu_dispatch_chunk_rows(n);
         let chunk_count = n.div_ceil(chunk_rows);
         let timestamp_enabled = self.timestamp_query && use_timestamps;
         let timestamp_query_count = (chunk_count * 2) as u32;
@@ -595,7 +618,7 @@ impl GpuRunner {
             let params = Params {
                 n: n_u32,
                 row_offset: row_offset as u32,
-                _pad1: 0,
+                row_count: rows_this_chunk as u32,
                 _pad2: 0,
             };
             self.queue
@@ -680,20 +703,36 @@ impl GpuRunner {
 
     fn wait_for_submission(
         &self,
-        submission: wgpu::SubmissionIndex,
+        _submission: wgpu::SubmissionIndex,
         cancel: Option<&AtomicBool>,
         context: &'static str,
     ) -> Result<()> {
+        let (done_tx, done_rx) = mpsc::channel();
+        self.queue.on_submitted_work_done(move || {
+            let _ = done_tx.send(());
+        });
+
         loop {
-            match self.device.poll(wgpu::PollType::Wait {
-                submission_index: Some(submission.clone()),
-                timeout: Some(Duration::from_millis(GPU_WAIT_POLL_MS)),
-            }) {
-                Ok(status) if status.wait_finished() => return Ok(()),
-                Ok(_) => self.check_gpu_canceled(cancel)?,
-                Err(wgpu::PollError::Timeout) => self.check_gpu_canceled(cancel)?,
+            self.check_gpu_canceled(cancel)?;
+            match done_rx.try_recv() {
+                Ok(()) => return Ok(()),
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(anyhow!("GPU completion callback channel closed")).context(context);
+                }
+            }
+            match self.device.poll(wgpu::PollType::Poll) {
+                Ok(_) => {}
                 Err(err) => return Err(anyhow!(err)).context(context),
             }
+            match done_rx.try_recv() {
+                Ok(()) => return Ok(()),
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(anyhow!("GPU completion callback channel closed")).context(context);
+                }
+            }
+            thread::sleep(Duration::from_millis(GPU_WAIT_POLL_MS));
         }
     }
 
@@ -717,6 +756,16 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
             min_binding_size: None,
         },
         count: None,
+    }
+}
+
+fn gpu_dispatch_chunk_rows(size: usize) -> usize {
+    if size <= 1024 {
+        size.max(1)
+    } else if size <= 2048 {
+        64
+    } else {
+        GPU_CANCELABLE_CHUNK_ROWS.min(size).max(1)
     }
 }
 
@@ -774,6 +823,7 @@ fn wait_for_map_callback(
     context: &'static str,
 ) -> Result<()> {
     loop {
+        check_canceled(cancel)?;
         match rx.try_recv() {
             Ok(result) => return result.map_err(|err| anyhow!(err)),
             Err(mpsc::TryRecvError::Empty) => {}
@@ -781,14 +831,18 @@ fn wait_for_map_callback(
                 return Err(anyhow!("map callback channel closed"));
             }
         }
-        check_canceled(cancel)?;
-        match device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: Some(Duration::from_millis(GPU_WAIT_POLL_MS)),
-        }) {
-            Ok(_) | Err(wgpu::PollError::Timeout) => {}
+        match device.poll(wgpu::PollType::Poll) {
+            Ok(_) => {}
             Err(err) => return Err(anyhow!(err)).context(context),
         }
+        match rx.try_recv() {
+            Ok(result) => return result.map_err(|err| anyhow!(err)),
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(anyhow!("map callback channel closed"));
+            }
+        }
+        thread::sleep(Duration::from_millis(GPU_WAIT_POLL_MS));
     }
 }
 
@@ -893,6 +947,46 @@ fn normalize_adapter_name(value: &str) -> String {
         .filter(|character| character.is_ascii_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+fn detect_cpu_info() -> CpuInfo {
+    CpuInfo {
+        model: cpu_model_name().unwrap_or_else(|| "Unknown CPU".to_owned()),
+        logical_processors: thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1),
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn cpu_model_name() -> Option<String> {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::__cpuid;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::__cpuid;
+
+    let max_extended = __cpuid(0x8000_0000).eax;
+    if max_extended < 0x8000_0004 {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(48);
+    for leaf in 0x8000_0002..=0x8000_0004 {
+        let result = __cpuid(leaf);
+        for register in [result.eax, result.ebx, result.ecx, result.edx] {
+            bytes.extend_from_slice(&register.to_le_bytes());
+        }
+    }
+
+    String::from_utf8(bytes)
+        .ok()
+        .map(|value| value.trim_matches('\0').trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+fn cpu_model_name() -> Option<String> {
+    None
 }
 
 #[cfg(test)]
@@ -1141,29 +1235,42 @@ fn sample_index(index: usize, size: usize, salt: usize) -> usize {
     }
 }
 
-fn run_single(size: usize, adapter: AdapterInfo, validate_output: bool) -> Result<BenchmarkResult> {
+fn run_single(
+    size: usize,
+    adapter: AdapterInfo,
+    validate_output: bool,
+    estimate_cpu_time: bool,
+) -> Result<BenchmarkResult> {
     let cancel = AtomicBool::new(false);
-    run_single_cancelable(size, adapter, validate_output, &cancel, None)
+    run_single_cancelable(
+        size,
+        adapter,
+        validate_output,
+        estimate_cpu_time,
+        &cancel,
+        None,
+    )
 }
 
 fn run_single_cancelable(
     size: usize,
     adapter: AdapterInfo,
     validate_output: bool,
+    estimate_cpu_time: bool,
     cancel: &AtomicBool,
     progress_tx: Option<Sender<WorkerEvent>>,
 ) -> Result<BenchmarkResult> {
     let mut progress = SingleProgressTracker::new(size, &adapter, progress_tx);
+    let cpu_info = detect_cpu_info();
     progress.set_phase("Generating matrices", true);
     let (a, b) = generate_matrices_cancelable(size, Some(cancel))?;
-    let use_exact_cpu = size <= MAX_EXACT_CPU_SIZE;
-    let (cpu_output, cpu_ms, cpu_estimated) = if use_exact_cpu {
+    let (cpu_output, cpu_ms, cpu_estimated) = if estimate_cpu_time {
+        let cpu_ms = estimate_cpu_multiply_ms(size, &a, &b, Some(cancel), Some(&mut progress))?;
+        (None, cpu_ms, true)
+    } else {
         let (cpu_output, cpu_ms) =
             cpu_multiply_cancelable(size, &a, &b, Some(cancel), Some(&mut progress))?;
         (Some(cpu_output), cpu_ms, false)
-    } else {
-        let cpu_ms = estimate_cpu_multiply_ms(size, &a, &b, Some(cancel), Some(&mut progress))?;
-        (None, cpu_ms, true)
     };
     check_canceled(Some(cancel))?;
     progress.set_phase("Preparing GPU", true);
@@ -1198,6 +1305,7 @@ fn run_single_cancelable(
     Ok(BenchmarkResult {
         size,
         adapter: adapter.label(),
+        cpu_model: cpu_info.label(),
         cpu_ms,
         cpu_estimated,
         gpu_compute_ms: gpu.compute_ms,
@@ -1339,9 +1447,11 @@ fn run_repeat(
 
 struct HardwareAccelApp {
     adapters: Vec<AdapterInfo>,
+    cpu_info: CpuInfo,
     selected_adapter: usize,
     size_text: String,
     validate_output: bool,
+    estimate_cpu_time: bool,
     repeat_mode: RepeatMode,
     repeat_duration: RepeatDuration,
     results: Vec<BenchmarkResult>,
@@ -1363,15 +1473,18 @@ impl HardwareAccelApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let (tx, rx) = mpsc::channel();
         let adapters = enumerate_adapters();
+        let cpu_info = detect_cpu_info();
         let selected_adapter = adapters
             .iter()
             .position(|adapter| adapter.device_type != wgpu::DeviceType::Cpu)
             .unwrap_or(0);
         let mut app = Self {
             adapters,
+            cpu_info,
             selected_adapter,
             size_text: DEFAULT_SIZES[6].to_string(),
             validate_output: true,
+            estimate_cpu_time: false,
             repeat_mode: RepeatMode::Gpu,
             repeat_duration: RepeatDuration::OneMinute,
             results: Vec::new(),
@@ -1393,6 +1506,7 @@ impl HardwareAccelApp {
             app.status = "No wgpu adapters found".to_owned();
             app.log("No wgpu adapters found");
         } else {
+            app.log(format!("CPU: {}", app.cpu_info.label()));
             app.log(format!("Found {} adapter(s)", app.adapters.len()));
             for adapter in app.adapters.clone() {
                 app.log(format!(
@@ -1468,6 +1582,7 @@ impl HardwareAccelApp {
                 size,
                 adapter.clone(),
                 self.validate_output,
+                self.estimate_cpu_time,
                 self.repeat_mode,
                 self.repeat_duration,
             ) {
@@ -1477,10 +1592,16 @@ impl HardwareAccelApp {
             }
         }
 
-        self.launch_single(size, adapter, self.validate_output);
+        self.launch_single(size, adapter, self.validate_output, self.estimate_cpu_time);
     }
 
-    fn launch_single(&mut self, size: usize, adapter: AdapterInfo, validate: bool) {
+    fn launch_single(
+        &mut self,
+        size: usize,
+        adapter: AdapterInfo,
+        validate: bool,
+        estimate_cpu_time: bool,
+    ) {
         let tx = self.tx.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
@@ -1491,11 +1612,25 @@ impl HardwareAccelApp {
         self.gpu_progress = 0.0;
         self.eta_text = "ETA: estimating".to_owned();
         self.status = format!("Running {size}x{size} benchmark...");
-        self.log(format!("Starting benchmark on {}", adapter.label()));
+        self.log(format!(
+            "Starting benchmark on {} with {} CPU timing",
+            adapter.label(),
+            if estimate_cpu_time {
+                "estimated"
+            } else {
+                "exact"
+            }
+        ));
         thread::spawn(move || {
-            let result =
-                run_single_cancelable(size, adapter, validate, &worker_cancel, Some(tx.clone()))
-                    .map_err(|err| format!("{err:#}"));
+            let result = run_single_cancelable(
+                size,
+                adapter,
+                validate,
+                estimate_cpu_time,
+                &worker_cancel,
+                Some(tx.clone()),
+            )
+            .map_err(|err| format!("{err:#}"));
             let _ = tx.send(WorkerEvent::SingleDone(result));
         });
     }
@@ -1528,6 +1663,7 @@ impl HardwareAccelApp {
                 size,
                 adapter.clone(),
                 self.validate_output,
+                self.estimate_cpu_time,
                 self.repeat_mode,
                 self.repeat_duration,
             ) {
@@ -1579,6 +1715,7 @@ impl HardwareAccelApp {
         size: usize,
         adapter: AdapterInfo,
         validate_output: bool,
+        estimate_cpu_time: bool,
         repeat_mode: RepeatMode,
         repeat_duration: RepeatDuration,
     ) -> Option<PendingVramWarning> {
@@ -1589,6 +1726,7 @@ impl HardwareAccelApp {
             size,
             adapter,
             validate_output,
+            estimate_cpu_time,
             repeat_mode,
             repeat_duration,
             estimated_gpu_bytes,
@@ -1610,9 +1748,12 @@ impl HardwareAccelApp {
             format_bytes(warning.limit_bytes)
         ));
         match warning.action {
-            RunAction::Single => {
-                self.launch_single(warning.size, warning.adapter, warning.validate_output)
-            }
+            RunAction::Single => self.launch_single(
+                warning.size,
+                warning.adapter,
+                warning.validate_output,
+                warning.estimate_cpu_time,
+            ),
             RunAction::Repeat => self.launch_repeat(
                 warning.size,
                 warning.adapter,
@@ -1625,8 +1766,7 @@ impl HardwareAccelApp {
     fn cancel_single(&mut self) {
         if let Some(cancel) = &self.cancel {
             cancel.store(true, Ordering::Relaxed);
-            self.status =
-                "Cancel requested; waiting for the current benchmark step to finish".to_owned();
+            self.status = "Cancel requested; stopping benchmark...".to_owned();
             self.log("Cancel requested for single benchmark");
         }
     }
@@ -1634,7 +1774,7 @@ impl HardwareAccelApp {
     fn cancel_repeat(&mut self) {
         if let Some(cancel) = &self.cancel {
             cancel.store(true, Ordering::Relaxed);
-            self.status = "Cancel requested; waiting for current iteration to finish".to_owned();
+            self.status = "Cancel requested; stopping repeat test...".to_owned();
             self.log("Cancel requested");
         }
     }
@@ -1666,8 +1806,14 @@ impl HardwareAccelApp {
                             self.eta_text = "ETA: complete".to_owned();
                             self.status = "Benchmark complete".to_owned();
                             self.log(format!(
-                                "Benchmark complete: CPU {} ms, GPU total {} ms, GPU compute {} ms",
+                                "Benchmark complete: CPU {} ms ({}, {}), GPU total {} ms, GPU compute {} ms",
                                 format_cpu_ms(&result),
+                                if result.cpu_estimated {
+                                    "estimated"
+                                } else {
+                                    "exact"
+                                },
+                                result.cpu_model,
                                 format_ms(Some(result.gpu_total_ms)),
                                 format_ms(result.gpu_compute_ms)
                             ));
@@ -1790,6 +1936,9 @@ impl eframe::App for HardwareAccelApp {
                 ui.heading("Controls");
                 ui.add_space(8.0);
 
+                ui.small(format!("CPU: {}", self.cpu_info.label()));
+                ui.add_space(4.0);
+
                 ui.label("GPU adapter");
                 egui::ComboBox::from_id_salt("adapter_combo")
                     .selected_text(
@@ -1844,9 +1993,10 @@ impl eframe::App for HardwareAccelApp {
                         for size in DEFAULT_SIZES {
                             ui.selectable_value(&mut self.size_text, size.to_string(), size.to_string());
                         }
-                    });
+                });
                 ui.text_edit_singleline(&mut self.size_text);
                 ui.checkbox(&mut self.validate_output, "Validate GPU output");
+                ui.checkbox(&mut self.estimate_cpu_time, "Estimate CPU time");
 
                 if let Ok(size) = self.selected_size() {
                     if let (Some(matrix_bytes), Some(gpu_bytes)) =
@@ -1876,7 +2026,11 @@ impl eframe::App for HardwareAccelApp {
                     if size >= 4096 {
                         ui.colored_label(
                             egui::Color32::YELLOW,
-                            "Large sizes use a sampled CPU estimate and can still take a long time on GPU.",
+                            if self.estimate_cpu_time {
+                                "CPU time will be estimated from sampled work on this CPU."
+                            } else {
+                                "Exact CPU timing can take a very long time at this size."
+                            },
                         );
                     }
                     if size == 16384 {
@@ -1944,10 +2098,11 @@ impl eframe::App for HardwareAccelApp {
                         .show(ui, |ui| {
                             egui::Grid::new("results_grid")
                                 .striped(true)
-                                .num_columns(8)
+                                .num_columns(9)
                                 .show(ui, |ui| {
                                     ui.strong("Size");
                                     ui.strong("CPU ms");
+                                    ui.strong("CPU model");
                                     ui.strong("GPU compute ms");
                                     ui.strong("GPU total ms");
                                     ui.strong("Transfer/sync ms");
@@ -1959,6 +2114,7 @@ impl eframe::App for HardwareAccelApp {
                                     for result in &self.results {
                                         ui.label(format!("{}x{}", result.size, result.size));
                                         ui.label(format_cpu_ms(result));
+                                        ui.label(&result.cpu_model);
                                         ui.label(format_ms(result.gpu_compute_ms));
                                         ui.label(format_ms(Some(result.gpu_total_ms)));
                                         ui.label(format_ms(result.transfer_sync_ms));
@@ -2130,7 +2286,7 @@ fn format_ms(value: Option<f64>) -> String {
 fn format_cpu_ms(result: &BenchmarkResult) -> String {
     let value = format_ms(Some(result.cpu_ms));
     if result.cpu_estimated {
-        format!("~{value}")
+        format!("Est. {value}")
     } else {
         value
     }
@@ -2191,6 +2347,7 @@ fn run_cli(args: &[String]) -> Result<bool> {
             .map(|value| value.parse::<usize>())
             .transpose()
             .context("--adapter must be an integer")?;
+        let estimate_cpu_time = args.iter().any(|arg| arg == "--estimate-cpu");
         let adapters = enumerate_adapters();
         let adapter = if let Some(index) = adapter_index {
             adapters
@@ -2205,9 +2362,9 @@ fn run_cli(args: &[String]) -> Result<bool> {
         };
 
         println!("Running self-test on {}", adapter.label());
-        let result = run_single(size, adapter, true)?;
+        let result = run_single(size, adapter, true, estimate_cpu_time)?;
         println!("Size: {}x{}", result.size, result.size);
-        println!("CPU: {} ms", format_cpu_ms(&result));
+        println!("CPU: {} ms ({})", format_cpu_ms(&result), result.cpu_model);
         println!("GPU compute: {} ms", format_ms(result.gpu_compute_ms));
         println!("GPU total: {} ms", format_ms(Some(result.gpu_total_ms)));
         println!("Transfer/sync: {} ms", format_ms(result.transfer_sync_ms));
@@ -2301,6 +2458,7 @@ mod tests {
         let result = BenchmarkResult {
             size: 4096,
             adapter: "Test GPU".to_owned(),
+            cpu_model: "Test CPU (8 logical processors)".to_owned(),
             cpu_ms: 1234.0,
             cpu_estimated: true,
             gpu_compute_ms: Some(10.0),
@@ -2310,12 +2468,27 @@ mod tests {
             validation: "Skipped".to_owned(),
         };
 
-        assert_eq!(format_cpu_ms(&result), "~1234.0");
+        assert_eq!(format_cpu_ms(&result), "Est. 1234.0");
+    }
+
+    #[test]
+    fn cpu_info_has_model_and_parallelism() {
+        let cpu_info = detect_cpu_info();
+
+        assert!(!cpu_info.model.is_empty());
+        assert!(cpu_info.logical_processors >= 1);
     }
 
     #[test]
     fn gpu_working_set_counts_four_matrices() {
         assert_eq!(gpu_working_set_bytes(16_384), Some(4 * 1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn gpu_chunking_is_adaptive() {
+        assert_eq!(gpu_dispatch_chunk_rows(128), 128);
+        assert_eq!(gpu_dispatch_chunk_rows(2048), 64);
+        assert_eq!(gpu_dispatch_chunk_rows(4096), GPU_CANCELABLE_CHUNK_ROWS);
     }
 
     #[test]
