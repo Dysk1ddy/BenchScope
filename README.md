@@ -48,7 +48,8 @@ Select a specific adapter:
 - Timestamp-query based GPU compute timing when supported by the selected adapter.
 - Pre-run warning when the estimated GPU working set exceeds the selected adapter's reported VRAM/shared-memory limit, with an explicit run-anyway override.
 - Correctness validation against CPU output.
-- Cancelable 1-minute repeat test for CPU or GPU mode.
+- Cancelable single benchmark runs.
+- Cancelable 1-minute or 5-minute repeat tests for CPU or GPU mode.
 
 ## Build and Test
 

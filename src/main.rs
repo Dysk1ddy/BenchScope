@@ -18,7 +18,7 @@ const DEFAULT_SIZES: &[usize] = &[
     4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384,
 ];
 const TILE_SIZE: u32 = 16;
-const REPEAT_SECONDS: f64 = 60.0;
+const CANCEL_CHECK_INTERVAL: usize = 1_048_576;
 
 const MATMUL_SHADER: &str = r#"
 const TILE: u32 = 16u;
@@ -145,6 +145,7 @@ struct BenchmarkResult {
 struct RepeatProgress {
     mode: RepeatMode,
     size: usize,
+    duration_s: f64,
     elapsed_s: f64,
     iterations: u64,
     latest_ms: f64,
@@ -164,6 +165,34 @@ impl fmt::Display for RepeatMode {
         match self {
             RepeatMode::Gpu => f.write_str("GPU"),
             RepeatMode::Cpu => f.write_str("CPU"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepeatDuration {
+    OneMinute,
+    FiveMinutes,
+}
+
+impl RepeatDuration {
+    fn seconds(self) -> f64 {
+        match self {
+            RepeatDuration::OneMinute => 60.0,
+            RepeatDuration::FiveMinutes => 300.0,
+        }
+    }
+
+    fn duration(self) -> Duration {
+        Duration::from_secs_f64(self.seconds())
+    }
+}
+
+impl fmt::Display for RepeatDuration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RepeatDuration::OneMinute => f.write_str("1 minute"),
+            RepeatDuration::FiveMinutes => f.write_str("5 minutes"),
         }
     }
 }
@@ -188,6 +217,7 @@ struct PendingVramWarning {
     adapter: AdapterInfo,
     validate_output: bool,
     repeat_mode: RepeatMode,
+    repeat_duration: RepeatDuration,
     estimated_gpu_bytes: u64,
     limit_bytes: u64,
     limit_label: String,
@@ -619,29 +649,53 @@ fn normalize_adapter_name(value: &str) -> String {
         .collect()
 }
 
+#[cfg(test)]
 fn generate_matrices(size: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+    generate_matrices_cancelable(size, None)
+}
+
+fn generate_matrices_cancelable(
+    size: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<(Vec<f32>, Vec<f32>)> {
     let elements = size
         .checked_mul(size)
         .ok_or_else(|| anyhow!("matrix size overflow"))?;
     let mut a = Vec::with_capacity(elements);
     let mut b = Vec::with_capacity(elements);
     for i in 0..elements {
+        if i % CANCEL_CHECK_INTERVAL == 0 {
+            check_canceled(cancel)?;
+        }
         a.push((i % 97) as f32 / 97.0);
         b.push(((i * 3 + 1) % 89) as f32 / 89.0);
     }
     Ok((a, b))
 }
 
+#[cfg(test)]
 fn cpu_multiply(size: usize, a: &[f32], b: &[f32]) -> (Vec<f32>, f64) {
+    cpu_multiply_cancelable(size, a, b, None).expect("uncancelable CPU multiply cannot be canceled")
+}
+
+fn cpu_multiply_cancelable(
+    size: usize,
+    a: &[f32],
+    b: &[f32],
+    cancel: Option<&AtomicBool>,
+) -> Result<(Vec<f32>, f64)> {
     let mut c = vec![0.0_f32; size * size];
     let tile = 32usize;
     let start = Instant::now();
 
     for ii in (0..size).step_by(tile) {
+        check_canceled(cancel)?;
         let i_end = (ii + tile).min(size);
         for kk in (0..size).step_by(tile) {
+            check_canceled(cancel)?;
             let k_end = (kk + tile).min(size);
             for jj in (0..size).step_by(tile) {
+                check_canceled(cancel)?;
                 let j_end = (jj + tile).min(size);
                 for i in ii..i_end {
                     let c_row = i * size;
@@ -658,17 +712,34 @@ fn cpu_multiply(size: usize, a: &[f32], b: &[f32]) -> (Vec<f32>, f64) {
         }
     }
 
-    (c, start.elapsed().as_secs_f64() * 1000.0)
+    Ok((c, start.elapsed().as_secs_f64() * 1000.0))
 }
 
+#[cfg(test)]
 fn validate(cpu: &[f32], gpu: &[f32], size: usize) -> String {
+    validate_cancelable(cpu, gpu, size, None).expect("uncancelable validation cannot be canceled")
+}
+
+fn validate_cancelable(
+    cpu: &[f32],
+    gpu: &[f32],
+    size: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<String> {
     if cpu.len() != gpu.len() {
-        return format!("Failed: CPU len {}, GPU len {}", cpu.len(), gpu.len());
+        return Ok(format!(
+            "Failed: CPU len {}, GPU len {}",
+            cpu.len(),
+            gpu.len()
+        ));
     }
 
     let mut max_abs = 0.0_f32;
     let mut max_rel = 0.0_f32;
-    for (&cpu_value, &gpu_value) in cpu.iter().zip(gpu.iter()) {
+    for (index, (&cpu_value, &gpu_value)) in cpu.iter().zip(gpu.iter()).enumerate() {
+        if index % CANCEL_CHECK_INTERVAL == 0 {
+            check_canceled(cancel)?;
+        }
         let diff = (cpu_value - gpu_value).abs();
         max_abs = max_abs.max(diff);
         max_rel = max_rel.max(diff / cpu_value.abs().max(1.0));
@@ -677,19 +748,39 @@ fn validate(cpu: &[f32], gpu: &[f32], size: usize) -> String {
     let abs_tol = 0.02_f32.max(size as f32 * 0.00005);
     let rel_tol = 0.0025_f32;
     if max_abs <= abs_tol || max_rel <= rel_tol {
-        format!("Passed (max abs {max_abs:.5}, max rel {max_rel:.5})")
+        Ok(format!(
+            "Passed (max abs {max_abs:.5}, max rel {max_rel:.5})"
+        ))
     } else {
-        format!("Failed (max abs {max_abs:.5}, max rel {max_rel:.5})")
+        Ok(format!(
+            "Failed (max abs {max_abs:.5}, max rel {max_rel:.5})"
+        ))
     }
 }
 
 fn run_single(size: usize, adapter: AdapterInfo, validate_output: bool) -> Result<BenchmarkResult> {
-    let (a, b) = generate_matrices(size)?;
-    let (cpu_output, cpu_ms) = cpu_multiply(size, &a, &b);
+    let cancel = AtomicBool::new(false);
+    run_single_cancelable(size, adapter, validate_output, &cancel)
+}
+
+fn run_single_cancelable(
+    size: usize,
+    adapter: AdapterInfo,
+    validate_output: bool,
+    cancel: &AtomicBool,
+) -> Result<BenchmarkResult> {
+    let (a, b) = generate_matrices_cancelable(size, Some(cancel))?;
+    let (cpu_output, cpu_ms) = cpu_multiply_cancelable(size, &a, &b, Some(cancel))?;
+    check_canceled(Some(cancel))?;
     let runner = GpuRunner::new(adapter.index)?;
+    check_canceled(Some(cancel))?;
     let gpu = runner.multiply(size, &a, &b, true)?;
+    check_canceled_with(
+        Some(cancel),
+        "Benchmark canceled after the current GPU dispatch completed",
+    )?;
     let validation = if validate_output {
-        validate(&cpu_output, &gpu.output, size)
+        validate_cancelable(&cpu_output, &gpu.output, size, Some(cancel))?
     } else {
         "Skipped".to_owned()
     };
@@ -710,6 +801,18 @@ fn run_single(size: usize, adapter: AdapterInfo, validate_output: bool) -> Resul
     })
 }
 
+fn check_canceled(cancel: Option<&AtomicBool>) -> Result<()> {
+    check_canceled_with(cancel, "Benchmark canceled")
+}
+
+fn check_canceled_with(cancel: Option<&AtomicBool>, message: &str) -> Result<()> {
+    if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+        Err(anyhow!(message.to_owned()))
+    } else {
+        Ok(())
+    }
+}
+
 fn run_repeat(
     size: usize,
     adapter: AdapterInfo,
@@ -718,9 +821,10 @@ fn run_repeat(
     tx: Sender<WorkerEvent>,
     duration: Duration,
 ) -> Result<RepeatProgress> {
-    let (a, b) = generate_matrices(size)?;
+    let (a, b) = generate_matrices_cancelable(size, Some(&cancel))?;
     let deadline = Instant::now() + duration;
     let started = Instant::now();
+    let duration_s = duration.as_secs_f64();
     let mut iterations = 0_u64;
     let mut total_ms = 0.0;
     let mut total_compute_ms = 0.0;
@@ -740,7 +844,8 @@ fn run_repeat(
         let progress = RepeatProgress {
             mode,
             size,
-            elapsed_s,
+            duration_s,
+            elapsed_s: elapsed_s.min(duration_s),
             iterations,
             latest_ms,
             average_total_ms: if iterations == 0 {
@@ -765,7 +870,7 @@ fn run_repeat(
     match mode {
         RepeatMode::Cpu => {
             while Instant::now() < deadline && !cancel.load(Ordering::Relaxed) {
-                let (_, elapsed_ms) = cpu_multiply(size, &a, &b);
+                let (_, elapsed_ms) = cpu_multiply_cancelable(size, &a, &b, Some(&cancel))?;
                 latest_ms = elapsed_ms;
                 total_ms += elapsed_ms;
                 iterations += 1;
@@ -783,6 +888,7 @@ fn run_repeat(
         RepeatMode::Gpu => {
             let runner = GpuRunner::new(adapter.index)?;
             while Instant::now() < deadline && !cancel.load(Ordering::Relaxed) {
+                check_canceled(Some(&cancel))?;
                 let timing = runner.multiply(size, &a, &b, true)?;
                 latest_ms = timing.total_ms;
                 total_ms += timing.total_ms;
@@ -821,6 +927,7 @@ struct HardwareAccelApp {
     size_text: String,
     validate_output: bool,
     repeat_mode: RepeatMode,
+    repeat_duration: RepeatDuration,
     results: Vec<BenchmarkResult>,
     log: Vec<String>,
     status: String,
@@ -847,6 +954,7 @@ impl HardwareAccelApp {
             size_text: DEFAULT_SIZES[6].to_string(),
             validate_output: true,
             repeat_mode: RepeatMode::Gpu,
+            repeat_duration: RepeatDuration::OneMinute,
             results: Vec::new(),
             log: Vec::new(),
             status: "Ready".to_owned(),
@@ -939,6 +1047,7 @@ impl HardwareAccelApp {
                 adapter.clone(),
                 self.validate_output,
                 self.repeat_mode,
+                self.repeat_duration,
             ) {
                 self.status = "VRAM warning: confirm before running this benchmark".to_owned();
                 self.pending_vram_warning = Some(warning);
@@ -951,12 +1060,16 @@ impl HardwareAccelApp {
 
     fn launch_single(&mut self, size: usize, adapter: AdapterInfo, validate: bool) {
         let tx = self.tx.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        self.cancel = Some(cancel);
         self.running = true;
         self.progress = 0.1;
         self.status = format!("Running {size}x{size} benchmark...");
         self.log(format!("Starting benchmark on {}", adapter.label()));
         thread::spawn(move || {
-            let result = run_single(size, adapter, validate).map_err(|err| format!("{err:#}"));
+            let result = run_single_cancelable(size, adapter, validate, &worker_cancel)
+                .map_err(|err| format!("{err:#}"));
             let _ = tx.send(WorkerEvent::SingleDone(result));
         });
     }
@@ -990,6 +1103,7 @@ impl HardwareAccelApp {
                 adapter.clone(),
                 self.validate_output,
                 self.repeat_mode,
+                self.repeat_duration,
             ) {
                 self.status = "VRAM warning: confirm before starting the repeat test".to_owned();
                 self.pending_vram_warning = Some(warning);
@@ -997,10 +1111,16 @@ impl HardwareAccelApp {
             }
         }
 
-        self.launch_repeat(size, adapter, self.repeat_mode);
+        self.launch_repeat(size, adapter, self.repeat_mode, self.repeat_duration);
     }
 
-    fn launch_repeat(&mut self, size: usize, adapter: AdapterInfo, mode: RepeatMode) {
+    fn launch_repeat(
+        &mut self,
+        size: usize,
+        adapter: AdapterInfo,
+        mode: RepeatMode,
+        duration: RepeatDuration,
+    ) {
         let tx = self.tx.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
@@ -1008,9 +1128,9 @@ impl HardwareAccelApp {
         self.running = true;
         self.repeat_running = true;
         self.progress = 0.0;
-        self.status = format!("Running {mode} repeat test for 60 seconds...");
+        self.status = format!("Running {mode} repeat test for {duration}...");
         self.log(format!(
-            "Starting {mode} repeat test at {size}x{size} on {}",
+            "Starting {mode} {duration} repeat test at {size}x{size} on {}",
             adapter.label()
         ));
         thread::spawn(move || {
@@ -1020,7 +1140,7 @@ impl HardwareAccelApp {
                 mode,
                 worker_cancel,
                 tx.clone(),
-                Duration::from_secs_f64(REPEAT_SECONDS),
+                duration.duration(),
             )
             .map_err(|err| format!("{err:#}"));
             let _ = tx.send(WorkerEvent::RepeatDone(result));
@@ -1034,6 +1154,7 @@ impl HardwareAccelApp {
         adapter: AdapterInfo,
         validate_output: bool,
         repeat_mode: RepeatMode,
+        repeat_duration: RepeatDuration,
     ) -> Option<PendingVramWarning> {
         let estimated_gpu_bytes = gpu_working_set_bytes(size)?;
         let (limit_bytes, limit_label) = adapter_memory_limit_bytes(&adapter)?;
@@ -1043,6 +1164,7 @@ impl HardwareAccelApp {
             adapter,
             validate_output,
             repeat_mode,
+            repeat_duration,
             estimated_gpu_bytes,
             limit_bytes,
             limit_label: limit_label.to_owned(),
@@ -1065,9 +1187,21 @@ impl HardwareAccelApp {
             RunAction::Single => {
                 self.launch_single(warning.size, warning.adapter, warning.validate_output)
             }
-            RunAction::Repeat => {
-                self.launch_repeat(warning.size, warning.adapter, warning.repeat_mode)
-            }
+            RunAction::Repeat => self.launch_repeat(
+                warning.size,
+                warning.adapter,
+                warning.repeat_mode,
+                warning.repeat_duration,
+            ),
+        }
+    }
+
+    fn cancel_single(&mut self) {
+        if let Some(cancel) = &self.cancel {
+            cancel.store(true, Ordering::Relaxed);
+            self.status =
+                "Cancel requested; waiting for the current benchmark step to finish".to_owned();
+            self.log("Cancel requested for single benchmark");
         }
     }
 
@@ -1086,9 +1220,9 @@ impl HardwareAccelApp {
                     self.running = false;
                     self.repeat_running = false;
                     self.cancel = None;
-                    self.progress = 1.0;
                     match result {
                         Ok(result) => {
+                            self.progress = 1.0;
                             self.status = "Benchmark complete".to_owned();
                             self.log(format!(
                                 "Benchmark complete: CPU {} ms, GPU total {} ms, GPU compute {} ms",
@@ -1099,13 +1233,19 @@ impl HardwareAccelApp {
                             self.results.push(result);
                         }
                         Err(err) => {
+                            if err.to_ascii_lowercase().contains("canceled") {
+                                self.progress = 0.0;
+                            } else {
+                                self.progress = 1.0;
+                            }
                             self.status = err.clone();
                             self.log(err);
                         }
                     }
                 }
                 WorkerEvent::RepeatProgress(progress) => {
-                    self.progress = (progress.elapsed_s / REPEAT_SECONDS).clamp(0.0, 1.0) as f32;
+                    self.progress =
+                        (progress.elapsed_s / progress.duration_s).clamp(0.0, 1.0) as f32;
                     self.status = format!(
                         "{} repeat: {:.1}s, {} iteration(s), latest {} ms, avg {} ms, compute avg {} ms",
                         progress.mode,
@@ -1281,12 +1421,29 @@ impl eframe::App for HardwareAccelApp {
                         self.start_single();
                     }
                 });
+                ui.add_enabled_ui(self.running && !self.repeat_running, |ui| {
+                    if ui.button("Cancel benchmark").clicked() {
+                        self.cancel_single();
+                    }
+                });
 
                 ui.separator();
-                ui.label("1-minute repeat test");
+                ui.label("Repeat test");
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.repeat_mode, RepeatMode::Gpu, "GPU");
                     ui.selectable_value(&mut self.repeat_mode, RepeatMode::Cpu, "CPU");
+                });
+                ui.horizontal(|ui| {
+                    ui.selectable_value(
+                        &mut self.repeat_duration,
+                        RepeatDuration::OneMinute,
+                        "1 min",
+                    );
+                    ui.selectable_value(
+                        &mut self.repeat_duration,
+                        RepeatDuration::FiveMinutes,
+                        "5 min",
+                    );
                 });
                 ui.add_enabled_ui(!self.running && !self.adapters.is_empty(), |ui| {
                     if ui.button("Start repeat").clicked() {
