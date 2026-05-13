@@ -25,9 +25,9 @@ const CPU_ESTIMATE_BASE_SAMPLE_SIZE: usize = 512;
 const CPU_ESTIMATE_MID_SAMPLE_SIZE: usize = 768;
 const CPU_ESTIMATE_MAX_SAMPLE_SIZE: usize = 1024;
 const VALIDATION_SAMPLE_POINTS: usize = 256;
-const GPU_CANCELABLE_CHUNK_ROWS: usize = 16;
-const GPU_BLOCKED_ROW_TARGET: usize = 16;
-const GPU_BLOCKED_COL_TARGET: usize = 1024;
+const GPU_CANCELABLE_CHUNK_ROWS: usize = 64;
+const GPU_BLOCKED_ROW_TARGET: usize = 128;
+const GPU_BLOCKED_COL_TARGET: usize = 4096;
 const GPU_WAIT_POLL_MS: u64 = 1;
 const FORCE_BLOCKED_GPU_ENV: &str = "HARDWARE_ACCEL_TEST_FORCE_BLOCKED_GPU";
 
@@ -390,40 +390,6 @@ impl SingleProgressTracker {
         self.emit(force);
     }
 
-    fn start_gpu_ticker(&mut self) -> Option<ProgressTicker> {
-        self.gpu_started = Some(Instant::now());
-        self.set_phase("GPU computing and readback", true);
-        let tx = self.tx.clone()?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = Arc::clone(&stop);
-        let started = self.started;
-        let gpu_started = self.gpu_started?;
-        let cpu_progress = self.cpu_progress;
-        let gpu_estimate_s = self.gpu_estimate_s;
-        let handle = thread::spawn(move || {
-            while !worker_stop.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_millis(PROGRESS_SAMPLE_MS));
-                if worker_stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                let gpu_elapsed_s = gpu_started.elapsed().as_secs_f64();
-                let gpu_progress = (gpu_elapsed_s / gpu_estimate_s).clamp(0.0, 0.95) as f32;
-                let eta_s = Some((gpu_estimate_s - gpu_elapsed_s).max(0.0));
-                let _ = tx.send(WorkerEvent::SingleProgress(SingleProgress {
-                    cpu_progress,
-                    gpu_progress,
-                    elapsed_s: started.elapsed().as_secs_f64(),
-                    eta_s,
-                    phase: "GPU computing and readback".to_owned(),
-                }));
-            }
-        });
-        Some(ProgressTicker {
-            stop,
-            handle: Some(handle),
-        })
-    }
-
     fn emit(&mut self, force: bool) {
         let now = Instant::now();
         if !force && now.duration_since(self.last_emit) < Duration::from_millis(PROGRESS_SAMPLE_MS)
@@ -456,29 +422,6 @@ impl SingleProgressTracker {
                 .map(|started| (self.gpu_estimate_s - started.elapsed().as_secs_f64()).max(0.0))
         } else {
             None
-        }
-    }
-}
-
-struct ProgressTicker {
-    stop: Arc<AtomicBool>,
-    handle: Option<thread::JoinHandle<()>>,
-}
-
-impl ProgressTicker {
-    fn stop(mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-impl Drop for ProgressTicker {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
         }
     }
 }
@@ -593,7 +536,7 @@ impl GpuRunner {
     }
 
     fn multiply(&self, n: usize, a: &[f32], b: &[f32], use_timestamps: bool) -> Result<GpuTiming> {
-        self.multiply_cancelable(n, a, b, use_timestamps, None)
+        self.multiply_cancelable(n, a, b, use_timestamps, None, None)
     }
 
     fn multiply_cancelable(
@@ -603,6 +546,7 @@ impl GpuRunner {
         b: &[f32],
         use_timestamps: bool,
         cancel: Option<&AtomicBool>,
+        mut progress: Option<&mut SingleProgressTracker>,
     ) -> Result<GpuTiming> {
         let elements = n
             .checked_mul(n)
@@ -617,10 +561,15 @@ impl GpuRunner {
             .ok_or_else(|| anyhow!("matrix byte length overflow"))?
             as wgpu::BufferAddress;
         if self.needs_blocked_path(byte_len) {
-            return self.multiply_blocked(n, n_u32, a, b, cancel);
+            return self.multiply_blocked(n, n_u32, a, b, cancel, progress);
         }
 
         let total_start = Instant::now();
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.gpu_started = Some(Instant::now());
+            progress.set_phase("GPU computing and readback", true);
+            progress.set_gpu_progress(0.0, true);
+        }
 
         let a_buffer = self
             .device
@@ -754,9 +703,17 @@ impl GpuRunner {
 
             let submission = self.queue.submit([encoder.finish()]);
             self.wait_for_submission(submission, cancel, "waiting for GPU matrix chunk to finish")?;
+            if let Some(progress) = progress.as_deref_mut() {
+                progress
+                    .set_gpu_progress((chunk_index + 1) as f32 / chunk_count as f32 * 0.97, false);
+            }
         }
 
         self.check_gpu_canceled(cancel)?;
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.set_phase("GPU readback", true);
+            progress.set_gpu_progress(0.98, true);
+        }
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -775,6 +732,9 @@ impl GpuRunner {
 
         let output = read_f32_buffer_cancelable(&self.device, &readback_buffer, elements, cancel)
             .context("reading GPU result buffer")?;
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.set_gpu_progress(1.0, true);
+        }
         let compute_ms = if let Some(readback) = &timestamp_readback {
             read_timestamps(&self.device, readback, chunk_count, cancel)
                 .ok()
@@ -810,6 +770,7 @@ impl GpuRunner {
         a: &[f32],
         b: &[f32],
         cancel: Option<&AtomicBool>,
+        mut progress: Option<&mut SingleProgressTracker>,
     ) -> Result<GpuTiming> {
         let elements = n
             .checked_mul(n)
@@ -817,6 +778,22 @@ impl GpuRunner {
         let total_start = Instant::now();
         let (row_block, col_block) = self.block_dimensions(n)?;
         let mut output = vec![0.0_f32; elements];
+        let row_blocks = n.div_ceil(row_block);
+        let col_blocks = n.div_ceil(col_block);
+        let total_blocks = row_blocks
+            .checked_mul(col_blocks)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let mut completed_blocks = 0usize;
+
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.gpu_started = Some(Instant::now());
+            progress.set_phase(
+                format!("GPU blocked compute ({row_block}x{col_block} blocks)"),
+                true,
+            );
+            progress.set_gpu_progress(0.0, true);
+        }
 
         for col_offset in (0..n).step_by(col_block) {
             self.check_gpu_canceled(cancel)?;
@@ -838,7 +815,15 @@ impl GpuRunner {
                     output[output_start..output_start + cols]
                         .copy_from_slice(&c_block[block_start..block_start + cols]);
                 }
+                completed_blocks += 1;
+                if let Some(progress) = progress.as_deref_mut() {
+                    progress.set_gpu_progress(completed_blocks as f32 / total_blocks as f32, false);
+                }
             }
+        }
+
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.set_gpu_progress(1.0, true);
         }
 
         Ok(GpuTiming {
@@ -1663,11 +1648,7 @@ fn run_single_cancelable(
     progress.set_phase("Preparing GPU", true);
     let runner = GpuRunner::new(adapter.index)?;
     check_canceled(Some(cancel))?;
-    let gpu_ticker = progress.start_gpu_ticker();
-    let gpu = runner.multiply_cancelable(size, &a, &b, true, Some(cancel))?;
-    if let Some(ticker) = gpu_ticker {
-        ticker.stop();
-    }
+    let gpu = runner.multiply_cancelable(size, &a, &b, true, Some(cancel), Some(&mut progress))?;
     progress.set_gpu_progress(1.0, true);
     check_canceled_with(
         Some(cancel),
@@ -1796,11 +1777,12 @@ fn run_repeat(
             let runner = GpuRunner::new(adapter.index)?;
             while Instant::now() < deadline && !cancel.load(Ordering::Relaxed) {
                 check_canceled(Some(&cancel))?;
-                let timing = match runner.multiply_cancelable(size, &a, &b, true, Some(&cancel)) {
-                    Ok(timing) => timing,
-                    Err(_) if cancel.load(Ordering::Relaxed) => break,
-                    Err(err) => return Err(err),
-                };
+                let timing =
+                    match runner.multiply_cancelable(size, &a, &b, true, Some(&cancel), None) {
+                        Ok(timing) => timing,
+                        Err(_) if cancel.load(Ordering::Relaxed) => break,
+                        Err(err) => return Err(err),
+                    };
                 latest_ms = timing.total_ms;
                 total_ms += timing.total_ms;
                 if let Some(compute_ms) = timing.compute_ms {
