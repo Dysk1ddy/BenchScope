@@ -25,9 +25,15 @@ const CPU_ESTIMATE_BASE_SAMPLE_SIZE: usize = 512;
 const CPU_ESTIMATE_MID_SAMPLE_SIZE: usize = 768;
 const CPU_ESTIMATE_MAX_SAMPLE_SIZE: usize = 1024;
 const VALIDATION_SAMPLE_POINTS: usize = 256;
-const GPU_CANCELABLE_CHUNK_ROWS: usize = 512;
-const GPU_BLOCKED_ROW_TARGET: usize = 4096;
-const GPU_BLOCKED_COL_TARGET: usize = 4096;
+const GPU_SAFE_CHUNK_ROWS: usize = 16;
+const GPU_BALANCED_CHUNK_ROWS: usize = 64;
+const GPU_HIGH_CHUNK_ROWS: usize = 128;
+const GPU_SAFE_BLOCK_ROWS: usize = 32;
+const GPU_SAFE_BLOCK_COLS: usize = 512;
+const GPU_BALANCED_BLOCK_ROWS: usize = 64;
+const GPU_BALANCED_BLOCK_COLS: usize = 1024;
+const GPU_HIGH_BLOCK_ROWS: usize = 128;
+const GPU_HIGH_BLOCK_COLS: usize = 2048;
 const GPU_WAIT_POLL_MS: u64 = 1;
 const FORCE_BLOCKED_GPU_ENV: &str = "HARDWARE_ACCEL_TEST_FORCE_BLOCKED_GPU";
 
@@ -287,6 +293,58 @@ impl fmt::Display for RepeatMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GpuIntensity {
+    Safe,
+    Balanced,
+    High,
+}
+
+impl GpuIntensity {
+    const ALL: [GpuIntensity; 3] = [
+        GpuIntensity::Safe,
+        GpuIntensity::Balanced,
+        GpuIntensity::High,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            GpuIntensity::Safe => "Safe",
+            GpuIntensity::Balanced => "Balanced",
+            GpuIntensity::High => "High",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            GpuIntensity::Safe => {
+                "Default. Smaller GPU submissions with short pauses to reduce driver timeout and power-spike risk."
+            }
+            GpuIntensity::Balanced => {
+                "Larger GPU submissions with lighter pauses for faster large runs."
+            }
+            GpuIntensity::High => {
+                "Largest submissions. Use only after the system is stable under Safe/Balanced mode."
+            }
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "safe" | "low" | "conservative" => Some(GpuIntensity::Safe),
+            "balanced" | "normal" | "medium" => Some(GpuIntensity::Balanced),
+            "high" | "max" | "maximum" => Some(GpuIntensity::High),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for GpuIntensity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RepeatDuration {
     OneMinute,
     FiveMinutes,
@@ -333,6 +391,7 @@ struct PendingVramWarning {
     action: RunAction,
     size: usize,
     adapter: AdapterInfo,
+    gpu_intensity: GpuIntensity,
     validate_output: bool,
     estimate_cpu_time: bool,
     repeat_mode: RepeatMode,
@@ -367,7 +426,12 @@ struct SingleProgressTracker {
 }
 
 impl SingleProgressTracker {
-    fn new(size: usize, adapter: &AdapterInfo, tx: Option<Sender<WorkerEvent>>) -> Self {
+    fn new(
+        size: usize,
+        adapter: &AdapterInfo,
+        gpu_intensity: GpuIntensity,
+        tx: Option<Sender<WorkerEvent>>,
+    ) -> Self {
         Self {
             tx,
             started: Instant::now(),
@@ -375,7 +439,7 @@ impl SingleProgressTracker {
             cpu_progress: 0.0,
             gpu_progress: 0.0,
             phase: "Preparing benchmark".to_owned(),
-            gpu_estimate_s: estimate_gpu_seconds(size, adapter),
+            gpu_estimate_s: estimate_gpu_seconds(size, adapter, gpu_intensity),
             gpu_started: None,
         }
     }
@@ -614,7 +678,7 @@ impl GpuRunner {
     }
 
     fn multiply(&self, n: usize, a: &[f32], b: &[f32], use_timestamps: bool) -> Result<GpuTiming> {
-        self.multiply_cancelable(n, a, b, use_timestamps, None, None)
+        self.multiply_cancelable(n, a, b, use_timestamps, GpuIntensity::Safe, None, None)
     }
 
     fn multiply_cancelable(
@@ -623,6 +687,7 @@ impl GpuRunner {
         a: &[f32],
         b: &[f32],
         use_timestamps: bool,
+        gpu_intensity: GpuIntensity,
         cancel: Option<&AtomicBool>,
         mut progress: Option<&mut SingleProgressTracker>,
     ) -> Result<GpuTiming> {
@@ -639,7 +704,16 @@ impl GpuRunner {
             .ok_or_else(|| anyhow!("matrix byte length overflow"))?
             as wgpu::BufferAddress;
         if self.needs_blocked_path(byte_len) {
-            return self.multiply_blocked(n, n_u32, a, b, use_timestamps, cancel, progress);
+            return self.multiply_blocked(
+                n,
+                n_u32,
+                a,
+                b,
+                use_timestamps,
+                gpu_intensity,
+                cancel,
+                progress,
+            );
         }
 
         let total_start = Instant::now();
@@ -712,7 +786,7 @@ impl GpuRunner {
             ],
         });
 
-        let chunk_rows = gpu_dispatch_chunk_rows(n);
+        let chunk_rows = gpu_dispatch_chunk_rows(n, gpu_intensity);
         let chunk_count = n.div_ceil(chunk_rows);
         let timestamp_enabled = self.timestamp_query && use_timestamps;
         let timestamp_query_count = (chunk_count * 2) as u32;
@@ -785,6 +859,9 @@ impl GpuRunner {
                 progress
                     .set_gpu_progress((chunk_index + 1) as f32 / chunk_count as f32 * 0.97, false);
             }
+            if chunk_index + 1 < chunk_count {
+                pause_between_gpu_submissions(gpu_intensity, cancel)?;
+            }
         }
 
         self.check_gpu_canceled(cancel)?;
@@ -848,6 +925,7 @@ impl GpuRunner {
         a: &[f32],
         b: &[f32],
         use_timestamps: bool,
+        gpu_intensity: GpuIntensity,
         cancel: Option<&AtomicBool>,
         mut progress: Option<&mut SingleProgressTracker>,
     ) -> Result<GpuTiming> {
@@ -855,7 +933,7 @@ impl GpuRunner {
             .checked_mul(n)
             .ok_or_else(|| anyhow!("matrix size overflow"))?;
         let total_start = Instant::now();
-        let (row_block, col_block) = self.block_dimensions(n)?;
+        let (row_block, col_block) = self.block_dimensions(n, gpu_intensity)?;
         let mut output = vec![0.0_f32; elements];
         let row_blocks = n.div_ceil(row_block);
         let col_blocks = n.div_ceil(col_block);
@@ -912,6 +990,9 @@ impl GpuRunner {
                 completed_blocks += 1;
                 if let Some(progress) = progress.as_deref_mut() {
                     progress.set_gpu_progress(completed_blocks as f32 / total_blocks as f32, false);
+                }
+                if completed_blocks < total_blocks {
+                    pause_between_gpu_submissions(gpu_intensity, cancel)?;
                 }
             }
         }
@@ -1099,15 +1180,16 @@ impl GpuRunner {
             || matrix_byte_len > self.max_buffer_size
     }
 
-    fn block_dimensions(&self, n: usize) -> Result<(usize, usize)> {
+    fn block_dimensions(&self, n: usize, gpu_intensity: GpuIntensity) -> Result<(usize, usize)> {
         let limit_bytes = self
             .max_storage_buffer_binding_size
             .min(self.max_buffer_size)
             .max(std::mem::size_of::<f32>() as u64);
         let limit_floats = (limit_bytes / std::mem::size_of::<f32>() as u64) as usize;
         let max_rows_or_cols = (limit_floats / n).max(1);
-        let rows = align_block_extent(GPU_BLOCKED_ROW_TARGET.min(max_rows_or_cols));
-        let cols = align_block_extent(GPU_BLOCKED_COL_TARGET.min(max_rows_or_cols));
+        let (target_rows, target_cols) = gpu_block_targets(gpu_intensity);
+        let rows = align_block_extent(target_rows.min(max_rows_or_cols));
+        let cols = align_block_extent(target_cols.min(max_rows_or_cols));
 
         let a_bytes = buffer_len_bytes(
             rows.checked_mul(n)
@@ -1203,12 +1285,51 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-fn gpu_dispatch_chunk_rows(size: usize) -> usize {
+fn gpu_dispatch_chunk_rows(size: usize, gpu_intensity: GpuIntensity) -> usize {
     if size <= 1024 {
         size.max(1)
     } else {
-        GPU_CANCELABLE_CHUNK_ROWS.min(size).max(1)
+        let rows = match gpu_intensity {
+            GpuIntensity::Safe => GPU_SAFE_CHUNK_ROWS,
+            GpuIntensity::Balanced => GPU_BALANCED_CHUNK_ROWS,
+            GpuIntensity::High => GPU_HIGH_CHUNK_ROWS,
+        };
+        rows.min(size).max(1)
     }
+}
+
+fn gpu_block_targets(gpu_intensity: GpuIntensity) -> (usize, usize) {
+    match gpu_intensity {
+        GpuIntensity::Safe => (GPU_SAFE_BLOCK_ROWS, GPU_SAFE_BLOCK_COLS),
+        GpuIntensity::Balanced => (GPU_BALANCED_BLOCK_ROWS, GPU_BALANCED_BLOCK_COLS),
+        GpuIntensity::High => (GPU_HIGH_BLOCK_ROWS, GPU_HIGH_BLOCK_COLS),
+    }
+}
+
+fn gpu_submission_pause(gpu_intensity: GpuIntensity) -> Duration {
+    match gpu_intensity {
+        GpuIntensity::Safe => Duration::from_millis(3),
+        GpuIntensity::Balanced => Duration::from_millis(1),
+        GpuIntensity::High => Duration::from_millis(0),
+    }
+}
+
+fn pause_between_gpu_submissions(
+    gpu_intensity: GpuIntensity,
+    cancel: Option<&AtomicBool>,
+) -> Result<()> {
+    let pause = gpu_submission_pause(gpu_intensity);
+    if pause.is_zero() {
+        check_canceled(cancel)?;
+        return Ok(());
+    }
+
+    let started = Instant::now();
+    while started.elapsed() < pause {
+        check_canceled(cancel)?;
+        thread::sleep(Duration::from_millis(1));
+    }
+    check_canceled(cancel)
 }
 
 fn align_block_extent(value: usize) -> usize {
@@ -1796,6 +1917,7 @@ fn run_single(
     adapter: AdapterInfo,
     validate_output: bool,
     estimate_cpu_time: bool,
+    gpu_intensity: GpuIntensity,
 ) -> Result<BenchmarkResult> {
     let cancel = AtomicBool::new(false);
     run_single_cancelable(
@@ -1803,6 +1925,7 @@ fn run_single(
         adapter,
         validate_output,
         estimate_cpu_time,
+        gpu_intensity,
         &cancel,
         None,
     )
@@ -1813,10 +1936,11 @@ fn run_single_cancelable(
     adapter: AdapterInfo,
     validate_output: bool,
     estimate_cpu_time: bool,
+    gpu_intensity: GpuIntensity,
     cancel: &AtomicBool,
     progress_tx: Option<Sender<WorkerEvent>>,
 ) -> Result<BenchmarkResult> {
-    let mut progress = SingleProgressTracker::new(size, &adapter, progress_tx);
+    let mut progress = SingleProgressTracker::new(size, &adapter, gpu_intensity, progress_tx);
     let cpu_info = detect_cpu_info();
     progress.set_phase("Generating matrices", true);
     let (a, b) = generate_matrices_cancelable(size, Some(cancel))?;
@@ -1833,7 +1957,15 @@ fn run_single_cancelable(
     progress.set_phase("Preparing GPU", true);
     let runner = GpuRunner::new(adapter.index)?;
     check_canceled(Some(cancel))?;
-    let gpu = runner.multiply_cancelable(size, &a, &b, true, Some(cancel), Some(&mut progress))?;
+    let gpu = runner.multiply_cancelable(
+        size,
+        &a,
+        &b,
+        true,
+        gpu_intensity,
+        Some(cancel),
+        Some(&mut progress),
+    )?;
     progress.set_gpu_progress(1.0, true);
     check_canceled_with(
         Some(cancel),
@@ -1885,6 +2017,7 @@ fn run_repeat(
     size: usize,
     adapter: AdapterInfo,
     mode: RepeatMode,
+    gpu_intensity: GpuIntensity,
     cancel: Arc<AtomicBool>,
     tx: Sender<WorkerEvent>,
     duration: Duration,
@@ -1962,12 +2095,19 @@ fn run_repeat(
             let runner = GpuRunner::new(adapter.index)?;
             while Instant::now() < deadline && !cancel.load(Ordering::Relaxed) {
                 check_canceled(Some(&cancel))?;
-                let timing =
-                    match runner.multiply_cancelable(size, &a, &b, true, Some(&cancel), None) {
-                        Ok(timing) => timing,
-                        Err(_) if cancel.load(Ordering::Relaxed) => break,
-                        Err(err) => return Err(err),
-                    };
+                let timing = match runner.multiply_cancelable(
+                    size,
+                    &a,
+                    &b,
+                    true,
+                    gpu_intensity,
+                    Some(&cancel),
+                    None,
+                ) {
+                    Ok(timing) => timing,
+                    Err(_) if cancel.load(Ordering::Relaxed) => break,
+                    Err(err) => return Err(err),
+                };
                 latest_ms = timing.total_ms;
                 total_ms += timing.total_ms;
                 if let Some(compute_ms) = timing.compute_ms {
@@ -2004,6 +2144,7 @@ struct HardwareAccelApp {
     cpu_info: CpuInfo,
     selected_adapter: usize,
     size_text: String,
+    gpu_intensity: GpuIntensity,
     validate_output: bool,
     estimate_cpu_time: bool,
     repeat_mode: RepeatMode,
@@ -2037,6 +2178,7 @@ impl HardwareAccelApp {
             cpu_info,
             selected_adapter,
             size_text: DEFAULT_SIZES[6].to_string(),
+            gpu_intensity: GpuIntensity::Safe,
             validate_output: true,
             estimate_cpu_time: false,
             repeat_mode: RepeatMode::Gpu,
@@ -2135,6 +2277,7 @@ impl HardwareAccelApp {
                 RunAction::Single,
                 size,
                 adapter.clone(),
+                self.gpu_intensity,
                 self.validate_output,
                 self.estimate_cpu_time,
                 self.repeat_mode,
@@ -2146,13 +2289,20 @@ impl HardwareAccelApp {
             }
         }
 
-        self.launch_single(size, adapter, self.validate_output, self.estimate_cpu_time);
+        self.launch_single(
+            size,
+            adapter,
+            self.gpu_intensity,
+            self.validate_output,
+            self.estimate_cpu_time,
+        );
     }
 
     fn launch_single(
         &mut self,
         size: usize,
         adapter: AdapterInfo,
+        gpu_intensity: GpuIntensity,
         validate: bool,
         estimate_cpu_time: bool,
     ) {
@@ -2167,8 +2317,9 @@ impl HardwareAccelApp {
         self.eta_text = "ETA: estimating".to_owned();
         self.status = format!("Running {size}x{size} benchmark...");
         self.log(format!(
-            "Starting benchmark on {} with {} CPU timing",
+            "Starting benchmark on {} with {} GPU intensity and {} CPU timing",
             adapter.label(),
+            gpu_intensity,
             if estimate_cpu_time {
                 "estimated"
             } else {
@@ -2181,6 +2332,7 @@ impl HardwareAccelApp {
                 adapter,
                 validate,
                 estimate_cpu_time,
+                gpu_intensity,
                 &worker_cancel,
                 Some(tx.clone()),
             )
@@ -2216,6 +2368,7 @@ impl HardwareAccelApp {
                 RunAction::Repeat,
                 size,
                 adapter.clone(),
+                self.gpu_intensity,
                 self.validate_output,
                 self.estimate_cpu_time,
                 self.repeat_mode,
@@ -2227,13 +2380,20 @@ impl HardwareAccelApp {
             }
         }
 
-        self.launch_repeat(size, adapter, self.repeat_mode, self.repeat_duration);
+        self.launch_repeat(
+            size,
+            adapter,
+            self.gpu_intensity,
+            self.repeat_mode,
+            self.repeat_duration,
+        );
     }
 
     fn launch_repeat(
         &mut self,
         size: usize,
         adapter: AdapterInfo,
+        gpu_intensity: GpuIntensity,
         mode: RepeatMode,
         duration: RepeatDuration,
     ) {
@@ -2246,14 +2406,16 @@ impl HardwareAccelApp {
         self.progress = 0.0;
         self.status = format!("Running {mode} repeat test for {duration}...");
         self.log(format!(
-            "Starting {mode} {duration} repeat test at {size}x{size} on {}",
-            adapter.label()
+            "Starting {mode} {duration} repeat test at {size}x{size} on {} with {} GPU intensity",
+            adapter.label(),
+            gpu_intensity
         ));
         thread::spawn(move || {
             let result = run_repeat(
                 size,
                 adapter,
                 mode,
+                gpu_intensity,
                 worker_cancel,
                 tx.clone(),
                 duration.duration(),
@@ -2268,17 +2430,22 @@ impl HardwareAccelApp {
         action: RunAction,
         size: usize,
         adapter: AdapterInfo,
+        gpu_intensity: GpuIntensity,
         validate_output: bool,
         estimate_cpu_time: bool,
         repeat_mode: RepeatMode,
         repeat_duration: RepeatDuration,
     ) -> Option<PendingVramWarning> {
+        if action == RunAction::Repeat && repeat_mode == RepeatMode::Cpu {
+            return None;
+        }
         let estimated_gpu_bytes = gpu_working_set_bytes(size)?;
         let (limit_bytes, limit_label) = adapter_memory_limit_bytes(&adapter)?;
         (estimated_gpu_bytes > limit_bytes).then(|| PendingVramWarning {
             action,
             size,
             adapter,
+            gpu_intensity,
             validate_output,
             estimate_cpu_time,
             repeat_mode,
@@ -2305,12 +2472,14 @@ impl HardwareAccelApp {
             RunAction::Single => self.launch_single(
                 warning.size,
                 warning.adapter,
+                warning.gpu_intensity,
                 warning.validate_output,
                 warning.estimate_cpu_time,
             ),
             RunAction::Repeat => self.launch_repeat(
                 warning.size,
                 warning.adapter,
+                warning.gpu_intensity,
                 warning.repeat_mode,
                 warning.repeat_duration,
             ),
@@ -2532,6 +2701,23 @@ impl eframe::App for HardwareAccelApp {
                     ));
                 }
 
+                ui.add_space(6.0);
+                ui.label("GPU intensity");
+                ui.add_enabled_ui(!self.running, |ui| {
+                    ui.horizontal(|ui| {
+                        for intensity in GpuIntensity::ALL {
+                            ui.selectable_value(&mut self.gpu_intensity, intensity, intensity.label());
+                        }
+                    });
+                });
+                ui.small(self.gpu_intensity.description());
+                if self.gpu_intensity == GpuIntensity::High {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "High mode can stress the driver, PSU, and thermals during large matrices.",
+                    );
+                }
+
                 if ui.button("Refresh GPUs").clicked() && !self.running {
                     self.adapters = enumerate_adapters();
                     self.selected_adapter = 0;
@@ -2585,6 +2771,12 @@ impl eframe::App for HardwareAccelApp {
                             } else {
                                 "Exact CPU timing can take a very long time at this size."
                             },
+                        );
+                    }
+                    if size >= 8192 {
+                        ui.colored_label(
+                            egui::Color32::YELLOW,
+                            "Large GPU runs are split into smaller submissions in Safe mode to reduce driver timeout risk.",
                         );
                     }
                     if size == 16384 {
@@ -2741,7 +2933,7 @@ fn gpu_working_set_bytes(size: usize) -> Option<u64> {
     matrix_buffers_bytes(size, 4)
 }
 
-fn estimate_gpu_seconds(size: usize, adapter: &AdapterInfo) -> f64 {
+fn estimate_gpu_seconds(size: usize, adapter: &AdapterInfo, gpu_intensity: GpuIntensity) -> f64 {
     let n = size as f64;
     let flops = 2.0 * n * n * n;
     let throughput_flops = match adapter.device_type {
@@ -2762,7 +2954,12 @@ fn estimate_gpu_seconds(size: usize, adapter: &AdapterInfo) -> f64 {
         .map(|bytes| bytes as f64 / bandwidth_bytes)
         .unwrap_or(0.0);
     let compute_s = flops / throughput_flops;
-    (compute_s + transfer_s).max(0.2)
+    let safety_factor = match gpu_intensity {
+        GpuIntensity::Safe => 1.8,
+        GpuIntensity::Balanced => 1.25,
+        GpuIntensity::High => 1.0,
+    };
+    (compute_s * safety_factor + transfer_s).max(0.2)
 }
 
 fn adapter_memory_limit_bytes(adapter: &AdapterInfo) -> Option<(u64, &'static str)> {
@@ -2902,6 +3099,11 @@ fn run_cli(args: &[String]) -> Result<bool> {
             .transpose()
             .context("--adapter must be an integer")?;
         let estimate_cpu_time = args.iter().any(|arg| arg == "--estimate-cpu");
+        let gpu_intensity = arg_value(args, "--gpu-intensity")
+            .as_deref()
+            .map(parse_gpu_intensity)
+            .transpose()?
+            .unwrap_or(GpuIntensity::Safe);
         let adapters = enumerate_adapters();
         let adapter = if let Some(index) = adapter_index {
             adapters
@@ -2915,8 +3117,12 @@ fn run_cli(args: &[String]) -> Result<bool> {
                 .ok_or_else(|| anyhow!("no hardware GPU adapter was found"))?
         };
 
-        println!("Running self-test on {}", adapter.label());
-        let result = run_single(size, adapter, true, estimate_cpu_time)?;
+        println!(
+            "Running self-test on {} with {} GPU intensity",
+            adapter.label(),
+            gpu_intensity
+        );
+        let result = run_single(size, adapter, true, estimate_cpu_time, gpu_intensity)?;
         println!("Size: {}x{}", result.size, result.size);
         println!("CPU: {} ms ({})", format_cpu_ms(&result), result.cpu_model);
         println!("GPU compute: {} ms", format_ms(result.gpu_compute_ms));
@@ -2934,6 +3140,12 @@ fn arg_value(args: &[String], name: &str) -> Option<String> {
     args.windows(2)
         .find(|pair| pair[0] == name)
         .map(|pair| pair[1].clone())
+}
+
+fn parse_gpu_intensity(value: &str) -> Result<GpuIntensity> {
+    GpuIntensity::parse(value).ok_or_else(|| {
+        anyhow!("--gpu-intensity must be one of safe, balanced, or high (got {value})")
+    })
 }
 
 fn main() -> eframe::Result<()> {
@@ -3078,9 +3290,41 @@ mod tests {
 
     #[test]
     fn gpu_chunking_is_adaptive() {
-        assert_eq!(gpu_dispatch_chunk_rows(128), 128);
-        assert_eq!(gpu_dispatch_chunk_rows(2048), GPU_CANCELABLE_CHUNK_ROWS);
-        assert_eq!(gpu_dispatch_chunk_rows(4096), GPU_CANCELABLE_CHUNK_ROWS);
+        assert_eq!(gpu_dispatch_chunk_rows(128, GpuIntensity::Safe), 128);
+        assert_eq!(
+            gpu_dispatch_chunk_rows(2048, GpuIntensity::Safe),
+            GPU_SAFE_CHUNK_ROWS
+        );
+        assert_eq!(
+            gpu_dispatch_chunk_rows(4096, GpuIntensity::Balanced),
+            GPU_BALANCED_CHUNK_ROWS
+        );
+        assert!(
+            gpu_dispatch_chunk_rows(4096, GpuIntensity::High)
+                > gpu_dispatch_chunk_rows(4096, GpuIntensity::Safe)
+        );
+    }
+
+    #[test]
+    fn gpu_intensity_changes_block_targets() {
+        let safe = gpu_block_targets(GpuIntensity::Safe);
+        let balanced = gpu_block_targets(GpuIntensity::Balanced);
+        let high = gpu_block_targets(GpuIntensity::High);
+
+        assert!(safe.0 < balanced.0);
+        assert!(balanced.0 < high.0);
+        assert!(safe.1 < balanced.1);
+        assert!(balanced.1 < high.1);
+        assert!(
+            gpu_submission_pause(GpuIntensity::Safe) > gpu_submission_pause(GpuIntensity::High)
+        );
+    }
+
+    #[test]
+    fn gpu_intensity_parser_accepts_aliases() {
+        assert_eq!(parse_gpu_intensity("safe").unwrap(), GpuIntensity::Safe);
+        assert_eq!(parse_gpu_intensity("maximum").unwrap(), GpuIntensity::High);
+        assert!(parse_gpu_intensity("danger").is_err());
     }
 
     #[test]
@@ -3110,7 +3354,7 @@ mod tests {
             dedicated_system_memory_bytes: None,
             shared_system_memory_bytes: None,
         };
-        let mut tracker = SingleProgressTracker::new(8192, &adapter, None);
+        let mut tracker = SingleProgressTracker::new(8192, &adapter, GpuIntensity::Safe, None);
         tracker.cpu_progress = 1.0;
         tracker.gpu_progress = 0.25;
         tracker.gpu_estimate_s = 0.1;

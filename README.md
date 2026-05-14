@@ -45,12 +45,21 @@ Use the sampled CPU estimate path:
 .\target\release\hardware_accel_tester.exe --self-test --size 512 --estimate-cpu
 ```
 
+Choose the GPU submission intensity used by self-test:
+
+```powershell
+.\target\release\hardware_accel_tester.exe --self-test --size 512 --gpu-intensity safe
+.\target\release\hardware_accel_tester.exe --self-test --size 512 --gpu-intensity balanced
+.\target\release\hardware_accel_tester.exe --self-test --size 512 --gpu-intensity high
+```
+
 ## Current Features
 
 - CPU-only matrix multiplication timing by default, with an opt-in sampled estimate mode.
 - CPU exact timing uses parallel worker threads for larger matrices while leaving one logical processor free for system responsiveness.
 - GPU matrix multiplication using a tiled WGSL compute shader through `wgpu`.
 - GPU adapter selection when multiple backends or devices are available.
+- GPU intensity selection defaults to Safe mode, which uses smaller GPU submissions and brief pauses between large chunks to reduce Windows driver-timeout and power-spike risk.
 - Timing columns for CPU, GPU compute-only, GPU total with transfer, and transfer/sync overhead.
 - Timestamp-query based GPU compute timing when supported by the selected adapter.
 - Pre-run warning when the estimated GPU working set exceeds the selected adapter's reported VRAM/shared-memory limit, with an explicit run-anyway override.
@@ -59,7 +68,7 @@ Use the sampled CPU estimate path:
 - Cancelable 1-minute or 5-minute repeat tests for CPU or GPU mode.
 - Separate CPU and GPU progress bars with roughly 5Hz progress sampling and an estimated time remaining during single benchmark runs.
 - Large GPU runs report real chunk/block progress so the progress bar keeps moving through long matrix computations.
-- GPU matrices that exceed an adapter's storage-buffer binding limit use larger legal row/column blocks to keep the GPU busier instead of binding the whole matrix at once.
+- GPU matrices that exceed an adapter's storage-buffer binding limit use intensity-controlled legal row/column blocks instead of binding the whole matrix at once.
 - CPU estimate results are labeled `Est.` and include the detected CPU model/logical processor count used for the calibrated estimate.
 
 ## Build and Test
@@ -80,3 +89,5 @@ The Rust app is cross-vendor and can enumerate multiple `wgpu` backends, such as
 Exact CPU multiplication is the default for every supported matrix size. For very large matrices, the optional CPU estimate mode runs the same CPU multiply implementation on a representative submatrix, chooses the calibration size from the detected CPU class, and extrapolates from that measured throughput; estimated timings are labeled `Est.`.
 
 For very large GPU runs, some adapters expose less storage-buffer binding space than a full matrix requires. The app automatically switches to a blocked GPU path in that case. When timestamp queries are supported, the blocked path sums compute-only timing across completed row/column blocks and derives transfer/sync time from total minus compute. The blocked path also reports progress per completed block.
+
+On Windows, a large compute dispatch that keeps the GPU busy for too long can trigger Timeout Detection and Recovery (TDR), which may reset the graphics driver or reboot the system if recovery fails. Full GPU utilization by itself should be safe on stable hardware, but long non-preemptible compute work can combine with driver bugs, overclocks, power spikes, or thermals. Use Safe mode first for 8192+ matrices, avoid High mode until the system is stable, and check Windows Event Viewer for `nvlddmkm`, LiveKernelEvent 117/141, WHEA, or power events after any crash.
