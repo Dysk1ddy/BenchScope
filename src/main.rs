@@ -1,5 +1,7 @@
 use std::{
+    any::Any,
     fmt,
+    panic::{self, AssertUnwindSafe},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -22,8 +24,15 @@ const CANCEL_CHECK_INTERVAL: usize = 1_048_576;
 const PROGRESS_SAMPLE_MS: u64 = 200;
 const CPU_ESTIMATE_MIN_SAMPLE_SIZE: usize = 128;
 const CPU_ESTIMATE_BASE_SAMPLE_SIZE: usize = 512;
+#[cfg(test)]
 const CPU_ESTIMATE_MID_SAMPLE_SIZE: usize = 768;
+#[cfg(test)]
 const CPU_ESTIMATE_MAX_SAMPLE_SIZE: usize = 1024;
+const CPU_ESTIMATE_BASE_ROW_CELLS: usize = 131_072;
+const CPU_ESTIMATE_MID_ROW_CELLS: usize = 196_608;
+const CPU_ESTIMATE_HIGH_ROW_CELLS: usize = 262_144;
+const CPU_ESTIMATE_MAX_ROWS: usize = 128;
+const CPU_ESTIMATE_TARGET_MS: f64 = 2_000.0;
 const VALIDATION_SAMPLE_POINTS: usize = 256;
 const GPU_SAFE_CHUNK_ROWS: usize = 16;
 const GPU_BALANCED_CHUNK_ROWS: usize = 64;
@@ -35,6 +44,7 @@ const GPU_BALANCED_BLOCK_COLS: usize = 1024;
 const GPU_HIGH_BLOCK_ROWS: usize = 128;
 const GPU_HIGH_BLOCK_COLS: usize = 2048;
 const GPU_WAIT_POLL_MS: u64 = 1;
+const WGPU_MAX_QUERY_COUNT: usize = 4096;
 const FORCE_BLOCKED_GPU_ENV: &str = "HARDWARE_ACCEL_TEST_FORCE_BLOCKED_GPU";
 
 const MATMUL_SHADER: &str = r#"
@@ -251,8 +261,75 @@ struct BenchmarkResult {
     gpu_compute_ms: Option<f64>,
     gpu_total_ms: f64,
     transfer_sync_ms: Option<f64>,
+    gpu_path: GpuPath,
+    gpu_intensity: GpuIntensity,
+    dispatch_count: usize,
+    tile_shape: String,
+    last_dispatch_ms: Option<f64>,
+    avg_dispatch_ms: Option<f64>,
+    max_dispatch_ms: Option<f64>,
+    backoff_count: usize,
     speedup: f64,
     validation: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GpuPath {
+    DirectFullBuffer,
+    PersistentPanelized,
+    StreamingBlocked,
+}
+
+impl GpuPath {
+    fn label(self) -> &'static str {
+        match self {
+            GpuPath::DirectFullBuffer => "Direct",
+            GpuPath::PersistentPanelized => "Panelized",
+            GpuPath::StreamingBlocked => "Streaming",
+        }
+    }
+}
+
+impl fmt::Display for GpuPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GpuDispatchStats {
+    path: GpuPath,
+    tile_shape: String,
+    dispatch_count: usize,
+    avg_dispatch_ms: Option<f64>,
+    max_dispatch_ms: Option<f64>,
+    last_dispatch_ms: Option<f64>,
+    backoff_count: usize,
+}
+
+impl GpuDispatchStats {
+    fn new(
+        path: GpuPath,
+        tile_shape: impl Into<String>,
+        dispatch_times_ms: &[f64],
+        backoff_count: usize,
+    ) -> Self {
+        let dispatch_count = dispatch_times_ms.len();
+        let avg_dispatch_ms = (!dispatch_times_ms.is_empty())
+            .then(|| dispatch_times_ms.iter().sum::<f64>() / dispatch_times_ms.len() as f64);
+        let max_dispatch_ms = dispatch_times_ms.iter().copied().reduce(f64::max);
+        let last_dispatch_ms = dispatch_times_ms.last().copied();
+
+        Self {
+            path,
+            tile_shape: tile_shape.into(),
+            dispatch_count,
+            avg_dispatch_ms,
+            max_dispatch_ms,
+            last_dispatch_ms,
+            backoff_count,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -406,12 +483,50 @@ struct GpuTiming {
     compute_ms: Option<f64>,
     total_ms: f64,
     transfer_sync_ms: Option<f64>,
+    stats: GpuDispatchStats,
     output: Vec<f32>,
 }
 
 struct BlockGpuTiming {
     compute_ms: Option<f64>,
+    observed_ms: f64,
     output: Vec<f32>,
+}
+
+#[derive(Clone, Debug)]
+struct ColumnPanel {
+    col_offset: usize,
+    cols: usize,
+    element_offset: usize,
+}
+
+struct GpuWorkGovernor {
+    row_extent: usize,
+    min_row_extent: usize,
+    hard_backoff_ms: f64,
+    backoff_count: usize,
+}
+
+impl GpuWorkGovernor {
+    fn new(row_extent: usize, min_row_extent: usize, gpu_intensity: GpuIntensity) -> Self {
+        Self {
+            row_extent: row_extent.max(1),
+            min_row_extent: min_row_extent.max(1),
+            hard_backoff_ms: gpu_hard_backoff_ms(gpu_intensity),
+            backoff_count: 0,
+        }
+    }
+
+    fn row_extent(&self, remaining: usize) -> usize {
+        self.row_extent.min(remaining).max(1)
+    }
+
+    fn record_dispatch(&mut self, observed_ms: f64) {
+        if observed_ms > self.hard_backoff_ms && self.row_extent > self.min_row_extent {
+            self.row_extent = align_block_extent((self.row_extent / 2).max(self.min_row_extent));
+            self.backoff_count += 1;
+        }
+    }
 }
 
 struct SingleProgressTracker {
@@ -577,6 +692,7 @@ struct GpuRunner {
     timestamp_query: bool,
     max_storage_buffer_binding_size: u64,
     max_buffer_size: u64,
+    min_storage_buffer_offset_alignment: u32,
 }
 
 impl GpuRunner {
@@ -666,6 +782,8 @@ impl GpuRunner {
             timestamp_query,
             max_storage_buffer_binding_size: requested_limits.max_storage_buffer_binding_size,
             max_buffer_size: requested_limits.max_buffer_size,
+            min_storage_buffer_offset_alignment: requested_limits
+                .min_storage_buffer_offset_alignment,
         };
         runner.warm_up()?;
         Ok(runner)
@@ -704,6 +822,19 @@ impl GpuRunner {
             .ok_or_else(|| anyhow!("matrix byte length overflow"))?
             as wgpu::BufferAddress;
         if self.needs_blocked_path(byte_len) {
+            if self.can_use_panelized_path(n, byte_len, gpu_intensity)? {
+                return self.multiply_panelized(
+                    n,
+                    n_u32,
+                    a,
+                    b,
+                    byte_len,
+                    use_timestamps,
+                    gpu_intensity,
+                    cancel,
+                    progress,
+                );
+            }
             return self.multiply_blocked(
                 n,
                 n_u32,
@@ -787,18 +918,20 @@ impl GpuRunner {
         });
 
         let chunk_rows = gpu_dispatch_chunk_rows(n, gpu_intensity);
-        let chunk_count = n.div_ceil(chunk_rows);
-        let timestamp_enabled = self.timestamp_query && use_timestamps;
-        let timestamp_query_count = (chunk_count * 2) as u32;
-        let timestamp_buffer_size = (timestamp_query_count as u64) * 8;
-        let query_set = timestamp_enabled.then(|| {
+        let min_chunk_rows = gpu_min_dispatch_rows(gpu_intensity).min(chunk_rows).max(1);
+        let max_chunk_count = n.div_ceil(min_chunk_rows);
+        let mut governor = GpuWorkGovernor::new(chunk_rows, min_chunk_rows, gpu_intensity);
+        let timestamp_plan = (self.timestamp_query && use_timestamps)
+            .then(|| timestamp_query_plan(max_chunk_count))
+            .flatten();
+        let query_set = timestamp_plan.map(|(timestamp_query_count, _)| {
             self.device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("GPU compute timestamps"),
                 ty: wgpu::QueryType::Timestamp,
                 count: timestamp_query_count,
             })
         });
-        let timestamp_resolve = timestamp_enabled.then(|| {
+        let timestamp_resolve = timestamp_plan.map(|(_, timestamp_buffer_size)| {
             self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Timestamp resolve"),
                 size: timestamp_buffer_size,
@@ -806,7 +939,7 @@ impl GpuRunner {
                 mapped_at_creation: false,
             })
         });
-        let timestamp_readback = timestamp_enabled.then(|| {
+        let timestamp_readback = timestamp_plan.map(|(_, timestamp_buffer_size)| {
             self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Timestamp readback"),
                 size: timestamp_buffer_size,
@@ -815,9 +948,12 @@ impl GpuRunner {
             })
         });
 
-        for (chunk_index, row_offset) in (0..n).step_by(chunk_rows).enumerate() {
+        let mut observed_dispatch_ms = Vec::new();
+        let mut chunk_index = 0usize;
+        let mut row_offset = 0usize;
+        while row_offset < n {
             self.check_gpu_canceled(cancel)?;
-            let rows_this_chunk = (n - row_offset).min(chunk_rows);
+            let rows_this_chunk = governor.row_extent(n - row_offset);
             let params = Params {
                 n: n_u32,
                 row_offset: row_offset as u32,
@@ -853,13 +989,18 @@ impl GpuRunner {
                 pass.dispatch_workgroups(groups_x, groups_y, 1);
             }
 
+            let dispatch_start = Instant::now();
             let submission = self.queue.submit([encoder.finish()]);
             self.wait_for_submission(submission, cancel, "waiting for GPU matrix chunk to finish")?;
+            let observed_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
+            observed_dispatch_ms.push(observed_ms);
+            governor.record_dispatch(observed_ms);
+            row_offset += rows_this_chunk;
+            chunk_index += 1;
             if let Some(progress) = progress.as_deref_mut() {
-                progress
-                    .set_gpu_progress((chunk_index + 1) as f32 / chunk_count as f32 * 0.97, false);
+                progress.set_gpu_progress(row_offset as f32 / n as f32 * 0.97, false);
             }
-            if chunk_index + 1 < chunk_count {
+            if row_offset < n {
                 pause_between_gpu_submissions(gpu_intensity, cancel)?;
             }
         }
@@ -877,8 +1018,10 @@ impl GpuRunner {
         if let (Some(query_set), Some(resolve), Some(readback)) =
             (&query_set, &timestamp_resolve, &timestamp_readback)
         {
-            encoder.resolve_query_set(query_set, 0..timestamp_query_count, resolve, 0);
-            encoder.copy_buffer_to_buffer(resolve, 0, readback, 0, timestamp_buffer_size);
+            let used_query_count = (chunk_index * 2) as u32;
+            let used_timestamp_buffer_size = (used_query_count as u64) * 8;
+            encoder.resolve_query_set(query_set, 0..used_query_count, resolve, 0);
+            encoder.copy_buffer_to_buffer(resolve, 0, readback, 0, used_timestamp_buffer_size);
         }
         encoder.copy_buffer_to_buffer(&c_buffer, 0, &readback_buffer, 0, byte_len);
 
@@ -890,30 +1033,332 @@ impl GpuRunner {
         if let Some(progress) = progress.as_deref_mut() {
             progress.set_gpu_progress(1.0, true);
         }
-        let compute_ms = if let Some(readback) = &timestamp_readback {
-            read_timestamps(&self.device, readback, chunk_count, cancel)
-                .ok()
-                .map(|timestamps| {
-                    let timestamp_period = self.queue.get_timestamp_period() as f64;
-                    timestamps
-                        .into_iter()
-                        .map(|[start, end]| {
-                            let delta = end.saturating_sub(start);
-                            (delta as f64 * timestamp_period) / 1_000_000.0
-                        })
-                        .sum::<f64>()
-                })
+        let timestamp_pairs = if let Some(readback) = &timestamp_readback {
+            read_timestamps(&self.device, readback, chunk_index, cancel).ok()
         } else {
             None
         };
+        let (compute_ms, dispatch_times_ms) = dispatch_stats_from_timestamps(
+            timestamp_pairs,
+            &observed_dispatch_ms,
+            self.queue.get_timestamp_period() as f64,
+        );
 
         let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
         let transfer_sync_ms = compute_ms.map(|ms| (total_ms - ms).max(0.0));
+        let stats = GpuDispatchStats::new(
+            GpuPath::DirectFullBuffer,
+            format!("{chunk_rows}x{n}"),
+            &dispatch_times_ms,
+            governor.backoff_count,
+        );
 
         Ok(GpuTiming {
             compute_ms,
             total_ms,
             transfer_sync_ms,
+            stats,
+            output,
+        })
+    }
+
+    fn multiply_panelized(
+        &self,
+        n: usize,
+        n_u32: u32,
+        a: &[f32],
+        b: &[f32],
+        byte_len: u64,
+        use_timestamps: bool,
+        gpu_intensity: GpuIntensity,
+        cancel: Option<&AtomicBool>,
+        mut progress: Option<&mut SingleProgressTracker>,
+    ) -> Result<GpuTiming> {
+        let elements = n
+            .checked_mul(n)
+            .ok_or_else(|| anyhow!("matrix size overflow"))?;
+        let total_start = Instant::now();
+        let (row_block, col_block) = self.block_dimensions(n, gpu_intensity)?;
+        let min_row_block =
+            align_block_extent(gpu_min_dispatch_rows(gpu_intensity).min(row_block).max(1));
+        let mut governor = GpuWorkGovernor::new(row_block, min_row_block, gpu_intensity);
+
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.gpu_started = Some(Instant::now());
+            progress.set_phase(
+                format!("GPU persistent panel compute ({row_block}x{col_block} target)"),
+                true,
+            );
+            progress.set_gpu_progress(0.0, true);
+        }
+
+        let (b_packed, panels) = pack_column_panels(b, n, col_block, cancel)?;
+        self.ensure_panelized_offsets_aligned(n, min_row_block, &panels)?;
+
+        let a_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Persistent matrix A"),
+                contents: bytemuck::cast_slice(a),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let b_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Persistent packed matrix B panels"),
+                contents: bytemuck::cast_slice(&b_packed),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let c_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Persistent packed matrix C panels"),
+            size: byte_len,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Persistent packed matrix C readback"),
+            size: byte_len,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let params_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Persistent panel matrix params"),
+                contents: bytemuck::bytes_of(&BlockParams {
+                    n: n_u32,
+                    rows: 0,
+                    cols: 0,
+                    _pad: 0,
+                }),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
+        let max_dispatch_count = panels
+            .iter()
+            .map(|_| n.div_ceil(min_row_block))
+            .sum::<usize>()
+            .max(1);
+        let timestamp_plan = (self.timestamp_query && use_timestamps)
+            .then(|| timestamp_query_plan(max_dispatch_count))
+            .flatten();
+        let query_set = timestamp_plan.map(|(timestamp_query_count, _)| {
+            self.device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("Persistent panel GPU timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: timestamp_query_count,
+            })
+        });
+        let timestamp_resolve = timestamp_plan.map(|(_, timestamp_buffer_size)| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Persistent panel timestamp resolve"),
+                size: timestamp_buffer_size,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        });
+        let timestamp_readback = timestamp_plan.map(|(_, timestamp_buffer_size)| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Persistent panel timestamp readback"),
+                size: timestamp_buffer_size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        });
+
+        let mut observed_dispatch_ms = Vec::new();
+        let mut completed_cells = 0usize;
+        let mut query_pair_index = 0usize;
+        for panel in &panels {
+            self.check_gpu_canceled(cancel)?;
+            let b_offset = buffer_len_bytes(panel.element_offset)?;
+            let b_bytes = buffer_len_bytes(
+                n.checked_mul(panel.cols)
+                    .ok_or_else(|| anyhow!("B panel size overflow"))?,
+            )?;
+            let b_binding_size =
+                wgpu::BufferSize::new(b_bytes).ok_or_else(|| anyhow!("empty B panel"))?;
+
+            let mut row_offset = 0usize;
+            while row_offset < n {
+                self.check_gpu_canceled(cancel)?;
+                let rows = governor.row_extent(n - row_offset);
+                let a_elements = rows
+                    .checked_mul(n)
+                    .ok_or_else(|| anyhow!("A panel row size overflow"))?;
+                let c_elements = rows
+                    .checked_mul(panel.cols)
+                    .ok_or_else(|| anyhow!("C panel row size overflow"))?;
+                let a_offset = buffer_len_bytes(
+                    row_offset
+                        .checked_mul(n)
+                        .ok_or_else(|| anyhow!("A panel offset overflow"))?,
+                )?;
+                let c_offset = buffer_len_bytes(
+                    panel
+                        .element_offset
+                        .checked_add(
+                            row_offset
+                                .checked_mul(panel.cols)
+                                .ok_or_else(|| anyhow!("C panel row offset overflow"))?,
+                        )
+                        .ok_or_else(|| anyhow!("C panel offset overflow"))?,
+                )?;
+                let a_bytes = buffer_len_bytes(a_elements)?;
+                let c_bytes = buffer_len_bytes(c_elements)?;
+                let a_binding_size =
+                    wgpu::BufferSize::new(a_bytes).ok_or_else(|| anyhow!("empty A panel"))?;
+                let c_binding_size =
+                    wgpu::BufferSize::new(c_bytes).ok_or_else(|| anyhow!("empty C panel"))?;
+
+                let params = BlockParams {
+                    n: n_u32,
+                    rows: u32::try_from(rows).context("panel row block exceeds shader limits")?,
+                    cols: u32::try_from(panel.cols)
+                        .context("panel column block exceeds shader limits")?,
+                    _pad: 0,
+                };
+                self.queue
+                    .write_buffer(&params_buffer, 0, bytemuck::bytes_of(&params));
+
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Persistent panel matrix bind group"),
+                    layout: &self.bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &a_buffer,
+                                offset: a_offset,
+                                size: Some(a_binding_size),
+                            }),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &b_buffer,
+                                offset: b_offset,
+                                size: Some(b_binding_size),
+                            }),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &c_buffer,
+                                offset: c_offset,
+                                size: Some(c_binding_size),
+                            }),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: params_buffer.as_entire_binding(),
+                        },
+                    ],
+                });
+
+                let mut encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("Persistent panel matrix encoder"),
+                        });
+                {
+                    let timestamp_writes =
+                        query_set
+                            .as_ref()
+                            .map(|query_set| wgpu::ComputePassTimestampWrites {
+                                query_set,
+                                beginning_of_pass_write_index: Some((query_pair_index * 2) as u32),
+                                end_of_pass_write_index: Some((query_pair_index * 2 + 1) as u32),
+                            });
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("Persistent panel matrix pass"),
+                        timestamp_writes,
+                    });
+                    pass.set_pipeline(&self.blocked_pipeline);
+                    pass.set_bind_group(0, &bind_group, &[]);
+                    pass.dispatch_workgroups(
+                        (panel.cols as u32).div_ceil(TILE_SIZE),
+                        (rows as u32).div_ceil(TILE_SIZE),
+                        1,
+                    );
+                }
+
+                let dispatch_start = Instant::now();
+                let submission = self.queue.submit([encoder.finish()]);
+                self.wait_for_submission(submission, cancel, "waiting for persistent panel chunk")?;
+                let observed_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
+                observed_dispatch_ms.push(observed_ms);
+                governor.record_dispatch(observed_ms);
+                query_pair_index += 1;
+                completed_cells += c_elements;
+                row_offset += rows;
+
+                if let Some(progress) = progress.as_deref_mut() {
+                    progress.set_gpu_progress(
+                        (completed_cells as f32 / elements as f32 * 0.97).clamp(0.0, 0.97),
+                        false,
+                    );
+                }
+                if completed_cells < elements {
+                    pause_between_gpu_submissions(gpu_intensity, cancel)?;
+                }
+            }
+        }
+
+        self.check_gpu_canceled(cancel)?;
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.set_phase("GPU panel readback", true);
+            progress.set_gpu_progress(0.98, true);
+        }
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Persistent panel readback encoder"),
+            });
+        if let (Some(query_set), Some(resolve), Some(readback)) =
+            (&query_set, &timestamp_resolve, &timestamp_readback)
+        {
+            let used_query_count = (query_pair_index * 2) as u32;
+            let used_timestamp_buffer_size = (used_query_count as u64) * 8;
+            encoder.resolve_query_set(query_set, 0..used_query_count, resolve, 0);
+            encoder.copy_buffer_to_buffer(resolve, 0, readback, 0, used_timestamp_buffer_size);
+        }
+        encoder.copy_buffer_to_buffer(&c_buffer, 0, &readback_buffer, 0, byte_len);
+        let submission = self.queue.submit([encoder.finish()]);
+        self.wait_for_submission(submission, cancel, "waiting for persistent panel readback")?;
+
+        let packed_output =
+            read_f32_buffer_cancelable(&self.device, &readback_buffer, elements, cancel)
+                .context("reading persistent panel GPU result buffer")?;
+        let output = unpack_column_panels(&packed_output, n, &panels, cancel)?;
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.set_gpu_progress(1.0, true);
+        }
+
+        let timestamp_pairs = if let Some(readback) = &timestamp_readback {
+            read_timestamps(&self.device, readback, query_pair_index, cancel).ok()
+        } else {
+            None
+        };
+        let (compute_ms, dispatch_times_ms) = dispatch_stats_from_timestamps(
+            timestamp_pairs,
+            &observed_dispatch_ms,
+            self.queue.get_timestamp_period() as f64,
+        );
+        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+        let transfer_sync_ms = compute_ms.map(|ms| (total_ms - ms).max(0.0));
+        let stats = GpuDispatchStats::new(
+            GpuPath::PersistentPanelized,
+            format!("{row_block}x{col_block}"),
+            &dispatch_times_ms,
+            governor.backoff_count,
+        );
+
+        Ok(GpuTiming {
+            compute_ms,
+            total_ms,
+            transfer_sync_ms,
+            stats,
             output,
         })
     }
@@ -945,6 +1390,7 @@ impl GpuRunner {
         let timestamp_enabled = self.timestamp_query && use_timestamps;
         let mut total_compute_ms = 0.0;
         let mut compute_block_count = 0usize;
+        let mut dispatch_times_ms = Vec::new();
 
         if let Some(progress) = progress.as_deref_mut() {
             progress.gpu_started = Some(Instant::now());
@@ -973,6 +1419,7 @@ impl GpuRunner {
                     timestamp_enabled,
                     cancel,
                 )?;
+                dispatch_times_ms.push(block.compute_ms.unwrap_or(block.observed_ms));
                 if let Some(compute_ms) = block.compute_ms {
                     total_compute_ms += compute_ms;
                     compute_block_count += 1;
@@ -1003,10 +1450,17 @@ impl GpuRunner {
 
         let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
         let compute_ms = (compute_block_count > 0).then_some(total_compute_ms);
+        let stats = GpuDispatchStats::new(
+            GpuPath::StreamingBlocked,
+            format!("{row_block}x{col_block}"),
+            &dispatch_times_ms,
+            0,
+        );
         Ok(GpuTiming {
             compute_ms,
             total_ms,
             transfer_sync_ms: compute_ms.map(|ms| (total_ms - ms).max(0.0)),
+            stats,
             output,
         })
     }
@@ -1155,8 +1609,10 @@ impl GpuRunner {
         }
         encoder.copy_buffer_to_buffer(&c_buffer, 0, &readback_buffer, 0, c_bytes);
 
+        let dispatch_start = Instant::now();
         let submission = self.queue.submit([encoder.finish()]);
         self.wait_for_submission(submission, cancel, "waiting for blocked GPU matrix chunk")?;
+        let observed_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
         let output = read_f32_buffer_cancelable(&self.device, &readback_buffer, c_elements, cancel)
             .context("reading blocked GPU result buffer")?;
         let compute_ms = if let Some(readback) = &timestamp_readback {
@@ -1171,13 +1627,35 @@ impl GpuRunner {
             None
         };
 
-        Ok(BlockGpuTiming { compute_ms, output })
+        Ok(BlockGpuTiming {
+            compute_ms,
+            observed_ms,
+            output,
+        })
     }
 
     fn needs_blocked_path(&self, matrix_byte_len: u64) -> bool {
         std::env::var_os(FORCE_BLOCKED_GPU_ENV).is_some()
             || matrix_byte_len > self.max_storage_buffer_binding_size
             || matrix_byte_len > self.max_buffer_size
+    }
+
+    fn can_use_panelized_path(
+        &self,
+        n: usize,
+        matrix_byte_len: u64,
+        gpu_intensity: GpuIntensity,
+    ) -> Result<bool> {
+        if matrix_byte_len > self.max_buffer_size {
+            return Ok(false);
+        }
+        let (row_block, col_block) = self.block_dimensions(n, gpu_intensity)?;
+        let min_row_block =
+            align_block_extent(gpu_min_dispatch_rows(gpu_intensity).min(row_block).max(1));
+        let panels = column_panel_descriptors(n, col_block)?;
+        Ok(self
+            .panelized_offsets_aligned(n, min_row_block, &panels)
+            .is_ok())
     }
 
     fn block_dimensions(&self, n: usize, gpu_intensity: GpuIntensity) -> Result<(usize, usize)> {
@@ -1207,6 +1685,68 @@ impl GpuRunner {
         self.ensure_block_buffer_fits("B column block", b_bytes)?;
         self.ensure_block_buffer_fits("C output block", c_bytes)?;
         Ok((rows, cols))
+    }
+
+    fn ensure_panelized_offsets_aligned(
+        &self,
+        n: usize,
+        row_block: usize,
+        panels: &[ColumnPanel],
+    ) -> Result<()> {
+        self.panelized_offsets_aligned(n, row_block, panels)
+    }
+
+    fn panelized_offsets_aligned(
+        &self,
+        n: usize,
+        row_block: usize,
+        panels: &[ColumnPanel],
+    ) -> Result<()> {
+        let alignment = self.min_storage_buffer_offset_alignment;
+        for panel in panels {
+            let b_offset = buffer_len_bytes(panel.element_offset)?;
+            if !aligned_storage_offset(b_offset, alignment) {
+                return Err(anyhow!(
+                    "packed B panel offset {} is not aligned to {} bytes",
+                    b_offset,
+                    alignment
+                ));
+            }
+            let mut row_offset = 0usize;
+            while row_offset < n {
+                let a_offset = buffer_len_bytes(
+                    row_offset
+                        .checked_mul(n)
+                        .ok_or_else(|| anyhow!("A panel offset overflow"))?,
+                )?;
+                let c_offset = buffer_len_bytes(
+                    panel
+                        .element_offset
+                        .checked_add(
+                            row_offset
+                                .checked_mul(panel.cols)
+                                .ok_or_else(|| anyhow!("C panel row offset overflow"))?,
+                        )
+                        .ok_or_else(|| anyhow!("C panel offset overflow"))?,
+                )?;
+                if !aligned_storage_offset(a_offset, alignment) {
+                    return Err(anyhow!(
+                        "A panel offset {} is not aligned to {} bytes",
+                        a_offset,
+                        alignment
+                    ));
+                }
+                if !aligned_storage_offset(c_offset, alignment) {
+                    return Err(anyhow!(
+                        "packed C panel offset {} is not aligned to {} bytes",
+                        c_offset,
+                        alignment
+                    ));
+                }
+                row_offset += row_block.min(n - row_offset).max(1);
+            }
+        }
+        Ok(())
     }
 
     fn ensure_block_buffer_fits(&self, label: &str, bytes: u64) -> Result<()> {
@@ -1298,6 +1838,14 @@ fn gpu_dispatch_chunk_rows(size: usize, gpu_intensity: GpuIntensity) -> usize {
     }
 }
 
+fn gpu_min_dispatch_rows(gpu_intensity: GpuIntensity) -> usize {
+    match gpu_intensity {
+        GpuIntensity::Safe => 8,
+        GpuIntensity::Balanced => 16,
+        GpuIntensity::High => 32,
+    }
+}
+
 fn gpu_block_targets(gpu_intensity: GpuIntensity) -> (usize, usize) {
     match gpu_intensity {
         GpuIntensity::Safe => (GPU_SAFE_BLOCK_ROWS, GPU_SAFE_BLOCK_COLS),
@@ -1311,6 +1859,14 @@ fn gpu_submission_pause(gpu_intensity: GpuIntensity) -> Duration {
         GpuIntensity::Safe => Duration::from_millis(3),
         GpuIntensity::Balanced => Duration::from_millis(1),
         GpuIntensity::High => Duration::from_millis(0),
+    }
+}
+
+fn gpu_hard_backoff_ms(gpu_intensity: GpuIntensity) -> f64 {
+    match gpu_intensity {
+        GpuIntensity::Safe => 500.0,
+        GpuIntensity::Balanced => 750.0,
+        GpuIntensity::High => 1000.0,
     }
 }
 
@@ -1330,6 +1886,41 @@ fn pause_between_gpu_submissions(
         thread::sleep(Duration::from_millis(1));
     }
     check_canceled(cancel)
+}
+
+fn dispatch_stats_from_timestamps(
+    timestamp_pairs: Option<Vec<[u64; 2]>>,
+    observed_dispatch_ms: &[f64],
+    timestamp_period: f64,
+) -> (Option<f64>, Vec<f64>) {
+    if let Some(timestamp_pairs) = timestamp_pairs {
+        let dispatch_times = timestamp_pairs
+            .into_iter()
+            .map(|[start, end]| {
+                let delta = end.saturating_sub(start);
+                (delta as f64 * timestamp_period) / 1_000_000.0
+            })
+            .collect::<Vec<_>>();
+        let compute_ms = (!dispatch_times.is_empty()).then(|| dispatch_times.iter().sum());
+        (compute_ms, dispatch_times)
+    } else {
+        (None, observed_dispatch_ms.to_vec())
+    }
+}
+
+fn timestamp_query_plan(pair_count: usize) -> Option<(u32, u64)> {
+    let query_count = pair_count.checked_mul(2)?;
+    if query_count > WGPU_MAX_QUERY_COUNT {
+        return None;
+    }
+    let query_count = u32::try_from(query_count).ok()?;
+    let buffer_size = u64::from(query_count).checked_mul(8)?;
+    Some((query_count, buffer_size))
+}
+
+fn aligned_storage_offset(offset: u64, alignment: u32) -> bool {
+    let alignment = u64::from(alignment.max(1));
+    offset % alignment == 0
 }
 
 fn align_block_extent(value: usize) -> usize {
@@ -1381,6 +1972,73 @@ fn pack_column_block(
         block.extend_from_slice(&source[start..start + cols]);
     }
     Ok(block)
+}
+
+fn column_panel_descriptors(size: usize, panel_cols: usize) -> Result<Vec<ColumnPanel>> {
+    if panel_cols == 0 {
+        return Err(anyhow!("panel column count must be positive"));
+    }
+    let mut panels = Vec::new();
+    let mut element_offset = 0usize;
+    for col_offset in (0..size).step_by(panel_cols) {
+        let cols = (size - col_offset).min(panel_cols);
+        panels.push(ColumnPanel {
+            col_offset,
+            cols,
+            element_offset,
+        });
+        element_offset = element_offset
+            .checked_add(
+                size.checked_mul(cols)
+                    .ok_or_else(|| anyhow!("column panel size overflow"))?,
+            )
+            .ok_or_else(|| anyhow!("column panel offset overflow"))?;
+    }
+    Ok(panels)
+}
+
+fn pack_column_panels(
+    source: &[f32],
+    size: usize,
+    panel_cols: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<(Vec<f32>, Vec<ColumnPanel>)> {
+    let panels = column_panel_descriptors(size, panel_cols)?;
+    let expected = size
+        .checked_mul(size)
+        .ok_or_else(|| anyhow!("packed panel size overflow"))?;
+    let mut packed = Vec::with_capacity(expected);
+    for panel in &panels {
+        for row in 0..size {
+            if row % 32 == 0 {
+                check_canceled(cancel)?;
+            }
+            let start = row * size + panel.col_offset;
+            packed.extend_from_slice(&source[start..start + panel.cols]);
+        }
+    }
+    Ok((packed, panels))
+}
+
+fn unpack_column_panels(
+    packed: &[f32],
+    size: usize,
+    panels: &[ColumnPanel],
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<f32>> {
+    let mut output = vec![0.0_f32; size * size];
+    for panel in panels {
+        for row in 0..size {
+            if row % 32 == 0 {
+                check_canceled(cancel)?;
+            }
+            let source_start = panel.element_offset + row * panel.cols;
+            let output_start = row * size + panel.col_offset;
+            output[output_start..output_start + panel.cols]
+                .copy_from_slice(&packed[source_start..source_start + panel.cols]);
+        }
+    }
+    Ok(output)
 }
 
 fn read_f32_buffer_cancelable(
@@ -1725,6 +2383,74 @@ fn cpu_worker_count(size: usize) -> usize {
         .min(size)
 }
 
+fn cpu_multiply_row_sample_cancelable(
+    size: usize,
+    a: &[f32],
+    b: &[f32],
+    row_offset: usize,
+    row_count: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<f64> {
+    let elements = size
+        .checked_mul(size)
+        .ok_or_else(|| anyhow!("matrix size overflow"))?;
+    if a.len() != elements || b.len() != elements {
+        return Err(anyhow!("matrix data length does not match {size}x{size}"));
+    }
+    if row_offset >= size {
+        return Err(anyhow!("row offset exceeds matrix size"));
+    }
+    let row_count = row_count.min(size - row_offset).max(1);
+    let mut c = vec![0.0_f32; row_count * size];
+    let tile = 32usize;
+    let worker_count = cpu_worker_count(size).min(row_count).max(1);
+    let rows_per_worker = row_count.div_ceil(worker_count);
+    let start = Instant::now();
+
+    thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::new();
+        for (worker_index, c_rows) in c.chunks_mut(rows_per_worker * size).enumerate() {
+            let row_start = worker_index * rows_per_worker;
+            let row_end = row_start + c_rows.len() / size;
+            handles.push(scope.spawn(move || -> Result<()> {
+                for ii in (row_start..row_end).step_by(tile) {
+                    check_canceled(cancel)?;
+                    let i_end = (ii + tile).min(row_end);
+                    for kk in (0..size).step_by(tile) {
+                        check_canceled(cancel)?;
+                        let k_end = (kk + tile).min(size);
+                        for jj in (0..size).step_by(tile) {
+                            check_canceled(cancel)?;
+                            let j_end = (jj + tile).min(size);
+                            for i in ii..i_end {
+                                let c_row = (i - row_start) * size;
+                                let a_row = (row_offset + i) * size;
+                                for k in kk..k_end {
+                                    let a_val = a[a_row + k];
+                                    let b_row = k * size;
+                                    for j in jj..j_end {
+                                        c_rows[c_row + j] += a_val * b[b_row + j];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }));
+        }
+
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| anyhow!("CPU estimate worker thread panicked"))??;
+        }
+        Ok(())
+    })?;
+
+    Ok(start.elapsed().as_secs_f64() * 1000.0)
+}
+
 fn estimate_cpu_multiply_ms(
     size: usize,
     a: &[f32],
@@ -1741,28 +2467,78 @@ fn estimate_cpu_multiply_ms(
         progress.set_cpu_progress(0.0, true);
     }
 
-    let sample_size = cpu_estimate_sample_size(size, cpu_info);
-    let sample_a = copy_top_left_submatrix(a, size, sample_size, cancel)?;
-    let sample_b = copy_top_left_submatrix(b, size, sample_size, cancel)?;
-
-    if sample_size > CPU_ESTIMATE_MIN_SAMPLE_SIZE {
-        let warm_size = CPU_ESTIMATE_MIN_SAMPLE_SIZE.min(sample_size);
-        let warm_a = copy_top_left_submatrix(&sample_a, sample_size, warm_size, cancel)?;
-        let warm_b = copy_top_left_submatrix(&sample_b, sample_size, warm_size, cancel)?;
+    let warm_size = CPU_ESTIMATE_MIN_SAMPLE_SIZE.min(size);
+    if warm_size >= 2 {
+        let warm_a = copy_top_left_submatrix(a, size, warm_size, cancel)?;
+        let warm_b = copy_top_left_submatrix(b, size, warm_size, cancel)?;
         let _ = cpu_multiply_cancelable(warm_size, &warm_a, &warm_b, cancel, None)?;
     }
 
     check_canceled(cancel)?;
-    let (_, elapsed_ms) = cpu_multiply_cancelable(sample_size, &sample_a, &sample_b, cancel, None)?;
-    let scale = (size as f64 / sample_size as f64).powi(3);
+    let estimate_ms = if size <= CPU_ESTIMATE_BASE_SAMPLE_SIZE {
+        let (_, elapsed_ms) = cpu_multiply_cancelable(size, a, b, cancel, None)?;
+        elapsed_ms
+    } else {
+        let mut batch_rows = cpu_estimate_row_sample_count(size, cpu_info);
+        let mut row_offset = 0usize;
+        let mut completed_rows = 0usize;
+        let mut elapsed_ms = 0.0;
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.set_phase(
+                format!(
+                    "Estimating CPU baseline for ~{}",
+                    format_elapsed(CPU_ESTIMATE_TARGET_MS / 1000.0)
+                ),
+                true,
+            );
+        }
+
+        while row_offset < size && elapsed_ms < CPU_ESTIMATE_TARGET_MS {
+            check_canceled(cancel)?;
+            let rows_this_batch = batch_rows.min(size - row_offset).max(1);
+            let batch_ms = cpu_multiply_row_sample_cancelable(
+                size,
+                a,
+                b,
+                row_offset,
+                rows_this_batch,
+                cancel,
+            )?;
+            elapsed_ms += batch_ms;
+            completed_rows += rows_this_batch;
+            row_offset += rows_this_batch;
+
+            if let Some(progress) = progress.as_deref_mut() {
+                progress.set_cpu_progress(
+                    (elapsed_ms / CPU_ESTIMATE_TARGET_MS).min(0.95) as f32,
+                    false,
+                );
+            }
+
+            if elapsed_ms > 0.0 && elapsed_ms < CPU_ESTIMATE_TARGET_MS && row_offset < size {
+                let ms_per_row = elapsed_ms / completed_rows as f64;
+                let remaining_target_ms = CPU_ESTIMATE_TARGET_MS - elapsed_ms;
+                let target_next_rows = (remaining_target_ms / ms_per_row).ceil() as usize;
+                batch_rows = target_next_rows.clamp(
+                    1,
+                    cpu_estimate_row_sample_count(size, cpu_info)
+                        .saturating_mul(2)
+                        .max(1),
+                );
+            }
+        }
+
+        elapsed_ms * (size as f64 / completed_rows.max(1) as f64)
+    };
 
     if let Some(progress) = progress.as_deref_mut() {
         progress.set_cpu_progress(1.0, true);
     }
 
-    Ok(elapsed_ms * scale)
+    Ok(estimate_ms)
 }
 
+#[cfg(test)]
 fn cpu_estimate_sample_size(size: usize, cpu_info: &CpuInfo) -> usize {
     if size < 32 {
         return size.max(1);
@@ -1788,6 +2564,34 @@ fn cpu_estimate_sample_size(size: usize, cpu_info: &CpuInfo) -> usize {
 
     let sample_size = target.min(size).max(CPU_ESTIMATE_MIN_SAMPLE_SIZE.min(size));
     (sample_size / 32).max(1) * 32
+}
+
+fn cpu_estimate_row_sample_count(size: usize, cpu_info: &CpuInfo) -> usize {
+    if size <= CPU_ESTIMATE_BASE_SAMPLE_SIZE {
+        return size.max(1);
+    }
+
+    let model = cpu_info.model.to_ascii_lowercase();
+    let target_cells = if model.contains("threadripper")
+        || model.contains("ryzen 9")
+        || model.contains("core(tm) i9")
+        || model.contains("core ultra 9")
+        || cpu_info.logical_processors >= 24
+    {
+        CPU_ESTIMATE_HIGH_ROW_CELLS
+    } else if model.contains("ryzen 7")
+        || model.contains("core(tm) i7")
+        || model.contains("core ultra 7")
+        || cpu_info.logical_processors >= 12
+    {
+        CPU_ESTIMATE_MID_ROW_CELLS
+    } else {
+        CPU_ESTIMATE_BASE_ROW_CELLS
+    };
+
+    let worker_floor = cpu_worker_count(size).min(size).max(1);
+    let rows = target_cells.div_ceil(size).max(worker_floor).min(size);
+    rows.min(CPU_ESTIMATE_MAX_ROWS).max(1)
 }
 
 fn copy_top_left_submatrix(
@@ -1996,6 +2800,14 @@ fn run_single_cancelable(
         gpu_compute_ms: gpu.compute_ms,
         gpu_total_ms: gpu.total_ms,
         transfer_sync_ms: gpu.transfer_sync_ms,
+        gpu_path: gpu.stats.path,
+        gpu_intensity,
+        dispatch_count: gpu.stats.dispatch_count,
+        tile_shape: gpu.stats.tile_shape,
+        last_dispatch_ms: gpu.stats.last_dispatch_ms,
+        avg_dispatch_ms: gpu.stats.avg_dispatch_ms,
+        max_dispatch_ms: gpu.stats.max_dispatch_ms,
+        backoff_count: gpu.stats.backoff_count,
         speedup,
         validation,
     })
@@ -2010,6 +2822,16 @@ fn check_canceled_with(cancel: Option<&AtomicBool>, message: &str) -> Result<()>
         Err(anyhow!(message.to_owned()))
     } else {
         Ok(())
+    }
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_owned()
+    } else {
+        "unknown panic payload".to_owned()
     }
 }
 
@@ -2327,16 +3149,19 @@ impl HardwareAccelApp {
             }
         ));
         thread::spawn(move || {
-            let result = run_single_cancelable(
-                size,
-                adapter,
-                validate,
-                estimate_cpu_time,
-                gpu_intensity,
-                &worker_cancel,
-                Some(tx.clone()),
-            )
-            .map_err(|err| format!("{err:#}"));
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                run_single_cancelable(
+                    size,
+                    adapter,
+                    validate,
+                    estimate_cpu_time,
+                    gpu_intensity,
+                    &worker_cancel,
+                    Some(tx.clone()),
+                )
+            }))
+            .map_err(|panic| format!("Benchmark panicked: {}", panic_message(&*panic)))
+            .and_then(|result| result.map_err(|err| format!("{err:#}")));
             let _ = tx.send(WorkerEvent::SingleDone(result));
         });
     }
@@ -2411,16 +3236,19 @@ impl HardwareAccelApp {
             gpu_intensity
         ));
         thread::spawn(move || {
-            let result = run_repeat(
-                size,
-                adapter,
-                mode,
-                gpu_intensity,
-                worker_cancel,
-                tx.clone(),
-                duration.duration(),
-            )
-            .map_err(|err| format!("{err:#}"));
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                run_repeat(
+                    size,
+                    adapter,
+                    mode,
+                    gpu_intensity,
+                    worker_cancel,
+                    tx.clone(),
+                    duration.duration(),
+                )
+            }))
+            .map_err(|panic| format!("Repeat test panicked: {}", panic_message(&*panic)))
+            .and_then(|result| result.map_err(|err| format!("{err:#}")));
             let _ = tx.send(WorkerEvent::RepeatDone(result));
         });
     }
@@ -2529,7 +3357,7 @@ impl HardwareAccelApp {
                             self.eta_text = "ETA: complete".to_owned();
                             self.status = "Benchmark complete".to_owned();
                             self.log(format!(
-                                "Benchmark complete: CPU {} ms ({}, {}), GPU total {} ms, GPU compute {} ms",
+                                "Benchmark complete: CPU {} ms ({}, {}), GPU total {} ms, GPU compute {} ms, path {}, dispatches {}, max dispatch {} ms",
                                 format_cpu_ms(&result),
                                 if result.cpu_estimated {
                                     "estimated"
@@ -2538,7 +3366,10 @@ impl HardwareAccelApp {
                                 },
                                 result.cpu_model,
                                 format_ms(Some(result.gpu_total_ms)),
-                                format_ms(result.gpu_compute_ms)
+                                format_ms(result.gpu_compute_ms),
+                                result.gpu_path,
+                                result.dispatch_count,
+                                format_ms(result.max_dispatch_ms)
                             ));
                             self.results.push(result);
                         }
@@ -2844,28 +3675,42 @@ impl eframe::App for HardwareAccelApp {
                         .show(ui, |ui| {
                             egui::Grid::new("results_grid")
                                 .striped(true)
-                                .num_columns(9)
+                                .num_columns(16)
                                 .show(ui, |ui| {
                                     ui.strong("Size");
                                     ui.strong("CPU ms");
-                                    ui.strong("CPU model");
                                     ui.strong("GPU compute ms");
                                     ui.strong("GPU total ms");
                                     ui.strong("Transfer/sync ms");
                                     ui.strong("Speedup");
+                                    ui.strong("CPU model");
                                     ui.strong("Adapter");
+                                    ui.strong("GPU path");
+                                    ui.strong("Tile");
+                                    ui.strong("Dispatches");
+                                    ui.strong("Last dispatch ms");
+                                    ui.strong("Avg dispatch ms");
+                                    ui.strong("Max dispatch ms");
+                                    ui.strong("Backoffs");
                                     ui.strong("Validation");
                                     ui.end_row();
 
                                     for result in &self.results {
                                         ui.label(format!("{}x{}", result.size, result.size));
                                         ui.label(format_cpu_ms(result));
-                                        ui.label(&result.cpu_model);
                                         ui.label(format_ms(result.gpu_compute_ms));
                                         ui.label(format_ms(Some(result.gpu_total_ms)));
                                         ui.label(format_ms(result.transfer_sync_ms));
                                         ui.label(format_speedup(result.speedup));
+                                        ui.label(&result.cpu_model);
                                         ui.label(&result.adapter);
+                                        ui.label(result.gpu_path.label());
+                                        ui.label(&result.tile_shape);
+                                        ui.label(result.dispatch_count.to_string());
+                                        ui.label(format_ms(result.last_dispatch_ms));
+                                        ui.label(format_ms(result.avg_dispatch_ms));
+                                        ui.label(format_ms(result.max_dispatch_ms));
+                                        ui.label(result.backoff_count.to_string());
                                         ui.label(&result.validation);
                                         ui.end_row();
                                     }
@@ -3128,6 +3973,14 @@ fn run_cli(args: &[String]) -> Result<bool> {
         println!("GPU compute: {} ms", format_ms(result.gpu_compute_ms));
         println!("GPU total: {} ms", format_ms(Some(result.gpu_total_ms)));
         println!("Transfer/sync: {} ms", format_ms(result.transfer_sync_ms));
+        println!("GPU path: {}", result.gpu_path);
+        println!("GPU intensity: {}", result.gpu_intensity);
+        println!("Dispatches: {}", result.dispatch_count);
+        println!("Tile/panel: {}", result.tile_shape);
+        println!("Last dispatch: {} ms", format_ms(result.last_dispatch_ms));
+        println!("Avg dispatch: {} ms", format_ms(result.avg_dispatch_ms));
+        println!("Max dispatch: {} ms", format_ms(result.max_dispatch_ms));
+        println!("Backoffs: {}", result.backoff_count);
         println!("Speedup: {}", format_speedup(result.speedup));
         println!("Validation: {}", result.validation);
         return Ok(true);
@@ -3246,6 +4099,38 @@ mod tests {
     }
 
     #[test]
+    fn cpu_estimate_row_sample_uses_full_width_rows() {
+        let high_end = CpuInfo {
+            model: "AMD Ryzen 9 7950X".to_owned(),
+            logical_processors: 32,
+        };
+        let mid = CpuInfo {
+            model: "13th Gen Intel(R) Core(TM) i7-1360P".to_owned(),
+            logical_processors: 16,
+        };
+        let base = CpuInfo {
+            model: "Unknown CPU".to_owned(),
+            logical_processors: 8,
+        };
+
+        assert_eq!(cpu_estimate_row_sample_count(512, &mid), 512);
+        assert!(cpu_estimate_row_sample_count(4096, &high_end) >= 32);
+        assert!(cpu_estimate_row_sample_count(4096, &mid) >= 16);
+        assert!(cpu_estimate_row_sample_count(4096, &base) >= 8);
+        assert!(cpu_estimate_row_sample_count(16_384, &mid) < 64);
+    }
+
+    #[test]
+    fn cpu_row_sample_honors_cancellation() {
+        let (a, b) = generate_matrices(4).unwrap();
+        let cancel = AtomicBool::new(true);
+
+        let err = cpu_multiply_row_sample_cancelable(4, &a, &b, 0, 2, Some(&cancel)).unwrap_err();
+
+        assert!(err.to_string().contains("canceled"));
+    }
+
+    #[test]
     fn top_left_submatrix_copy_keeps_layout() {
         let source = vec![
             1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
@@ -3268,6 +4153,14 @@ mod tests {
             gpu_compute_ms: Some(10.0),
             gpu_total_ms: 12.0,
             transfer_sync_ms: Some(2.0),
+            gpu_path: GpuPath::DirectFullBuffer,
+            gpu_intensity: GpuIntensity::Safe,
+            dispatch_count: 1,
+            tile_shape: "4x4".to_owned(),
+            last_dispatch_ms: Some(10.0),
+            avg_dispatch_ms: Some(10.0),
+            max_dispatch_ms: Some(10.0),
+            backoff_count: 0,
             speedup: 102.83,
             validation: "Skipped".to_owned(),
         };
@@ -3379,6 +4272,44 @@ mod tests {
             pack_column_block(&source, 4, 1, 2, None).unwrap(),
             vec![2.0, 3.0, 6.0, 7.0, 10.0, 11.0, 14.0, 15.0]
         );
+    }
+
+    #[test]
+    fn column_panel_pack_unpack_round_trips() {
+        let source = (0..16).map(|value| value as f32).collect::<Vec<_>>();
+
+        let (packed, panels) = pack_column_panels(&source, 4, 2, None).unwrap();
+
+        assert_eq!(panels.len(), 2);
+        assert_eq!(
+            packed,
+            vec![
+                0.0, 1.0, 4.0, 5.0, 8.0, 9.0, 12.0, 13.0, 2.0, 3.0, 6.0, 7.0, 10.0, 11.0, 14.0,
+                15.0
+            ]
+        );
+        assert_eq!(
+            unpack_column_panels(&packed, 4, &panels, None).unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    fn dispatch_stats_uses_available_dispatch_timings() {
+        let stats =
+            GpuDispatchStats::new(GpuPath::PersistentPanelized, "32x512", &[2.0, 4.0, 6.0], 1);
+
+        assert_eq!(stats.dispatch_count, 3);
+        assert_eq!(stats.avg_dispatch_ms, Some(4.0));
+        assert_eq!(stats.max_dispatch_ms, Some(6.0));
+        assert_eq!(stats.last_dispatch_ms, Some(6.0));
+        assert_eq!(stats.backoff_count, 1);
+    }
+
+    #[test]
+    fn timestamp_query_plan_respects_wgpu_limit() {
+        assert_eq!(timestamp_query_plan(2048), Some((4096, 32_768)));
+        assert_eq!(timestamp_query_plan(2049), None);
     }
 
     #[test]
