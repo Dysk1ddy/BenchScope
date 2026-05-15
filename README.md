@@ -55,7 +55,7 @@ Choose the GPU submission intensity used by self-test:
 
 ## Current Features
 
-- Main menu with separate tool views for the matrix benchmark and drive benchmark.
+- Main menu with separate tool views for the matrix benchmark, matrix stress test, and drive benchmark.
 - Each tool view has a Back control that returns to the main menu; active tests ask for cancellation before leaving.
 - CPU-only matrix multiplication timing by default, with an opt-in sampled estimate mode.
 - CPU exact timing uses parallel worker threads for larger matrices while leaving one logical processor free for system responsiveness.
@@ -72,13 +72,16 @@ Choose the GPU submission intensity used by self-test:
 - Pre-run warning when the estimated GPU working set exceeds the selected adapter's reported VRAM/shared-memory limit, with an explicit run-anyway override.
 - Correctness validation against CPU output, using sampled validation when the CPU estimate mode is enabled.
 - Cancelable single benchmark runs.
-- Cancelable 1-minute or 5-minute repeat tests for CPU or GPU mode.
+- Matrix stress test tool with cancelable 1-minute or 5-minute CPU/GPU repeat runs.
 - Separate CPU and GPU progress bars with roughly 5Hz progress sampling and an estimated time remaining during single benchmark runs.
 - Large GPU runs report real chunk/block progress so the progress bar keeps moving through long matrix computations.
 - GPU matrices that exceed an adapter's storage-buffer binding limit use intensity-controlled legal row/column blocks instead of binding the whole matrix at once.
 - CPU estimate results are labeled `Est.` and include the detected CPU model/logical processor count. Large estimates spend about two seconds computing real full-width CPU rows against the full-size B matrix, then extrapolate from completed row throughput.
 - Drive benchmark tool with sequential read, sequential write, random 4 KiB read, and random 4 KiB write tests.
+- Drive benchmark includes a detected-drive picker and editable target folder.
 - Drive tests report MB/s, IOPS for random tests, average latency, p95 latency, duration, file size, I/O mode, and notes.
+- Bottom-right sensor panel shows CPU/GPU temperatures for matrix benchmark and stress views, plus SSD temperature for the selected drive benchmark target when the operating system/provider exposes readings.
+- Benchmark logs and result tables include start/end/max temperature summaries when readings are available.
 - Drive tests prefer Windows direct/no-buffering I/O and fall back to cached file I/O when direct mode is unavailable.
 - Drive benchmark profiles keep measured subtests below a 30 second hard cap, with shorter Quick/Balanced/Thorough targets.
 - Drive benchmark runs on a background worker, reports current-test and whole-suite progress, and can be canceled mid-run.
@@ -106,3 +109,5 @@ For very large GPU runs, some adapters expose less storage-buffer binding space 
 On Windows, a large compute dispatch that keeps the GPU busy for too long can trigger Timeout Detection and Recovery (TDR), which may reset the graphics driver or reboot the system if recovery fails. Full GPU utilization by itself should be safe on stable hardware, but long non-preemptible compute work can combine with driver bugs, overclocks, power spikes, or thermals. Use Safe mode first for 8192+ matrices, avoid High mode until the system is stable, and check Windows Event Viewer for `nvlddmkm`, LiveKernelEvent 117/141, WHEA, or power events after any crash.
 
 The drive benchmark prefers direct/no-buffering I/O on Windows. If the selected path or filesystem rejects direct mode, the app falls back to cached I/O and labels the result. Cached mode is useful for quick comparisons, but it can include operating-system RAM cache effects, especially on repeated reads.
+
+Temperature readings are supplemental telemetry. GPU temperature currently uses `nvidia-smi`/NVML when available, SSD temperature uses Windows storage reliability counters for the selected drive letter when available, and CPU temperature uses the Windows ACPI thermal-zone fallback. Unsupported or permission-blocked sensors show `N/A` and never prevent benchmarks from running.

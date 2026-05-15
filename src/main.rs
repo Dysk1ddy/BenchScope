@@ -5,8 +5,9 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     panic::{self, AssertUnwindSafe},
     path::PathBuf,
+    process::Command,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, Sender},
     },
@@ -15,7 +16,7 @@ use std::{
 };
 
 #[cfg(windows)]
-use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::{fs::OpenOptionsExt, process::CommandExt};
 
 use anyhow::{Context, Result, anyhow};
 use bytemuck::{Pod, Zeroable};
@@ -58,6 +59,12 @@ const DRIVE_SEQUENTIAL_BLOCK_BYTES: usize = 8 * 1024 * 1024;
 const DRIVE_RANDOM_BLOCK_BYTES: usize = 4 * 1024;
 const DRIVE_LATENCY_SAMPLE_LIMIT: usize = 200_000;
 const DECIMAL_MB: f64 = 1_000_000.0;
+const RESULT_HEADER_TEXT_SIZE: f32 = 16.0;
+const RESULT_CELL_TEXT_SIZE: f32 = 15.0;
+const SENSOR_IDLE_POLL_MS: u64 = 2_000;
+const SENSOR_ACTIVE_POLL_MS: u64 = 500;
+const SENSOR_STALE_AFTER_MS: u64 = 5_000;
+const CREATE_NO_WINDOW_RAW: u32 = 0x0800_0000;
 #[cfg(windows)]
 const FILE_FLAG_WRITE_THROUGH_RAW: u32 = 0x8000_0000;
 #[cfg(windows)]
@@ -271,6 +278,284 @@ impl CpuInfo {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SensorKind {
+    Cpu,
+    Gpu,
+    Drive,
+}
+
+impl SensorKind {
+    fn warning_c(self) -> f32 {
+        match self {
+            SensorKind::Cpu => 85.0,
+            SensorKind::Gpu => 80.0,
+            SensorKind::Drive => 60.0,
+        }
+    }
+
+    fn critical_c(self) -> f32 {
+        match self {
+            SensorKind::Cpu => 95.0,
+            SensorKind::Gpu => 90.0,
+            SensorKind::Drive => 70.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SensorStatus {
+    Ok,
+    Unsupported,
+    PermissionDenied,
+    Stale,
+    Error(String),
+}
+
+impl SensorStatus {
+    fn detail(&self) -> String {
+        match self {
+            SensorStatus::Ok => "OK".to_owned(),
+            SensorStatus::Unsupported => "Unsupported".to_owned(),
+            SensorStatus::PermissionDenied => "Permission denied".to_owned(),
+            SensorStatus::Stale => "Stale reading".to_owned(),
+            SensorStatus::Error(message) => message.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SensorReading {
+    kind: SensorKind,
+    label: String,
+    temperature_c: Option<f32>,
+    provider: String,
+    updated_at: Instant,
+    status: SensorStatus,
+}
+
+impl SensorReading {
+    fn ok(kind: SensorKind, label: impl Into<String>, temperature_c: f32, provider: &str) -> Self {
+        Self {
+            kind,
+            label: label.into(),
+            temperature_c: Some(temperature_c),
+            provider: provider.to_owned(),
+            updated_at: Instant::now(),
+            status: SensorStatus::Ok,
+        }
+    }
+
+    fn unavailable(
+        kind: SensorKind,
+        label: impl Into<String>,
+        provider: &str,
+        status: SensorStatus,
+    ) -> Self {
+        Self {
+            kind,
+            label: label.into(),
+            temperature_c: None,
+            provider: provider.to_owned(),
+            updated_at: Instant::now(),
+            status,
+        }
+    }
+
+    fn mark_stale(mut self) -> Self {
+        if self.temperature_c.is_some() {
+            self.status = SensorStatus::Stale;
+        }
+        self
+    }
+
+    fn is_ok(&self) -> bool {
+        self.status == SensorStatus::Ok && self.temperature_c.is_some()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SensorSnapshot {
+    cpu: Option<SensorReading>,
+    gpu: Option<SensorReading>,
+    drive: Option<SensorReading>,
+}
+
+impl SensorSnapshot {
+    fn stale_checked(&self, now: Instant) -> Self {
+        let stale_after = Duration::from_millis(SENSOR_STALE_AFTER_MS);
+        Self {
+            cpu: stale_checked_reading(self.cpu.clone(), now, stale_after),
+            gpu: stale_checked_reading(self.gpu.clone(), now, stale_after),
+            drive: stale_checked_reading(self.drive.clone(), now, stale_after),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TemperatureScope {
+    Matrix,
+    Drive,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct TemperatureSummary {
+    start_c: Option<f32>,
+    end_c: Option<f32>,
+    max_c: Option<f32>,
+}
+
+impl TemperatureSummary {
+    fn begin(value: Option<f32>) -> Self {
+        Self {
+            start_c: value,
+            end_c: None,
+            max_c: value,
+        }
+    }
+
+    fn observe(&mut self, value: Option<f32>) {
+        if let Some(value) = value {
+            self.max_c = Some(self.max_c.map_or(value, |current| current.max(value)));
+        }
+    }
+
+    fn finish(&mut self, value: Option<f32>) {
+        self.end_c = value;
+        self.observe(value);
+    }
+
+    fn has_any_value(&self) -> bool {
+        self.start_c.is_some() || self.end_c.is_some() || self.max_c.is_some()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TemperatureRunTracker {
+    scope: TemperatureScope,
+    cpu: TemperatureSummary,
+    gpu: TemperatureSummary,
+    drive: TemperatureSummary,
+}
+
+impl TemperatureRunTracker {
+    fn start(scope: TemperatureScope, snapshot: &SensorSnapshot) -> Self {
+        Self {
+            scope,
+            cpu: TemperatureSummary::begin(sensor_temperature(snapshot.cpu.as_ref())),
+            gpu: TemperatureSummary::begin(sensor_temperature(snapshot.gpu.as_ref())),
+            drive: TemperatureSummary::begin(sensor_temperature(snapshot.drive.as_ref())),
+        }
+    }
+
+    fn observe(&mut self, snapshot: &SensorSnapshot) {
+        self.cpu.observe(sensor_temperature(snapshot.cpu.as_ref()));
+        self.gpu.observe(sensor_temperature(snapshot.gpu.as_ref()));
+        self.drive
+            .observe(sensor_temperature(snapshot.drive.as_ref()));
+    }
+
+    fn finish(mut self, snapshot: &SensorSnapshot) -> TemperatureRunReport {
+        self.cpu.finish(sensor_temperature(snapshot.cpu.as_ref()));
+        self.gpu.finish(sensor_temperature(snapshot.gpu.as_ref()));
+        self.drive
+            .finish(sensor_temperature(snapshot.drive.as_ref()));
+        TemperatureRunReport {
+            scope: self.scope,
+            cpu: self.cpu,
+            gpu: self.gpu,
+            drive: self.drive,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TemperatureRunReport {
+    scope: TemperatureScope,
+    cpu: TemperatureSummary,
+    gpu: TemperatureSummary,
+    drive: TemperatureSummary,
+}
+
+struct SensorManager {
+    latest: Arc<RwLock<SensorSnapshot>>,
+    active: Arc<AtomicBool>,
+    target_drive_letter: Arc<RwLock<Option<char>>>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl SensorManager {
+    fn new(initial_drive_letter: Option<char>) -> Self {
+        let latest = Arc::new(RwLock::new(SensorSnapshot::default()));
+        let active = Arc::new(AtomicBool::new(false));
+        let target_drive_letter = Arc::new(RwLock::new(initial_drive_letter));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let thread_latest = Arc::clone(&latest);
+        let thread_active = Arc::clone(&active);
+        let thread_target_drive_letter = Arc::clone(&target_drive_letter);
+        let thread_shutdown = Arc::clone(&shutdown);
+
+        let _ = thread::Builder::new()
+            .name("benchscope-sensors".to_owned())
+            .spawn(move || {
+                while !thread_shutdown.load(Ordering::Relaxed) {
+                    let drive_letter = thread_target_drive_letter
+                        .read()
+                        .map(|guard| *guard)
+                        .unwrap_or(None);
+                    let snapshot = collect_sensor_snapshot(drive_letter);
+                    if let Ok(mut latest) = thread_latest.write() {
+                        *latest = snapshot;
+                    }
+
+                    let sleep_for = if thread_active.load(Ordering::Relaxed) {
+                        Duration::from_millis(SENSOR_ACTIVE_POLL_MS)
+                    } else {
+                        Duration::from_millis(SENSOR_IDLE_POLL_MS)
+                    };
+                    let sleep_until = Instant::now() + sleep_for;
+                    while Instant::now() < sleep_until {
+                        if thread_shutdown.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            });
+
+        Self {
+            latest,
+            active,
+            target_drive_letter,
+            shutdown,
+        }
+    }
+
+    fn latest(&self) -> SensorSnapshot {
+        self.latest
+            .read()
+            .map(|snapshot| snapshot.stale_checked(Instant::now()))
+            .unwrap_or_default()
+    }
+
+    fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::Relaxed);
+    }
+
+    fn set_target_drive_letter(&self, drive_letter: Option<char>) {
+        if let Ok(mut target) = self.target_drive_letter.write() {
+            *target = drive_letter.map(|letter| letter.to_ascii_uppercase());
+        }
+    }
+}
+
+impl Drop for SensorManager {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone, Debug)]
 struct BenchmarkResult {
     size: usize,
@@ -291,6 +576,8 @@ struct BenchmarkResult {
     backoff_count: usize,
     speedup: f64,
     validation: String,
+    cpu_temperature: TemperatureSummary,
+    gpu_temperature: TemperatureSummary,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -473,6 +760,7 @@ impl fmt::Display for RepeatDuration {
 enum AppView {
     MainMenu,
     MatrixBenchmark,
+    MatrixStressTest,
     DriveBenchmark,
 }
 
@@ -649,6 +937,19 @@ impl AlignedBuffer {
 }
 
 #[derive(Clone, Debug)]
+struct DriveInfo {
+    root: PathBuf,
+    label: String,
+}
+
+impl DriveInfo {
+    fn new(root: PathBuf) -> Self {
+        let label = format!("{} drive", root.display());
+        Self { root, label }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct DriveBenchmarkConfig {
     target_folder: PathBuf,
     file_size_bytes: u64,
@@ -668,6 +969,7 @@ struct DriveBenchmarkResult {
     file_size_bytes: u64,
     io_mode: DriveIoMode,
     notes: Vec<String>,
+    ssd_temperature: TemperatureSummary,
 }
 
 #[derive(Clone, Debug)]
@@ -689,6 +991,8 @@ enum DriveWorkerEvent {
 }
 
 struct DriveBenchmarkState {
+    drives: Vec<DriveInfo>,
+    selected_drive: usize,
     target_folder_text: String,
     profile: DriveProfile,
     file_size: DriveFileSize,
@@ -712,8 +1016,12 @@ impl DriveBenchmarkState {
     fn new() -> Self {
         let (tx, rx) = mpsc::channel();
         let target_folder = std::env::temp_dir();
+        let drives = detect_drives();
+        let selected_drive = selected_drive_for_path(&drives, &target_folder).unwrap_or(0);
 
         Self {
+            drives,
+            selected_drive,
             target_folder_text: target_folder.display().to_string(),
             profile: DriveProfile::Quick,
             file_size: DriveFileSize::Auto,
@@ -763,6 +1071,35 @@ impl DriveBenchmarkState {
         let tests = self.selected_tests();
         let write_tests = tests.iter().filter(|test| test.is_write()).count() as u64;
         self.planned_file_size().saturating_mul(write_tests)
+    }
+
+    fn selected_drive_label(&self) -> String {
+        self.drives
+            .get(self.selected_drive)
+            .map(|drive| drive.label.clone())
+            .unwrap_or_else(|| "No drives detected".to_owned())
+    }
+
+    fn select_drive(&mut self, index: usize) {
+        if let Some(drive) = self.drives.get(index) {
+            self.selected_drive = index;
+            self.target_folder_text = drive.root.display().to_string();
+            self.status = format!("Selected {}", drive.label);
+        }
+    }
+
+    fn refresh_drives(&mut self) {
+        self.drives = detect_drives();
+        let target_folder = PathBuf::from(self.target_folder_text.trim());
+        self.selected_drive = selected_drive_for_path(&self.drives, &target_folder).unwrap_or(0);
+        self.log(format!("Detected {} drive(s)", self.drives.len()));
+    }
+
+    fn sync_selected_drive_to_target(&mut self) {
+        let target_folder = PathBuf::from(self.target_folder_text.trim());
+        if let Some(index) = selected_drive_for_path(&self.drives, &target_folder) {
+            self.selected_drive = index;
+        }
     }
 
     fn start(&mut self) {
@@ -3238,6 +3575,8 @@ fn run_single_cancelable(
         backoff_count: gpu.stats.backoff_count,
         speedup,
         validation,
+        cpu_temperature: TemperatureSummary::default(),
+        gpu_temperature: TemperatureSummary::default(),
     })
 }
 
@@ -3414,8 +3753,11 @@ struct BenchScopeApp {
     repeat_running: bool,
     pending_vram_warning: Option<PendingVramWarning>,
     matrix_back_confirm: bool,
+    stress_back_confirm: bool,
     drive_back_confirm: bool,
     drive: DriveBenchmarkState,
+    sensors: SensorManager,
+    temperature_run: Option<TemperatureRunTracker>,
 }
 
 impl BenchScopeApp {
@@ -3427,6 +3769,10 @@ impl BenchScopeApp {
             .iter()
             .position(|adapter| adapter.device_type != wgpu::DeviceType::Cpu)
             .unwrap_or(0);
+        let drive = DriveBenchmarkState::new();
+        let sensors = SensorManager::new(drive_letter_for_path(&PathBuf::from(
+            drive.target_folder_text.trim(),
+        )));
         let mut app = Self {
             view: AppView::MainMenu,
             adapters,
@@ -3452,8 +3798,11 @@ impl BenchScopeApp {
             repeat_running: false,
             pending_vram_warning: None,
             matrix_back_confirm: false,
+            stress_back_confirm: false,
             drive_back_confirm: false,
-            drive: DriveBenchmarkState::new(),
+            drive,
+            sensors,
+            temperature_run: None,
         };
         app.log("Application started");
         if app.adapters.is_empty() {
@@ -3484,6 +3833,72 @@ impl BenchScopeApp {
 
     fn log(&mut self, message: impl Into<String>) {
         self.log.push(message.into());
+    }
+
+    fn begin_temperature_run(&mut self, scope: TemperatureScope) {
+        let snapshot = self.sensors.latest();
+        self.temperature_run = Some(TemperatureRunTracker::start(scope, &snapshot));
+    }
+
+    fn observe_temperature_run(&mut self) {
+        let snapshot = self.sensors.latest();
+        if let Some(run) = &mut self.temperature_run {
+            run.observe(&snapshot);
+        }
+    }
+
+    fn finish_temperature_run(&mut self) -> Option<TemperatureRunReport> {
+        let snapshot = self.sensors.latest();
+        self.temperature_run.take().map(|run| run.finish(&snapshot))
+    }
+
+    fn finish_and_log_temperature_run(&mut self) -> Option<TemperatureRunReport> {
+        let report = self.finish_temperature_run()?;
+        let summary = format_temperature_run_report(&report);
+        self.log(format!("Temperature: {summary}"));
+        Some(report)
+    }
+
+    fn sync_sensor_state(&mut self) {
+        self.sensors.set_active(self.running || self.drive.running);
+        self.sensors
+            .set_target_drive_letter(drive_letter_for_path(&PathBuf::from(
+                self.drive.target_folder_text.trim(),
+            )));
+    }
+
+    fn ui_sensor_panel(&mut self, ctx: &egui::Context) {
+        let snapshot = self.sensors.latest();
+        let rows: Vec<(&str, Option<&SensorReading>)> = match self.view {
+            AppView::MatrixBenchmark | AppView::MatrixStressTest => {
+                vec![
+                    ("CPU", snapshot.cpu.as_ref()),
+                    ("GPU", snapshot.gpu.as_ref()),
+                ]
+            }
+            AppView::DriveBenchmark => vec![("SSD", snapshot.drive.as_ref())],
+            AppView::MainMenu => vec![
+                ("CPU", snapshot.cpu.as_ref()),
+                ("GPU", snapshot.gpu.as_ref()),
+                ("SSD", snapshot.drive.as_ref()),
+            ],
+        };
+
+        egui::Area::new(egui::Id::new("sensor_panel"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, [-12.0, -12.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::window(ui.style())
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.set_min_width(150.0);
+                        ui.label(egui::RichText::new("Sensors").strong());
+                        ui.add_space(3.0);
+                        for (label, reading) in rows {
+                            ui_sensor_row(ui, label, reading);
+                        }
+                    });
+            });
     }
 
     fn selected_size(&self) -> Result<usize> {
@@ -3567,6 +3982,7 @@ impl BenchScopeApp {
         let tx = self.tx.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
+        self.begin_temperature_run(TemperatureScope::Matrix);
         self.cancel = Some(cancel);
         self.running = true;
         self.progress = 0.0;
@@ -3635,7 +4051,7 @@ impl BenchScopeApp {
                 self.repeat_mode,
                 self.repeat_duration,
             ) {
-                self.status = "VRAM warning: confirm before starting the repeat test".to_owned();
+                self.status = "VRAM warning: confirm before starting the stress test".to_owned();
                 self.pending_vram_warning = Some(warning);
                 return;
             }
@@ -3661,13 +4077,14 @@ impl BenchScopeApp {
         let tx = self.tx.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
+        self.begin_temperature_run(TemperatureScope::Matrix);
         self.cancel = Some(cancel);
         self.running = true;
         self.repeat_running = true;
         self.progress = 0.0;
-        self.status = format!("Running {mode} repeat test for {duration}...");
+        self.status = format!("Running {mode} stress test for {duration}...");
         self.log(format!(
-            "Starting {mode} {duration} repeat test at {size}x{size} on {} with {} GPU intensity",
+            "Starting {mode} {duration} stress test at {size}x{size} on {} with {} GPU intensity",
             adapter.label(),
             gpu_intensity
         ));
@@ -3761,7 +4178,7 @@ impl BenchScopeApp {
     fn cancel_repeat(&mut self) {
         if let Some(cancel) = &self.cancel {
             cancel.store(true, Ordering::Relaxed);
-            self.status = "Cancel requested; stopping repeat test...".to_owned();
+            self.status = "Cancel requested; stopping stress test...".to_owned();
             self.log("Cancel requested");
         }
     }
@@ -3786,12 +4203,16 @@ impl BenchScopeApp {
                     self.repeat_running = false;
                     self.cancel = None;
                     match result {
-                        Ok(result) => {
+                        Ok(mut result) => {
                             self.progress = 1.0;
                             self.cpu_progress = 1.0;
                             self.gpu_progress = 1.0;
                             self.eta_text = "ETA: complete".to_owned();
                             self.status = "Benchmark complete".to_owned();
+                            if let Some(report) = self.finish_and_log_temperature_run() {
+                                result.cpu_temperature = report.cpu;
+                                result.gpu_temperature = report.gpu;
+                            }
                             self.log(format!(
                                 "Benchmark complete: CPU {} ms ({}, {}), GPU total {} ms, GPU compute {} ms, path {}, dispatches {}, max dispatch {} ms",
                                 format_cpu_ms(&result),
@@ -3810,6 +4231,7 @@ impl BenchScopeApp {
                             self.results.push(result);
                         }
                         Err(err) => {
+                            let _ = self.finish_and_log_temperature_run();
                             if err.to_ascii_lowercase().contains("canceled") {
                                 self.progress = 0.0;
                                 self.eta_text = "ETA: canceled".to_owned();
@@ -3828,7 +4250,7 @@ impl BenchScopeApp {
                     self.eta_text =
                         format_eta(Some((progress.duration_s - progress.elapsed_s).max(0.0)));
                     self.status = format!(
-                        "{} repeat: {:.1}s, {} iteration(s), latest {} ms, avg {} ms, compute avg {} ms",
+                        "{} stress: {:.1}s, {} iteration(s), latest {} ms, avg {} ms, compute avg {} ms",
                         progress.mode,
                         progress.elapsed_s,
                         progress.iterations,
@@ -3844,6 +4266,7 @@ impl BenchScopeApp {
                     self.eta_text.clear();
                     match result {
                         Ok(progress) => {
+                            let _ = self.finish_and_log_temperature_run();
                             if !progress.canceled {
                                 self.progress = 1.0;
                             }
@@ -3853,12 +4276,12 @@ impl BenchScopeApp {
                                 "complete"
                             };
                             self.status = format!(
-                                "Repeat test {state}: {} iteration(s), avg {} ms",
+                                "Stress test {state}: {} iteration(s), avg {} ms",
                                 progress.iterations,
                                 format_ms(Some(progress.average_total_ms))
                             );
                             self.log(format!(
-                                "Repeat test {state}: mode {}, size {}, iterations {}, avg {} ms, compute avg {} ms",
+                                "Stress test {state}: mode {}, size {}, iterations {}, avg {} ms, compute avg {} ms",
                                 progress.mode,
                                 progress.size,
                                 progress.iterations,
@@ -3867,6 +4290,7 @@ impl BenchScopeApp {
                             ));
                         }
                         Err(err) => {
+                            let _ = self.finish_and_log_temperature_run();
                             self.status = err.clone();
                             self.log(err);
                         }
@@ -3890,6 +4314,13 @@ impl BenchScopeApp {
                 }
                 ui.add_space(8.0);
                 if ui
+                    .add_sized([280.0, 44.0], egui::Button::new("Matrix Stress Test"))
+                    .clicked()
+                {
+                    self.view = AppView::MatrixStressTest;
+                }
+                ui.add_space(8.0);
+                if ui
                     .add_sized([280.0, 44.0], egui::Button::new("Drive Benchmark"))
                     .clicked()
                 {
@@ -3905,6 +4336,14 @@ impl BenchScopeApp {
     fn request_matrix_back_to_menu(&mut self) {
         if self.running {
             self.matrix_back_confirm = true;
+        } else {
+            self.view = AppView::MainMenu;
+        }
+    }
+
+    fn request_stress_back_to_menu(&mut self) {
+        if self.repeat_running {
+            self.stress_back_confirm = true;
         } else {
             self.view = AppView::MainMenu;
         }
@@ -3958,6 +4397,26 @@ impl BenchScopeApp {
                 ui.heading("Controls");
                 ui.add_space(8.0);
 
+                self.drive.sync_selected_drive_to_target();
+                ui.label("Target drive");
+                ui.add_enabled_ui(!self.drive.running, |ui| {
+                    let mut selected_drive = self.drive.selected_drive;
+                    egui::ComboBox::from_id_salt("drive_picker_combo")
+                        .selected_text(self.drive.selected_drive_label())
+                        .show_ui(ui, |ui| {
+                            for (index, drive) in self.drive.drives.iter().enumerate() {
+                                ui.selectable_value(&mut selected_drive, index, &drive.label);
+                            }
+                        });
+                    if selected_drive != self.drive.selected_drive {
+                        self.drive.select_drive(selected_drive);
+                    }
+                    if ui.button("Refresh drives").clicked() {
+                        self.drive.refresh_drives();
+                    }
+                });
+                ui.small("Selecting a drive sets the target folder to that drive root.");
+
                 ui.label("Target folder");
                 ui.add_enabled_ui(!self.drive.running, |ui| {
                     ui.text_edit_singleline(&mut self.drive.target_folder_text);
@@ -3968,6 +4427,7 @@ impl BenchScopeApp {
                 } else {
                     ui.colored_label(egui::Color32::YELLOW, "Target folder is not valid.");
                 }
+                ui.small("If the drive root is protected, enter a writable folder on that drive.");
 
                 ui.add_space(8.0);
                 ui.label("Profile");
@@ -4027,7 +4487,11 @@ impl BenchScopeApp {
                 ui.separator();
                 ui.add_enabled_ui(!self.drive.running, |ui| {
                     if ui.button("Run drive benchmark").clicked() {
+                        let was_running = self.drive.running;
                         self.drive.start();
+                        if !was_running && self.drive.running {
+                            self.begin_temperature_run(TemperatureScope::Drive);
+                        }
                     }
                 });
                 ui.add_enabled_ui(self.drive.running, |ui| {
@@ -4053,33 +4517,47 @@ impl BenchScopeApp {
                         .show(ui, |ui| {
                             egui::Grid::new("drive_results_grid")
                                 .striped(true)
-                                .num_columns(9)
+                                .num_columns(10)
                                 .show(ui, |ui| {
-                                    ui.strong("Test");
-                                    ui.strong("Speed MB/s");
-                                    ui.strong("IOPS");
-                                    ui.strong("Avg latency");
-                                    ui.strong("P95 latency");
-                                    ui.strong("Duration");
-                                    ui.strong("File size");
-                                    ui.strong("Mode");
-                                    ui.strong("Notes");
+                                    result_header(ui, "Test");
+                                    result_header(ui, "Speed MB/s");
+                                    result_header(ui, "IOPS");
+                                    result_header(ui, "Avg latency");
+                                    result_header(ui, "P95 latency");
+                                    result_header(ui, "Duration");
+                                    result_header(ui, "File size");
+                                    result_header(ui, "Mode");
+                                    result_header(ui, "SSD temp");
+                                    result_header(ui, "Notes");
                                     ui.end_row();
 
                                     for result in &self.drive.results {
-                                        ui.label(result.test.label());
-                                        ui.label(format_drive_speed(result));
-                                        ui.label(format_optional_iops(result.iops));
-                                        ui.label(format_optional_latency(result.avg_latency_ms));
-                                        ui.label(format_optional_latency(result.p95_latency_ms));
-                                        ui.label(format_ms(Some(result.duration_ms)));
-                                        ui.label(format_bytes(result.file_size_bytes));
-                                        ui.label(result.io_mode.label());
-                                        ui.label(if result.notes.is_empty() {
-                                            String::new()
-                                        } else {
-                                            result.notes.join(", ")
-                                        });
+                                        result_cell(ui, result.test.label());
+                                        result_cell(ui, format_drive_speed(result));
+                                        result_cell(ui, format_optional_iops(result.iops));
+                                        result_cell(
+                                            ui,
+                                            format_optional_latency(result.avg_latency_ms),
+                                        );
+                                        result_cell(
+                                            ui,
+                                            format_optional_latency(result.p95_latency_ms),
+                                        );
+                                        result_cell(ui, format_ms(Some(result.duration_ms)));
+                                        result_cell(ui, format_bytes(result.file_size_bytes));
+                                        result_cell(ui, result.io_mode.label());
+                                        result_cell(
+                                            ui,
+                                            format_temperature_summary(&result.ssd_temperature),
+                                        );
+                                        result_cell(
+                                            ui,
+                                            if result.notes.is_empty() {
+                                                String::new()
+                                            } else {
+                                                result.notes.join(", ")
+                                            },
+                                        );
                                         ui.end_row();
                                     }
                                 });
@@ -4119,13 +4597,289 @@ impl BenchScopeApp {
                 });
         }
     }
+
+    fn ui_matrix_stress_test(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+
+        egui::Panel::top("stress_top_panel").show_inside(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Back").clicked() {
+                    self.request_stress_back_to_menu();
+                }
+                ui.separator();
+                ui.heading("Matrix Stress Test");
+                ui.separator();
+                ui.label(&self.status);
+                if !self.eta_text.is_empty() {
+                    ui.separator();
+                    ui.label(&self.eta_text);
+                }
+            });
+            ui.add(
+                egui::ProgressBar::new(self.progress)
+                    .show_percentage()
+                    .text("Stress test elapsed"),
+            );
+        });
+
+        egui::Panel::left("stress_controls")
+            .resizable(false)
+            .min_size(330.0)
+            .show_inside(ui, |ui| {
+                ui.heading("Stress Controls");
+                ui.add_space(8.0);
+
+                ui.small(format!("CPU: {}", self.cpu_info.label()));
+                ui.add_space(4.0);
+
+                ui.label("GPU adapter");
+                egui::ComboBox::from_id_salt("stress_adapter_combo")
+                    .selected_text(
+                        self.adapters
+                            .get(self.selected_adapter)
+                            .map(AdapterInfo::label)
+                            .unwrap_or_else(|| "No adapters found".to_owned()),
+                    )
+                    .show_ui(ui, |ui| {
+                        for (index, adapter) in self.adapters.iter().enumerate() {
+                            ui.selectable_value(&mut self.selected_adapter, index, adapter.label());
+                        }
+                    });
+
+                if let Some(adapter) = self.adapters.get(self.selected_adapter) {
+                    ui.small(format!(
+                        "Vendor {:04X}, device {:04X}, driver {}, timestamp queries {}",
+                        adapter.vendor,
+                        adapter.device,
+                        empty_to_unknown(&adapter.driver),
+                        if adapter.timestamp_query {
+                            "supported"
+                        } else {
+                            "unavailable"
+                        }
+                    ));
+                    if let Some((limit, label)) = adapter_memory_limit_bytes(adapter) {
+                        ui.small(format!("Memory limit estimate: {} ({label})", format_bytes(limit)));
+                    } else {
+                        ui.small("Memory limit estimate: unavailable for this adapter/backend");
+                    }
+                }
+
+                ui.add_space(6.0);
+                ui.label("GPU intensity");
+                ui.add_enabled_ui(!self.running, |ui| {
+                    ui.horizontal(|ui| {
+                        for intensity in GpuIntensity::ALL {
+                            ui.selectable_value(&mut self.gpu_intensity, intensity, intensity.label());
+                        }
+                    });
+                });
+                ui.small(self.gpu_intensity.description());
+                if self.gpu_intensity == GpuIntensity::High {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "High mode can stress the driver, PSU, and thermals during large matrices.",
+                    );
+                }
+
+                if ui.button("Refresh GPUs").clicked() && !self.running {
+                    self.adapters = enumerate_adapters();
+                    self.selected_adapter = 0;
+                    self.status = format!("Found {} adapter(s)", self.adapters.len());
+                    self.log(self.status.clone());
+                }
+
+                ui.separator();
+                ui.label("Matrix size");
+                egui::ComboBox::from_id_salt("stress_size_combo")
+                    .selected_text(self.size_text.clone())
+                    .show_ui(ui, |ui| {
+                        for size in DEFAULT_SIZES {
+                            ui.selectable_value(&mut self.size_text, size.to_string(), size.to_string());
+                        }
+                    });
+                ui.text_edit_singleline(&mut self.size_text);
+
+                if let Ok(size) = self.selected_size() {
+                    if let (Some(matrix_bytes), Some(gpu_bytes)) =
+                        (matrix_buffers_bytes(size, 3), gpu_working_set_bytes(size))
+                    {
+                        ui.small(format!(
+                            "A/B/C: {}; GPU run estimate: {}",
+                            format_bytes(matrix_bytes),
+                            format_bytes(gpu_bytes)
+                        ));
+
+                        if let Some(adapter) = self.adapters.get(self.selected_adapter) {
+                            if let Some((limit, label)) = adapter_memory_limit_bytes(adapter) {
+                                if gpu_bytes > limit {
+                                    ui.colored_label(
+                                        egui::Color32::RED,
+                                        format!(
+                                            "Estimated GPU memory exceeds {label}: {} > {}.",
+                                            format_bytes(gpu_bytes),
+                                            format_bytes(limit)
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if size >= 8192 {
+                        ui.colored_label(
+                            egui::Color32::YELLOW,
+                            "Large stress tests can heavily load the selected processor for the full duration.",
+                        );
+                    }
+                }
+
+                ui.separator();
+                ui.label("Processor");
+                ui.add_enabled_ui(!self.running, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.repeat_mode, RepeatMode::Gpu, "GPU");
+                        ui.selectable_value(&mut self.repeat_mode, RepeatMode::Cpu, "CPU");
+                    });
+                });
+                ui.label("Duration");
+                ui.add_enabled_ui(!self.running, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.repeat_duration,
+                            RepeatDuration::OneMinute,
+                            "1 min",
+                        );
+                        ui.selectable_value(
+                            &mut self.repeat_duration,
+                            RepeatDuration::FiveMinutes,
+                            "5 min",
+                        );
+                    });
+                });
+
+                ui.add_enabled_ui(!self.running && !self.adapters.is_empty(), |ui| {
+                    if ui.button("Start stress test").clicked() {
+                        self.start_repeat();
+                    }
+                });
+                ui.add_enabled_ui(self.repeat_running, |ui| {
+                    if ui.button("Cancel stress test").clicked() {
+                        self.cancel_repeat();
+                    }
+                });
+            });
+
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            let available_height = ui.available_height();
+            let log_height = (available_height * 0.35).clamp(160.0, 260.0);
+            let summary_height = (available_height - log_height - 56.0).max(220.0);
+
+            ui.heading("Stress Test");
+            ui.add_space(6.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), summary_height),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    ui.label(format!("Mode: {}", self.repeat_mode));
+                    ui.label(format!("Duration: {}", self.repeat_duration));
+                    ui.label(format!("Progress: {:.0}%", self.progress * 100.0));
+                    if !self.eta_text.is_empty() {
+                        ui.label(&self.eta_text);
+                    }
+                    ui.label(&self.status);
+                },
+            );
+
+            ui.separator();
+            ui.heading("Log");
+            egui::ScrollArea::vertical()
+                .stick_to_bottom(true)
+                .max_height(log_height)
+                .show(ui, |ui| {
+                    for line in &self.log {
+                        ui.monospace(line);
+                    }
+                });
+        });
+
+        if let Some(warning) = self.pending_vram_warning.clone() {
+            egui::Window::new("VRAM limit exceeded")
+                .collapsible(false)
+                .resizable(false)
+                .show(&ctx, |ui| {
+                    ui.label(format!(
+                        "{}x{} is estimated to need {} of GPU memory.",
+                        warning.size,
+                        warning.size,
+                        format_bytes(warning.estimated_gpu_bytes)
+                    ));
+                    ui.label(format!(
+                        "The selected adapter's {} is {}.",
+                        warning.limit_label,
+                        format_bytes(warning.limit_bytes)
+                    ));
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "Running anyway may fail, trigger driver paging, or make the result misleading.",
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.pending_vram_warning = None;
+                            self.status = "Run canceled before exceeding the VRAM estimate".to_owned();
+                            self.log("Canceled run after VRAM warning");
+                        }
+                        if ui.button("Run anyway").clicked() {
+                            self.continue_pending_vram_warning();
+                        }
+                    });
+                });
+        }
+
+        if self.stress_back_confirm {
+            egui::Window::new("Return to main menu?")
+                .collapsible(false)
+                .resizable(false)
+                .show(&ctx, |ui| {
+                    ui.label("A matrix stress test is currently running.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Stay").clicked() {
+                            self.stress_back_confirm = false;
+                        }
+                        if ui.button("Cancel and return").clicked() {
+                            self.cancel_repeat();
+                            self.stress_back_confirm = false;
+                            self.view = AppView::MainMenu;
+                        }
+                    });
+                });
+        }
+    }
 }
 
 impl eframe::App for BenchScopeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.sync_sensor_state();
+        let drive_was_running = self.drive.running;
+        let drive_result_count_before = self.drive.results.len();
         self.poll_worker_events();
         self.drive.poll_worker_events();
+        self.observe_temperature_run();
+        if drive_was_running && !self.drive.running {
+            if let Some(report) = self.finish_and_log_temperature_run() {
+                for result in self
+                    .drive
+                    .results
+                    .iter_mut()
+                    .skip(drive_result_count_before)
+                {
+                    result.ssd_temperature = report.drive;
+                }
+            }
+        }
+        self.sync_sensor_state();
         if self.running || self.drive.running {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -4133,10 +4887,17 @@ impl eframe::App for BenchScopeApp {
         match self.view {
             AppView::MainMenu => {
                 self.ui_main_menu(ui);
+                self.ui_sensor_panel(&ctx);
                 return;
             }
             AppView::DriveBenchmark => {
                 self.ui_drive_benchmark(ui);
+                self.ui_sensor_panel(&ctx);
+                return;
+            }
+            AppView::MatrixStressTest => {
+                self.ui_matrix_stress_test(ui);
+                self.ui_sensor_panel(&ctx);
                 return;
             }
             AppView::MatrixBenchmark => {}
@@ -4156,28 +4917,20 @@ impl eframe::App for BenchScopeApp {
                     ui.label(&self.eta_text);
                 }
             });
-            if self.repeat_running {
+            ui.horizontal(|ui| {
+                ui.label("CPU");
                 ui.add(
-                    egui::ProgressBar::new(self.progress)
+                    egui::ProgressBar::new(self.cpu_progress)
                         .show_percentage()
-                        .text("Repeat elapsed"),
+                        .desired_width(260.0),
                 );
-            } else {
-                ui.horizontal(|ui| {
-                    ui.label("CPU");
-                    ui.add(
-                        egui::ProgressBar::new(self.cpu_progress)
-                            .show_percentage()
-                            .desired_width(260.0),
-                    );
-                    ui.label("GPU");
-                    ui.add(
-                        egui::ProgressBar::new(self.gpu_progress)
-                            .show_percentage()
-                            .desired_width(260.0),
-                    );
-                });
-            }
+                ui.label("GPU");
+                ui.add(
+                    egui::ProgressBar::new(self.gpu_progress)
+                        .show_percentage()
+                        .desired_width(260.0),
+                );
+            });
         });
 
         egui::Panel::left("controls")
@@ -4325,35 +5078,6 @@ impl eframe::App for BenchScopeApp {
                         self.cancel_single();
                     }
                 });
-
-                ui.separator();
-                ui.label("Repeat test");
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.repeat_mode, RepeatMode::Gpu, "GPU");
-                    ui.selectable_value(&mut self.repeat_mode, RepeatMode::Cpu, "CPU");
-                });
-                ui.horizontal(|ui| {
-                    ui.selectable_value(
-                        &mut self.repeat_duration,
-                        RepeatDuration::OneMinute,
-                        "1 min",
-                    );
-                    ui.selectable_value(
-                        &mut self.repeat_duration,
-                        RepeatDuration::FiveMinutes,
-                        "5 min",
-                    );
-                });
-                ui.add_enabled_ui(!self.running && !self.adapters.is_empty(), |ui| {
-                    if ui.button("Start repeat").clicked() {
-                        self.start_repeat();
-                    }
-                });
-                ui.add_enabled_ui(self.repeat_running, |ui| {
-                    if ui.button("Cancel repeat").clicked() {
-                        self.cancel_repeat();
-                    }
-                });
             });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
@@ -4372,43 +5096,53 @@ impl eframe::App for BenchScopeApp {
                         .show(ui, |ui| {
                             egui::Grid::new("results_grid")
                                 .striped(true)
-                                .num_columns(16)
+                                .num_columns(18)
                                 .show(ui, |ui| {
-                                    ui.strong("Size");
-                                    ui.strong("CPU ms");
-                                    ui.strong("GPU compute ms");
-                                    ui.strong("GPU total ms");
-                                    ui.strong("Transfer/sync ms");
-                                    ui.strong("Speedup");
-                                    ui.strong("CPU model");
-                                    ui.strong("Adapter");
-                                    ui.strong("GPU path");
-                                    ui.strong("Tile");
-                                    ui.strong("Dispatches");
-                                    ui.strong("Last dispatch ms");
-                                    ui.strong("Avg dispatch ms");
-                                    ui.strong("Max dispatch ms");
-                                    ui.strong("Backoffs");
-                                    ui.strong("Validation");
+                                    result_header(ui, "Size");
+                                    result_header(ui, "CPU ms");
+                                    result_header(ui, "GPU compute ms");
+                                    result_header(ui, "GPU total ms");
+                                    result_header(ui, "Transfer/sync ms");
+                                    result_header(ui, "Speedup");
+                                    result_header(ui, "CPU model");
+                                    result_header(ui, "Adapter");
+                                    result_header(ui, "GPU path");
+                                    result_header(ui, "Tile");
+                                    result_header(ui, "Dispatches");
+                                    result_header(ui, "Last dispatch ms");
+                                    result_header(ui, "Avg dispatch ms");
+                                    result_header(ui, "Max dispatch ms");
+                                    result_header(ui, "Backoffs");
+                                    result_header(ui, "CPU temp");
+                                    result_header(ui, "GPU temp");
+                                    result_header(ui, "Validation");
                                     ui.end_row();
 
                                     for result in &self.results {
-                                        ui.label(format!("{}x{}", result.size, result.size));
-                                        ui.label(format_cpu_ms(result));
-                                        ui.label(format_ms(result.gpu_compute_ms));
-                                        ui.label(format_ms(Some(result.gpu_total_ms)));
-                                        ui.label(format_ms(result.transfer_sync_ms));
-                                        ui.label(format_speedup(result.speedup));
-                                        ui.label(&result.cpu_model);
-                                        ui.label(&result.adapter);
-                                        ui.label(result.gpu_path.label());
-                                        ui.label(&result.tile_shape);
-                                        ui.label(result.dispatch_count.to_string());
-                                        ui.label(format_ms(result.last_dispatch_ms));
-                                        ui.label(format_ms(result.avg_dispatch_ms));
-                                        ui.label(format_ms(result.max_dispatch_ms));
-                                        ui.label(result.backoff_count.to_string());
-                                        ui.label(&result.validation);
+                                        result_cell(ui, format!("{}x{}", result.size, result.size));
+                                        result_cell(ui, format_cpu_ms(result));
+                                        result_cell(ui, format_ms(result.gpu_compute_ms));
+                                        result_cell(ui, format_ms(Some(result.gpu_total_ms)));
+                                        result_cell(ui, format_ms(result.transfer_sync_ms));
+                                        result_cell(ui, format_speedup(result.speedup));
+                                        result_cell(ui, result.cpu_model.as_str());
+                                        result_cell(ui, result.adapter.as_str());
+                                        result_cell(ui, result.gpu_path.label());
+                                        result_cell(ui, result.tile_shape.as_str());
+                                        result_cell(ui, result.dispatch_count.to_string());
+                                        result_cell(ui, format_ms(result.last_dispatch_ms));
+                                        result_cell(ui, format_ms(result.avg_dispatch_ms));
+                                        result_cell(ui, format_ms(result.max_dispatch_ms));
+                                        result_cell(ui, result.backoff_count.to_string());
+                                        result_cell(
+                                            ui,
+                                            format_temperature_summary(&result.cpu_temperature),
+                                        );
+                                        result_cell(
+                                            ui,
+                                            format_temperature_summary(&result.gpu_temperature),
+                                        );
+                                        result_cell(ui, result.validation.as_str());
                                         ui.end_row();
                                     }
                                 });
@@ -4485,6 +5219,7 @@ impl eframe::App for BenchScopeApp {
                     });
                 });
         }
+        self.ui_sensor_panel(&ctx);
     }
 }
 
@@ -4494,6 +5229,318 @@ fn auto_drive_file_size(profile: DriveProfile) -> u64 {
         DriveProfile::Balanced => 512 * 1024 * 1024,
         DriveProfile::Thorough => 1024 * 1024 * 1024,
     }
+}
+
+fn detect_drives() -> Vec<DriveInfo> {
+    #[cfg(windows)]
+    {
+        let mut drives = Vec::new();
+        for letter in b'A'..=b'Z' {
+            let root = PathBuf::from(format!("{}:\\", letter as char));
+            if root.is_dir() {
+                drives.push(DriveInfo::new(root));
+            }
+        }
+        drives
+    }
+
+    #[cfg(not(windows))]
+    {
+        vec![DriveInfo::new(PathBuf::from("/"))]
+    }
+}
+
+fn selected_drive_for_path(drives: &[DriveInfo], path: &PathBuf) -> Option<usize> {
+    let root = drive_root_for_path(path)?;
+    drives
+        .iter()
+        .position(|drive| same_drive_root(&drive.root, &root))
+}
+
+fn same_drive_root(left: &PathBuf, right: &PathBuf) -> bool {
+    let left = left.display().to_string();
+    let right = right.display().to_string();
+    let left = left.trim_end_matches(|ch| ch == '\\' || ch == '/');
+    let right = right.trim_end_matches(|ch| ch == '\\' || ch == '/');
+    left.eq_ignore_ascii_case(right)
+}
+
+fn drive_root_for_path(path: &PathBuf) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let text = path.display().to_string();
+        let bytes = text.as_bytes();
+        if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+            let letter = (bytes[0] as char).to_ascii_uppercase();
+            return Some(PathBuf::from(format!("{letter}:\\")));
+        }
+        None
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Some(PathBuf::from("/"))
+    }
+}
+
+fn drive_letter_for_path(path: &PathBuf) -> Option<char> {
+    #[cfg(windows)]
+    {
+        let text = path.display().to_string();
+        let bytes = text.as_bytes();
+        if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+            return Some((bytes[0] as char).to_ascii_uppercase());
+        }
+        None
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+fn stale_checked_reading(
+    reading: Option<SensorReading>,
+    now: Instant,
+    stale_after: Duration,
+) -> Option<SensorReading> {
+    reading.map(|reading| {
+        if now.duration_since(reading.updated_at) > stale_after {
+            reading.mark_stale()
+        } else {
+            reading
+        }
+    })
+}
+
+fn sensor_temperature(reading: Option<&SensorReading>) -> Option<f32> {
+    reading
+        .filter(|reading| reading.is_ok())
+        .and_then(|reading| reading.temperature_c)
+}
+
+fn collect_sensor_snapshot(drive_letter: Option<char>) -> SensorSnapshot {
+    SensorSnapshot {
+        cpu: Some(query_cpu_temperature()),
+        gpu: Some(query_gpu_temperature()),
+        drive: Some(query_drive_temperature(drive_letter)),
+    }
+}
+
+fn query_cpu_temperature() -> SensorReading {
+    #[cfg(windows)]
+    {
+        let script = r#"
+$zone = Get-CimInstance -Namespace root/wmi -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($zone -and $zone.CurrentTemperature) {
+    [math]::Round(($zone.CurrentTemperature / 10) - 273.15, 1)
+}
+"#;
+        match run_powershell_sensor_script(script) {
+            Ok(output) => parse_first_temperature(&output)
+                .map(|temp| SensorReading::ok(SensorKind::Cpu, "CPU", temp, "ACPI thermal zone"))
+                .unwrap_or_else(|| {
+                    SensorReading::unavailable(
+                        SensorKind::Cpu,
+                        "CPU",
+                        "ACPI thermal zone",
+                        SensorStatus::Unsupported,
+                    )
+                }),
+            Err(err) => SensorReading::unavailable(
+                SensorKind::Cpu,
+                "CPU",
+                "ACPI thermal zone",
+                sensor_error_status(err),
+            ),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        SensorReading::unavailable(
+            SensorKind::Cpu,
+            "CPU",
+            "Windows sensors",
+            SensorStatus::Unsupported,
+        )
+    }
+}
+
+fn query_gpu_temperature() -> SensorReading {
+    #[cfg(windows)]
+    {
+        match run_command_no_window(
+            "nvidia-smi",
+            &[
+                "--query-gpu=temperature.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+        ) {
+            Ok(output) => parse_first_temperature(&output)
+                .map(|temp| SensorReading::ok(SensorKind::Gpu, "GPU", temp, "NVML/nvidia-smi"))
+                .unwrap_or_else(|| {
+                    SensorReading::unavailable(
+                        SensorKind::Gpu,
+                        "GPU",
+                        "NVML/nvidia-smi",
+                        SensorStatus::Unsupported,
+                    )
+                }),
+            Err(err) => SensorReading::unavailable(
+                SensorKind::Gpu,
+                "GPU",
+                "NVML/nvidia-smi",
+                sensor_error_status(err),
+            ),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        SensorReading::unavailable(
+            SensorKind::Gpu,
+            "GPU",
+            "Windows sensors",
+            SensorStatus::Unsupported,
+        )
+    }
+}
+
+fn query_drive_temperature(drive_letter: Option<char>) -> SensorReading {
+    let Some(drive_letter) = drive_letter else {
+        return SensorReading::unavailable(
+            SensorKind::Drive,
+            "SSD",
+            "Windows Storage",
+            SensorStatus::Unsupported,
+        );
+    };
+    let label = format!("SSD {drive_letter}:");
+
+    #[cfg(windows)]
+    {
+        let script = format!(
+            r#"
+$letter = '{drive_letter}'
+$partition = Get-Partition -DriveLetter $letter -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($partition) {{
+    $disk = $partition | Get-Disk -ErrorAction SilentlyContinue
+    if ($disk) {{
+        $physical = Get-PhysicalDisk -ErrorAction SilentlyContinue |
+            Where-Object {{ $_.DeviceId -eq "$($disk.Number)" -or $_.SerialNumber -eq $disk.SerialNumber }} |
+            Select-Object -First 1
+        if ($physical) {{
+            $counter = $physical | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue
+            if ($counter -and $counter.Temperature) {{
+                [math]::Round($counter.Temperature, 1)
+            }}
+        }}
+    }}
+}}
+"#
+        );
+        match run_powershell_sensor_script(&script) {
+            Ok(output) => parse_first_temperature(&output)
+                .map(|temp| {
+                    SensorReading::ok(
+                        SensorKind::Drive,
+                        label.clone(),
+                        temp,
+                        "Windows Storage SMART",
+                    )
+                })
+                .unwrap_or_else(|| {
+                    SensorReading::unavailable(
+                        SensorKind::Drive,
+                        label.clone(),
+                        "Windows Storage SMART",
+                        SensorStatus::Unsupported,
+                    )
+                }),
+            Err(err) => SensorReading::unavailable(
+                SensorKind::Drive,
+                label,
+                "Windows Storage SMART",
+                sensor_error_status(err),
+            ),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = drive_letter;
+        SensorReading::unavailable(
+            SensorKind::Drive,
+            label,
+            "Windows Storage SMART",
+            SensorStatus::Unsupported,
+        )
+    }
+}
+
+fn parse_first_temperature(output: &str) -> Option<f32> {
+    output
+        .split(|ch: char| !(ch.is_ascii_digit() || ch == '.' || ch == '-'))
+        .filter(|token| !token.is_empty())
+        .filter_map(|token| token.parse::<f32>().ok())
+        .find(|value| (-40.0..=130.0).contains(value))
+}
+
+fn sensor_error_status(err: anyhow::Error) -> SensorStatus {
+    let message = err.to_string();
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("access is denied") || lower.contains("permission") {
+        SensorStatus::PermissionDenied
+    } else if lower.contains("not found")
+        || lower.contains("not recognized")
+        || lower.contains("cannot find")
+        || lower.contains("os error 2")
+    {
+        SensorStatus::Unsupported
+    } else {
+        SensorStatus::Error(message)
+    }
+}
+
+#[cfg(windows)]
+fn run_powershell_sensor_script(script: &str) -> Result<String> {
+    run_command_no_window(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ],
+    )
+}
+
+#[cfg(windows)]
+fn run_command_no_window(program: &str, args: &[&str]) -> Result<String> {
+    let output = Command::new(program)
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW_RAW)
+        .output()
+        .with_context(|| format!("failed to start {program}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(anyhow!(
+            "{} failed{}",
+            program,
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 fn open_drive_file_direct_preferred(
@@ -5132,6 +6179,7 @@ fn make_drive_result(
         file_size_bytes,
         io_mode,
         notes,
+        ssd_temperature: TemperatureSummary::default(),
     }
 }
 
@@ -5331,6 +6379,95 @@ fn format_optional_latency(value: Option<f64>) -> String {
         Some(value) => format!("{value:.1} ms"),
         None => "N/A".to_owned(),
     }
+}
+
+fn format_temperature_value(value: Option<f32>) -> String {
+    value
+        .map(|value| format!("{value:.0} C"))
+        .unwrap_or_else(|| "N/A".to_owned())
+}
+
+fn format_temperature_summary(summary: &TemperatureSummary) -> String {
+    if !summary.has_any_value() {
+        return "N/A".to_owned();
+    }
+    format!(
+        "{} -> {} (max {})",
+        format_temperature_value(summary.start_c),
+        format_temperature_value(summary.end_c),
+        format_temperature_value(summary.max_c)
+    )
+}
+
+fn format_temperature_run_report(report: &TemperatureRunReport) -> String {
+    let mut parts = Vec::new();
+    if report.scope == TemperatureScope::Matrix {
+        parts.push(format!("CPU {}", format_temperature_summary(&report.cpu)));
+        parts.push(format!("GPU {}", format_temperature_summary(&report.gpu)));
+    } else {
+        parts.push(format!("SSD {}", format_temperature_summary(&report.drive)));
+    }
+    parts.join(", ")
+}
+
+fn temperature_color(kind: SensorKind, value: Option<f32>, status: &SensorStatus) -> egui::Color32 {
+    if !matches!(status, SensorStatus::Ok) {
+        return egui::Color32::GRAY;
+    }
+    match value {
+        Some(value) if value >= kind.critical_c() => egui::Color32::RED,
+        Some(value) if value >= kind.warning_c() => egui::Color32::YELLOW,
+        Some(_) => egui::Color32::WHITE,
+        None => egui::Color32::GRAY,
+    }
+}
+
+fn ui_sensor_row(ui: &mut egui::Ui, label: &str, reading: Option<&SensorReading>) {
+    let (value, color, tooltip) = if let Some(reading) = reading {
+        let value = if reading.status == SensorStatus::Stale {
+            "-- C".to_owned()
+        } else {
+            format_temperature_value(reading.temperature_c)
+        };
+        let tooltip = format!(
+            "{}\nProvider: {}\nStatus: {}",
+            reading.label,
+            reading.provider,
+            reading.status.detail()
+        );
+        (
+            value,
+            temperature_color(reading.kind, reading.temperature_c, &reading.status),
+            tooltip,
+        )
+    } else {
+        (
+            "N/A".to_owned(),
+            egui::Color32::GRAY,
+            "No sensor provider initialized".to_owned(),
+        )
+    };
+
+    ui.horizontal(|ui| {
+        ui.set_min_width(132.0);
+        ui.label(egui::RichText::new(label).monospace());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(egui::RichText::new(value).monospace().color(color))
+                .on_hover_text(tooltip);
+        });
+    });
+}
+
+fn result_header(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        egui::RichText::new(text)
+            .strong()
+            .size(RESULT_HEADER_TEXT_SIZE),
+    );
+}
+
+fn result_cell(ui: &mut egui::Ui, text: impl Into<String>) {
+    ui.label(egui::RichText::new(text.into()).size(RESULT_CELL_TEXT_SIZE));
 }
 
 fn device_type_label(value: wgpu::DeviceType) -> &'static str {
@@ -5600,6 +6737,8 @@ mod tests {
             backoff_count: 0,
             speedup: 102.83,
             validation: "Skipped".to_owned(),
+            cpu_temperature: TemperatureSummary::default(),
+            gpu_temperature: TemperatureSummary::default(),
         };
 
         assert_eq!(format_cpu_ms(&result), "Est. 1234.0");
@@ -5826,6 +6965,7 @@ mod tests {
         assert_eq!(result.p95_latency_ms, Some(0.3));
         assert_eq!(result.io_mode, DriveIoMode::Direct);
         assert_eq!(format_drive_speed(&result), "2.05");
+        assert_eq!(result.ssd_temperature, TemperatureSummary::default());
     }
 
     #[test]
@@ -5840,6 +6980,18 @@ mod tests {
         assert!(a.iter().any(|byte| *byte != 0));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn drive_root_parser_finds_windows_drive() {
+        let root = drive_root_for_path(&PathBuf::from("c:\\Users\\test")).unwrap();
+
+        assert_eq!(root.display().to_string(), "C:\\");
+        assert!(same_drive_root(
+            &PathBuf::from("c:\\"),
+            &PathBuf::from("C:\\")
+        ));
+    }
+
     #[test]
     fn aligned_drive_buffer_meets_direct_io_alignment() {
         let mut buffer = AlignedBuffer::new(DRIVE_RANDOM_BLOCK_BYTES, DRIVE_RANDOM_BLOCK_BYTES);
@@ -5847,5 +6999,45 @@ mod tests {
 
         assert_eq!(ptr % DRIVE_RANDOM_BLOCK_BYTES, 0);
         assert_eq!(buffer.len(), DRIVE_RANDOM_BLOCK_BYTES);
+    }
+
+    #[test]
+    fn temperature_summary_tracks_start_end_and_max() {
+        let mut summary = TemperatureSummary::begin(Some(42.0));
+
+        summary.observe(Some(55.0));
+        summary.observe(Some(51.0));
+        summary.finish(Some(49.0));
+
+        assert_eq!(summary.start_c, Some(42.0));
+        assert_eq!(summary.end_c, Some(49.0));
+        assert_eq!(summary.max_c, Some(55.0));
+        assert_eq!(
+            format_temperature_summary(&summary),
+            "42 C -> 49 C (max 55 C)"
+        );
+    }
+
+    #[test]
+    fn temperature_parser_finds_first_plausible_value() {
+        assert_eq!(parse_first_temperature("Temperature\n64 C\n"), Some(64.0));
+        assert_eq!(parse_first_temperature("GPU 72, CPU 66"), Some(72.0));
+        assert_eq!(parse_first_temperature("999"), None);
+    }
+
+    #[test]
+    fn temperature_color_uses_thresholds() {
+        assert_eq!(
+            temperature_color(SensorKind::Gpu, Some(91.0), &SensorStatus::Ok),
+            egui::Color32::RED
+        );
+        assert_eq!(
+            temperature_color(SensorKind::Drive, Some(62.0), &SensorStatus::Ok),
+            egui::Color32::YELLOW
+        );
+        assert_eq!(
+            temperature_color(SensorKind::Cpu, None, &SensorStatus::Unsupported),
+            egui::Color32::GRAY
+        );
     }
 }
