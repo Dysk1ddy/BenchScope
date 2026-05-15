@@ -1,15 +1,15 @@
-# Hardware Acceleration Tester
+# BenchScope
 
-Native desktop tool for comparing CPU matrix multiplication against GPU compute.
+Native desktop tool for comparing CPU matrix multiplication against GPU compute, with a drive read/write benchmark tool built into the same app.
 
-The primary implementation is now Rust + `wgpu` + `egui`. The earlier Python Direct3D prototype remains archived in `archive/hardware_accel_tester.py` as a fallback/reference implementation.
+The primary implementation is now Rust + `wgpu` + `egui`. The earlier Python Direct3D prototype remains archived in `archive/benchscope.py` as a fallback/reference implementation.
 
 ## Run
 
 Double-click `RUN_TESTER.bat`, or run the release binary directly:
 
 ```powershell
-.\target\release\hardware_accel_tester.exe
+.\target\release\benchscope.exe
 ```
 
 If the release binary has not been built yet:
@@ -24,37 +24,39 @@ $env:CARGO_NET_OFFLINE='false'
 List detected `wgpu` adapters:
 
 ```powershell
-.\target\release\hardware_accel_tester.exe --list-gpus
+.\target\release\benchscope.exe --list-gpus
 ```
 
 Run a small CPU/GPU smoke test:
 
 ```powershell
-.\target\release\hardware_accel_tester.exe --self-test --size 64
+.\target\release\benchscope.exe --self-test --size 64
 ```
 
 Select a specific adapter:
 
 ```powershell
-.\target\release\hardware_accel_tester.exe --self-test --size 64 --adapter 1
+.\target\release\benchscope.exe --self-test --size 64 --adapter 1
 ```
 
 Use the sampled CPU estimate path:
 
 ```powershell
-.\target\release\hardware_accel_tester.exe --self-test --size 512 --estimate-cpu
+.\target\release\benchscope.exe --self-test --size 512 --estimate-cpu
 ```
 
 Choose the GPU submission intensity used by self-test:
 
 ```powershell
-.\target\release\hardware_accel_tester.exe --self-test --size 512 --gpu-intensity safe
-.\target\release\hardware_accel_tester.exe --self-test --size 512 --gpu-intensity balanced
-.\target\release\hardware_accel_tester.exe --self-test --size 512 --gpu-intensity high
+.\target\release\benchscope.exe --self-test --size 512 --gpu-intensity safe
+.\target\release\benchscope.exe --self-test --size 512 --gpu-intensity balanced
+.\target\release\benchscope.exe --self-test --size 512 --gpu-intensity high
 ```
 
 ## Current Features
 
+- Main menu with separate tool views for the matrix benchmark and drive benchmark.
+- Each tool view has a Back control that returns to the main menu; active tests ask for cancellation before leaving.
 - CPU-only matrix multiplication timing by default, with an opt-in sampled estimate mode.
 - CPU exact timing uses parallel worker threads for larger matrices while leaving one logical processor free for system responsiveness.
 - GPU matrix multiplication using a tiled WGSL compute shader through `wgpu`.
@@ -75,6 +77,12 @@ Choose the GPU submission intensity used by self-test:
 - Large GPU runs report real chunk/block progress so the progress bar keeps moving through long matrix computations.
 - GPU matrices that exceed an adapter's storage-buffer binding limit use intensity-controlled legal row/column blocks instead of binding the whole matrix at once.
 - CPU estimate results are labeled `Est.` and include the detected CPU model/logical processor count. Large estimates spend about two seconds computing real full-width CPU rows against the full-size B matrix, then extrapolate from completed row throughput.
+- Drive benchmark tool with sequential read, sequential write, random 4 KiB read, and random 4 KiB write tests.
+- Drive tests report MB/s, IOPS for random tests, average latency, p95 latency, duration, file size, I/O mode, and notes.
+- Drive tests prefer Windows direct/no-buffering I/O and fall back to cached file I/O when direct mode is unavailable.
+- Drive benchmark profiles keep measured subtests below a 30 second hard cap, with shorter Quick/Balanced/Thorough targets.
+- Drive benchmark runs on a background worker, reports current-test and whole-suite progress, and can be canceled mid-run.
+- Drive benchmark uses a temporary file in the selected target folder and attempts cleanup after completion or failure.
 
 ## Build and Test
 
@@ -96,3 +104,5 @@ Exact CPU multiplication is the default for every supported matrix size. For ver
 For very large GPU runs, some adapters expose less storage-buffer binding space than a full matrix requires. The app first tries a persistent panelized path in that case, keeping full GPU buffers allocated and binding legal subranges. If that is not possible because of buffer limits or alignment, it falls back to the streaming blocked path. When timestamp queries are supported, both paths sum compute-only timing across completed dispatches and derive transfer/sync time from total minus compute.
 
 On Windows, a large compute dispatch that keeps the GPU busy for too long can trigger Timeout Detection and Recovery (TDR), which may reset the graphics driver or reboot the system if recovery fails. Full GPU utilization by itself should be safe on stable hardware, but long non-preemptible compute work can combine with driver bugs, overclocks, power spikes, or thermals. Use Safe mode first for 8192+ matrices, avoid High mode until the system is stable, and check Windows Event Viewer for `nvlddmkm`, LiveKernelEvent 117/141, WHEA, or power events after any crash.
+
+The drive benchmark prefers direct/no-buffering I/O on Windows. If the selected path or filesystem rejects direct mode, the app falls back to cached I/O and labels the result. Cached mode is useful for quick comparisons, but it can include operating-system RAM cache effects, especially on repeated reads.

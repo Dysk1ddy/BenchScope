@@ -1,5 +1,5 @@
 [package]
-name = "hardware_accel_tester"
+name = "benchscope"
 version = "0.1.0"
 edition = "2024"
 

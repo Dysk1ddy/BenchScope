@@ -1,7 +1,10 @@
 use std::{
     any::Any,
     fmt,
+    fs::{self, File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
     panic::{self, AssertUnwindSafe},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -10,6 +13,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 
 use anyhow::{Context, Result, anyhow};
 use bytemuck::{Pod, Zeroable};
@@ -45,7 +51,21 @@ const GPU_HIGH_BLOCK_ROWS: usize = 128;
 const GPU_HIGH_BLOCK_COLS: usize = 2048;
 const GPU_WAIT_POLL_MS: u64 = 1;
 const WGPU_MAX_QUERY_COUNT: usize = 4096;
-const FORCE_BLOCKED_GPU_ENV: &str = "HARDWARE_ACCEL_TEST_FORCE_BLOCKED_GPU";
+const FORCE_BLOCKED_GPU_ENV: &str = "BENCHSCOPE_FORCE_BLOCKED_GPU";
+const DRIVE_BENCHMARK_FILE_NAME: &str = "benchscope_drive_benchmark.tmp";
+const DRIVE_MAX_TEST_SECONDS: f64 = 30.0;
+const DRIVE_SEQUENTIAL_BLOCK_BYTES: usize = 8 * 1024 * 1024;
+const DRIVE_RANDOM_BLOCK_BYTES: usize = 4 * 1024;
+const DRIVE_LATENCY_SAMPLE_LIMIT: usize = 200_000;
+const DECIMAL_MB: f64 = 1_000_000.0;
+#[cfg(windows)]
+const FILE_FLAG_WRITE_THROUGH_RAW: u32 = 0x8000_0000;
+#[cfg(windows)]
+const FILE_FLAG_NO_BUFFERING_RAW: u32 = 0x2000_0000;
+#[cfg(windows)]
+const FILE_FLAG_RANDOM_ACCESS_RAW: u32 = 0x1000_0000;
+#[cfg(windows)]
+const FILE_FLAG_SEQUENTIAL_SCAN_RAW: u32 = 0x0800_0000;
 
 const MATMUL_SHADER: &str = r#"
 const TILE: u32 = 16u;
@@ -449,6 +469,414 @@ impl fmt::Display for RepeatDuration {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppView {
+    MainMenu,
+    MatrixBenchmark,
+    DriveBenchmark,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DriveProfile {
+    Quick,
+    Balanced,
+    Thorough,
+}
+
+impl DriveProfile {
+    const ALL: [DriveProfile; 3] = [
+        DriveProfile::Quick,
+        DriveProfile::Balanced,
+        DriveProfile::Thorough,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            DriveProfile::Quick => "Quick",
+            DriveProfile::Balanced => "Balanced",
+            DriveProfile::Thorough => "Thorough",
+        }
+    }
+
+    fn target_duration(self) -> Duration {
+        match self {
+            DriveProfile::Quick => Duration::from_secs(4),
+            DriveProfile::Balanced => Duration::from_secs(8),
+            DriveProfile::Thorough => Duration::from_secs(15),
+        }
+    }
+}
+
+impl fmt::Display for DriveProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DriveFileSize {
+    Auto,
+    Mib256,
+    Mib512,
+    Gib1,
+    Gib4,
+    Gib8,
+}
+
+impl DriveFileSize {
+    const ALL: [DriveFileSize; 6] = [
+        DriveFileSize::Auto,
+        DriveFileSize::Mib256,
+        DriveFileSize::Mib512,
+        DriveFileSize::Gib1,
+        DriveFileSize::Gib4,
+        DriveFileSize::Gib8,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            DriveFileSize::Auto => "Auto",
+            DriveFileSize::Mib256 => "256 MiB",
+            DriveFileSize::Mib512 => "512 MiB",
+            DriveFileSize::Gib1 => "1 GiB",
+            DriveFileSize::Gib4 => "4 GiB",
+            DriveFileSize::Gib8 => "8 GiB",
+        }
+    }
+
+    fn bytes(self, profile: DriveProfile) -> u64 {
+        match self {
+            DriveFileSize::Auto => auto_drive_file_size(profile),
+            DriveFileSize::Mib256 => 256 * 1024 * 1024,
+            DriveFileSize::Mib512 => 512 * 1024 * 1024,
+            DriveFileSize::Gib1 => 1024 * 1024 * 1024,
+            DriveFileSize::Gib4 => 4 * 1024 * 1024 * 1024,
+            DriveFileSize::Gib8 => 8 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DriveTestKind {
+    SequentialRead,
+    SequentialWrite,
+    RandomRead4K,
+    RandomWrite4K,
+}
+
+impl DriveTestKind {
+    fn label(self) -> &'static str {
+        match self {
+            DriveTestKind::SequentialRead => "Sequential read",
+            DriveTestKind::SequentialWrite => "Sequential write",
+            DriveTestKind::RandomRead4K => "Random 4 KiB read",
+            DriveTestKind::RandomWrite4K => "Random 4 KiB write",
+        }
+    }
+
+    fn is_read(self) -> bool {
+        matches!(
+            self,
+            DriveTestKind::SequentialRead | DriveTestKind::RandomRead4K
+        )
+    }
+
+    fn is_write(self) -> bool {
+        matches!(
+            self,
+            DriveTestKind::SequentialWrite | DriveTestKind::RandomWrite4K
+        )
+    }
+}
+
+impl fmt::Display for DriveTestKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DriveIoMode {
+    Direct,
+    Cached,
+}
+
+impl DriveIoMode {
+    fn label(self) -> &'static str {
+        match self {
+            DriveIoMode::Direct => "Direct I/O",
+            DriveIoMode::Cached => "Cached I/O",
+        }
+    }
+}
+
+struct DriveOpenFile {
+    file: File,
+    io_mode: DriveIoMode,
+    fallback_note: Option<String>,
+}
+
+struct AlignedBuffer {
+    storage: Vec<u8>,
+    offset: usize,
+    len: usize,
+}
+
+impl AlignedBuffer {
+    fn new(len: usize, alignment: usize) -> Self {
+        let alignment = alignment.max(1);
+        let storage = vec![0_u8; len + alignment];
+        let ptr = storage.as_ptr() as usize;
+        let offset = (alignment - (ptr % alignment)) % alignment;
+        Self {
+            storage,
+            offset,
+            len,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.storage[self.offset..self.offset + self.len]
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.storage[self.offset..self.offset + self.len]
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DriveBenchmarkConfig {
+    target_folder: PathBuf,
+    file_size_bytes: u64,
+    profile: DriveProfile,
+    selected_tests: Vec<DriveTestKind>,
+}
+
+#[derive(Clone, Debug)]
+struct DriveBenchmarkResult {
+    test: DriveTestKind,
+    read_mbps: Option<f64>,
+    write_mbps: Option<f64>,
+    iops: Option<f64>,
+    avg_latency_ms: Option<f64>,
+    p95_latency_ms: Option<f64>,
+    duration_ms: f64,
+    file_size_bytes: u64,
+    io_mode: DriveIoMode,
+    notes: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct DriveProgress {
+    current_test: String,
+    current_progress: f32,
+    suite_progress: f32,
+    elapsed_s: f64,
+    eta_s: Option<f64>,
+    bytes_processed: u64,
+    operations: u64,
+}
+
+#[derive(Debug)]
+enum DriveWorkerEvent {
+    Progress(DriveProgress),
+    Log(String),
+    Done(Result<Vec<DriveBenchmarkResult>, String>),
+}
+
+struct DriveBenchmarkState {
+    target_folder_text: String,
+    profile: DriveProfile,
+    file_size: DriveFileSize,
+    run_seq_read: bool,
+    run_seq_write: bool,
+    run_random_read: bool,
+    run_random_write: bool,
+    results: Vec<DriveBenchmarkResult>,
+    log: Vec<String>,
+    status: String,
+    current_progress: f32,
+    suite_progress: f32,
+    eta_text: String,
+    rx: Receiver<DriveWorkerEvent>,
+    tx: Sender<DriveWorkerEvent>,
+    cancel: Option<Arc<AtomicBool>>,
+    running: bool,
+}
+
+impl DriveBenchmarkState {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel();
+        let target_folder = std::env::temp_dir();
+
+        Self {
+            target_folder_text: target_folder.display().to_string(),
+            profile: DriveProfile::Quick,
+            file_size: DriveFileSize::Auto,
+            run_seq_read: true,
+            run_seq_write: true,
+            run_random_read: true,
+            run_random_write: true,
+            results: Vec::new(),
+            log: vec!["Drive benchmark tool ready".to_owned()],
+            status: "Ready".to_owned(),
+            current_progress: 0.0,
+            suite_progress: 0.0,
+            eta_text: String::new(),
+            rx,
+            tx,
+            cancel: None,
+            running: false,
+        }
+    }
+
+    fn log(&mut self, message: impl Into<String>) {
+        self.log.push(message.into());
+    }
+
+    fn selected_tests(&self) -> Vec<DriveTestKind> {
+        let mut tests = Vec::new();
+        if self.run_seq_read {
+            tests.push(DriveTestKind::SequentialRead);
+        }
+        if self.run_seq_write {
+            tests.push(DriveTestKind::SequentialWrite);
+        }
+        if self.run_random_read {
+            tests.push(DriveTestKind::RandomRead4K);
+        }
+        if self.run_random_write {
+            tests.push(DriveTestKind::RandomWrite4K);
+        }
+        tests
+    }
+
+    fn planned_file_size(&self) -> u64 {
+        self.file_size.bytes(self.profile)
+    }
+
+    fn planned_write_bytes(&self) -> u64 {
+        let tests = self.selected_tests();
+        let write_tests = tests.iter().filter(|test| test.is_write()).count() as u64;
+        self.planned_file_size().saturating_mul(write_tests)
+    }
+
+    fn start(&mut self) {
+        if self.running {
+            return;
+        }
+
+        let target_folder = PathBuf::from(self.target_folder_text.trim());
+        if target_folder.as_os_str().is_empty() {
+            self.status = "Choose a target folder".to_owned();
+            self.log("Drive benchmark target folder is empty");
+            return;
+        }
+        if !target_folder.is_dir() {
+            self.status = "Target folder does not exist".to_owned();
+            self.log(format!(
+                "Target folder does not exist: {}",
+                target_folder.display()
+            ));
+            return;
+        }
+
+        let selected_tests = self.selected_tests();
+        if selected_tests.is_empty() {
+            self.status = "Select at least one drive test".to_owned();
+            self.log("No drive tests selected");
+            return;
+        }
+
+        let config = DriveBenchmarkConfig {
+            target_folder,
+            file_size_bytes: self.planned_file_size(),
+            profile: self.profile,
+            selected_tests,
+        };
+
+        let tx = self.tx.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        self.cancel = Some(cancel);
+        self.running = true;
+        self.current_progress = 0.0;
+        self.suite_progress = 0.0;
+        self.eta_text = "ETA: estimating".to_owned();
+        self.status = "Running drive benchmark...".to_owned();
+        self.log(format!(
+            "Starting drive benchmark in {} with {} test file using {} profile",
+            config.target_folder.display(),
+            format_bytes(config.file_size_bytes),
+            config.profile
+        ));
+
+        thread::spawn(move || {
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                run_drive_benchmark(config, worker_cancel, tx.clone())
+            }))
+            .map_err(|panic| format!("Drive benchmark panicked: {}", panic_message(&*panic)))
+            .and_then(|result| result.map_err(|err| format!("{err:#}")));
+            let _ = tx.send(DriveWorkerEvent::Done(result));
+        });
+    }
+
+    fn cancel(&mut self) {
+        if let Some(cancel) = &self.cancel {
+            cancel.store(true, Ordering::Relaxed);
+            self.status = "Cancel requested; stopping drive benchmark...".to_owned();
+            self.log("Cancel requested for drive benchmark");
+        }
+    }
+
+    fn poll_worker_events(&mut self) {
+        while let Ok(event) = self.rx.try_recv() {
+            match event {
+                DriveWorkerEvent::Progress(progress) => {
+                    self.current_progress = progress.current_progress;
+                    self.suite_progress = progress.suite_progress;
+                    self.eta_text = format_eta(progress.eta_s);
+                    self.status = format!(
+                        "{} - {} processed, {} op(s), elapsed {}",
+                        progress.current_test,
+                        format_bytes(progress.bytes_processed),
+                        progress.operations,
+                        format_elapsed(progress.elapsed_s)
+                    );
+                }
+                DriveWorkerEvent::Log(message) => self.log(message),
+                DriveWorkerEvent::Done(result) => {
+                    self.running = false;
+                    self.cancel = None;
+                    self.eta_text.clear();
+                    match result {
+                        Ok(results) => {
+                            self.current_progress = 1.0;
+                            self.suite_progress = 1.0;
+                            self.status =
+                                format!("Drive benchmark complete: {} result(s)", results.len());
+                            self.log(self.status.clone());
+                            self.results.extend(results);
+                        }
+                        Err(err) => {
+                            if err.to_ascii_lowercase().contains("canceled") {
+                                self.current_progress = 0.0;
+                                self.eta_text = "ETA: canceled".to_owned();
+                            }
+                            self.status = err.clone();
+                            self.log(err);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 enum WorkerEvent {
     SingleProgress(SingleProgress),
@@ -715,7 +1143,7 @@ impl GpuRunner {
         let requested_limits =
             wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
         let mut descriptor = wgpu::DeviceDescriptor::default();
-        descriptor.label = Some("Hardware Acceleration Tester device");
+        descriptor.label = Some("BenchScope device");
         descriptor.required_features = required_features;
         descriptor.required_limits = requested_limits.clone();
 
@@ -2961,7 +3389,8 @@ fn run_repeat(
     ))
 }
 
-struct HardwareAccelApp {
+struct BenchScopeApp {
+    view: AppView,
     adapters: Vec<AdapterInfo>,
     cpu_info: CpuInfo,
     selected_adapter: usize,
@@ -2984,9 +3413,12 @@ struct HardwareAccelApp {
     running: bool,
     repeat_running: bool,
     pending_vram_warning: Option<PendingVramWarning>,
+    matrix_back_confirm: bool,
+    drive_back_confirm: bool,
+    drive: DriveBenchmarkState,
 }
 
-impl HardwareAccelApp {
+impl BenchScopeApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let (tx, rx) = mpsc::channel();
         let adapters = enumerate_adapters();
@@ -2996,6 +3428,7 @@ impl HardwareAccelApp {
             .position(|adapter| adapter.device_type != wgpu::DeviceType::Cpu)
             .unwrap_or(0);
         let mut app = Self {
+            view: AppView::MainMenu,
             adapters,
             cpu_info,
             selected_adapter,
@@ -3018,6 +3451,9 @@ impl HardwareAccelApp {
             running: false,
             repeat_running: false,
             pending_vram_warning: None,
+            matrix_back_confirm: false,
+            drive_back_confirm: false,
+            drive: DriveBenchmarkState::new(),
         };
         app.log("Application started");
         if app.adapters.is_empty() {
@@ -3439,19 +3875,280 @@ impl HardwareAccelApp {
             }
         }
     }
+
+    fn ui_main_menu(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(80.0);
+                ui.heading("BenchScope");
+                ui.add_space(20.0);
+                if ui
+                    .add_sized([280.0, 44.0], egui::Button::new("Matrix CPU/GPU Benchmark"))
+                    .clicked()
+                {
+                    self.view = AppView::MatrixBenchmark;
+                }
+                ui.add_space(8.0);
+                if ui
+                    .add_sized([280.0, 44.0], egui::Button::new("Drive Benchmark"))
+                    .clicked()
+                {
+                    self.view = AppView::DriveBenchmark;
+                }
+                ui.add_space(18.0);
+                ui.small(format!("CPU: {}", self.cpu_info.label()));
+                ui.small(format!("GPU adapters detected: {}", self.adapters.len()));
+            });
+        });
+    }
+
+    fn request_matrix_back_to_menu(&mut self) {
+        if self.running {
+            self.matrix_back_confirm = true;
+        } else {
+            self.view = AppView::MainMenu;
+        }
+    }
+
+    fn request_drive_back_to_menu(&mut self) {
+        if self.drive.running {
+            self.drive_back_confirm = true;
+        } else {
+            self.view = AppView::MainMenu;
+        }
+    }
+
+    fn ui_drive_benchmark(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+
+        egui::Panel::top("drive_top_panel").show_inside(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Back").clicked() {
+                    self.request_drive_back_to_menu();
+                }
+                ui.separator();
+                ui.heading("Drive Benchmark");
+                ui.separator();
+                ui.label(&self.drive.status);
+                if !self.drive.eta_text.is_empty() {
+                    ui.separator();
+                    ui.label(&self.drive.eta_text);
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Current");
+                ui.add(
+                    egui::ProgressBar::new(self.drive.current_progress)
+                        .show_percentage()
+                        .desired_width(260.0),
+                );
+                ui.label("Suite");
+                ui.add(
+                    egui::ProgressBar::new(self.drive.suite_progress)
+                        .show_percentage()
+                        .desired_width(260.0),
+                );
+            });
+        });
+
+        egui::Panel::left("drive_controls")
+            .resizable(false)
+            .min_size(350.0)
+            .show_inside(ui, |ui| {
+                ui.heading("Controls");
+                ui.add_space(8.0);
+
+                ui.label("Target folder");
+                ui.add_enabled_ui(!self.drive.running, |ui| {
+                    ui.text_edit_singleline(&mut self.drive.target_folder_text);
+                });
+                let target_path = PathBuf::from(self.drive.target_folder_text.trim());
+                if target_path.is_dir() {
+                    ui.small(format!("Benchmark file: {}", DRIVE_BENCHMARK_FILE_NAME));
+                } else {
+                    ui.colored_label(egui::Color32::YELLOW, "Target folder is not valid.");
+                }
+
+                ui.add_space(8.0);
+                ui.label("Profile");
+                ui.add_enabled_ui(!self.drive.running, |ui| {
+                    ui.horizontal(|ui| {
+                        for profile in DriveProfile::ALL {
+                            ui.selectable_value(&mut self.drive.profile, profile, profile.label());
+                        }
+                    });
+                });
+                ui.small(format!(
+                    "Measured target: {} per test, hard cap: {:.0}s",
+                    format_elapsed(self.drive.profile.target_duration().as_secs_f64()),
+                    DRIVE_MAX_TEST_SECONDS
+                ));
+
+                ui.add_space(8.0);
+                ui.label("Test file size");
+                ui.add_enabled_ui(!self.drive.running, |ui| {
+                    egui::ComboBox::from_id_salt("drive_file_size_combo")
+                        .selected_text(self.drive.file_size.label())
+                        .show_ui(ui, |ui| {
+                            for size in DriveFileSize::ALL {
+                                ui.selectable_value(&mut self.drive.file_size, size, size.label());
+                            }
+                        });
+                });
+                ui.small(format!(
+                    "Planned file size: {}",
+                    format_bytes(self.drive.planned_file_size())
+                ));
+
+                ui.separator();
+                ui.label("Tests");
+                ui.add_enabled_ui(!self.drive.running, |ui| {
+                    ui.checkbox(&mut self.drive.run_seq_read, "Sequential read");
+                    ui.checkbox(&mut self.drive.run_seq_write, "Sequential write");
+                    ui.checkbox(&mut self.drive.run_random_read, "Random 4 KiB read");
+                    ui.checkbox(&mut self.drive.run_random_write, "Random 4 KiB write");
+                });
+                ui.small("Mode: direct I/O preferred; cached fallback is labeled in results.");
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "Write tests create temporary data on the selected drive.",
+                );
+                let planned_writes = self.drive.planned_write_bytes();
+                if planned_writes >= 4 * 1024 * 1024 * 1024 {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        format!(
+                            "Selected write tests may write at least {}.",
+                            format_bytes(planned_writes)
+                        ),
+                    );
+                }
+
+                ui.separator();
+                ui.add_enabled_ui(!self.drive.running, |ui| {
+                    if ui.button("Run drive benchmark").clicked() {
+                        self.drive.start();
+                    }
+                });
+                ui.add_enabled_ui(self.drive.running, |ui| {
+                    if ui.button("Cancel drive benchmark").clicked() {
+                        self.drive.cancel();
+                    }
+                });
+            });
+
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            let available_height = ui.available_height();
+            let log_height = (available_height * 0.18).clamp(110.0, 150.0);
+            let results_height = (available_height - log_height - 56.0).max(260.0);
+
+            ui.heading("Drive Results");
+            ui.add_space(6.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), results_height),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            egui::Grid::new("drive_results_grid")
+                                .striped(true)
+                                .num_columns(9)
+                                .show(ui, |ui| {
+                                    ui.strong("Test");
+                                    ui.strong("Speed MB/s");
+                                    ui.strong("IOPS");
+                                    ui.strong("Avg latency");
+                                    ui.strong("P95 latency");
+                                    ui.strong("Duration");
+                                    ui.strong("File size");
+                                    ui.strong("Mode");
+                                    ui.strong("Notes");
+                                    ui.end_row();
+
+                                    for result in &self.drive.results {
+                                        ui.label(result.test.label());
+                                        ui.label(format_drive_speed(result));
+                                        ui.label(format_optional_iops(result.iops));
+                                        ui.label(format_optional_latency(result.avg_latency_ms));
+                                        ui.label(format_optional_latency(result.p95_latency_ms));
+                                        ui.label(format_ms(Some(result.duration_ms)));
+                                        ui.label(format_bytes(result.file_size_bytes));
+                                        ui.label(result.io_mode.label());
+                                        ui.label(if result.notes.is_empty() {
+                                            String::new()
+                                        } else {
+                                            result.notes.join(", ")
+                                        });
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                },
+            );
+
+            ui.separator();
+            ui.heading("Log");
+            egui::ScrollArea::vertical()
+                .stick_to_bottom(true)
+                .max_height(log_height)
+                .show(ui, |ui| {
+                    for line in &self.drive.log {
+                        ui.monospace(line);
+                    }
+                });
+        });
+
+        if self.drive_back_confirm {
+            egui::Window::new("Return to main menu?")
+                .collapsible(false)
+                .resizable(false)
+                .show(&ctx, |ui| {
+                    ui.label("A drive benchmark is currently running.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Stay").clicked() {
+                            self.drive_back_confirm = false;
+                        }
+                        if ui.button("Cancel and return").clicked() {
+                            self.drive.cancel();
+                            self.drive_back_confirm = false;
+                            self.view = AppView::MainMenu;
+                        }
+                    });
+                });
+        }
+    }
 }
 
-impl eframe::App for HardwareAccelApp {
+impl eframe::App for BenchScopeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_worker_events();
-        if self.running {
+        self.drive.poll_worker_events();
+        if self.running || self.drive.running {
             ctx.request_repaint_after(Duration::from_millis(100));
+        }
+
+        match self.view {
+            AppView::MainMenu => {
+                self.ui_main_menu(ui);
+                return;
+            }
+            AppView::DriveBenchmark => {
+                self.ui_drive_benchmark(ui);
+                return;
+            }
+            AppView::MatrixBenchmark => {}
         }
 
         egui::Panel::top("top_panel").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("Hardware Acceleration Tester");
+                if ui.button("Back").clicked() {
+                    self.request_matrix_back_to_menu();
+                }
+                ui.separator();
+                ui.heading("BenchScope");
                 ui.separator();
                 ui.label(&self.status);
                 if !self.eta_text.is_empty() {
@@ -3764,7 +4461,711 @@ impl eframe::App for HardwareAccelApp {
                     });
                 });
         }
+
+        if self.matrix_back_confirm {
+            egui::Window::new("Return to main menu?")
+                .collapsible(false)
+                .resizable(false)
+                .show(&ctx, |ui| {
+                    ui.label("A matrix benchmark is currently running.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Stay").clicked() {
+                            self.matrix_back_confirm = false;
+                        }
+                        if ui.button("Cancel and return").clicked() {
+                            if self.repeat_running {
+                                self.cancel_repeat();
+                            } else {
+                                self.cancel_single();
+                            }
+                            self.matrix_back_confirm = false;
+                            self.view = AppView::MainMenu;
+                        }
+                    });
+                });
+        }
     }
+}
+
+fn auto_drive_file_size(profile: DriveProfile) -> u64 {
+    match profile {
+        DriveProfile::Quick => 256 * 1024 * 1024,
+        DriveProfile::Balanced => 512 * 1024 * 1024,
+        DriveProfile::Thorough => 1024 * 1024 * 1024,
+    }
+}
+
+fn open_drive_file_direct_preferred(
+    path: &PathBuf,
+    read: bool,
+    write: bool,
+    create: bool,
+    truncate: bool,
+    sequential: bool,
+) -> Result<DriveOpenFile> {
+    #[cfg(windows)]
+    {
+        let mut direct_options = OpenOptions::new();
+        direct_options
+            .read(read)
+            .write(write)
+            .create(create)
+            .truncate(truncate);
+        let access_hint = if sequential {
+            FILE_FLAG_SEQUENTIAL_SCAN_RAW
+        } else {
+            FILE_FLAG_RANDOM_ACCESS_RAW
+        };
+        let write_hint = if write {
+            FILE_FLAG_WRITE_THROUGH_RAW
+        } else {
+            0
+        };
+        direct_options.custom_flags(FILE_FLAG_NO_BUFFERING_RAW | write_hint | access_hint);
+        match direct_options.open(path) {
+            Ok(file) => {
+                return Ok(DriveOpenFile {
+                    file,
+                    io_mode: DriveIoMode::Direct,
+                    fallback_note: None,
+                });
+            }
+            Err(err) => {
+                let file = OpenOptions::new()
+                    .read(read)
+                    .write(write)
+                    .create(create)
+                    .truncate(truncate)
+                    .open(path)
+                    .with_context(|| {
+                        format!(
+                            "failed to open benchmark file {} after direct I/O failed",
+                            path.display()
+                        )
+                    })?;
+                return Ok(DriveOpenFile {
+                    file,
+                    io_mode: DriveIoMode::Cached,
+                    fallback_note: Some(format!("Direct I/O unavailable: {err}")),
+                });
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let file = OpenOptions::new()
+            .read(read)
+            .write(write)
+            .create(create)
+            .truncate(truncate)
+            .open(path)
+            .with_context(|| format!("failed to open benchmark file {}", path.display()))?;
+        Ok(DriveOpenFile {
+            file,
+            io_mode: DriveIoMode::Cached,
+            fallback_note: Some("Direct I/O is only implemented on Windows".to_owned()),
+        })
+    }
+}
+
+fn run_drive_benchmark(
+    config: DriveBenchmarkConfig,
+    cancel: Arc<AtomicBool>,
+    tx: Sender<DriveWorkerEvent>,
+) -> Result<Vec<DriveBenchmarkResult>> {
+    let test_path = config.target_folder.join(DRIVE_BENCHMARK_FILE_NAME);
+    let _ = tx.send(DriveWorkerEvent::Log(format!(
+        "Using direct file I/O when available, with cached fallback."
+    )));
+    let _ = tx.send(DriveWorkerEvent::Log(format!(
+        "Temporary benchmark file: {}",
+        test_path.display()
+    )));
+
+    if config.selected_tests.iter().any(|test| test.is_read()) {
+        prepare_drive_benchmark_file(&test_path, config.file_size_bytes, &cancel, &tx)?;
+    }
+
+    let suite_started = Instant::now();
+    let mut results = Vec::new();
+    let total_tests = config.selected_tests.len().max(1);
+    for (index, test) in config.selected_tests.iter().copied().enumerate() {
+        check_canceled_with(Some(&cancel), "Drive benchmark canceled")?;
+        let result = run_drive_test(
+            &test_path,
+            config.file_size_bytes,
+            config.profile,
+            test,
+            index,
+            total_tests,
+            suite_started,
+            &cancel,
+            &tx,
+        )?;
+        let _ = tx.send(DriveWorkerEvent::Log(format!(
+            "{} complete: read {}, write {}, IOPS {}, duration {} ms",
+            result.test,
+            format_optional_rate(result.read_mbps),
+            format_optional_rate(result.write_mbps),
+            format_optional_iops(result.iops),
+            format_ms(Some(result.duration_ms))
+        )));
+        results.push(result);
+    }
+
+    if let Err(err) = fs::remove_file(&test_path) {
+        let _ = tx.send(DriveWorkerEvent::Log(format!(
+            "Could not delete temporary benchmark file {}: {err}",
+            test_path.display()
+        )));
+    }
+
+    Ok(results)
+}
+
+fn prepare_drive_benchmark_file(
+    path: &PathBuf,
+    file_size_bytes: u64,
+    cancel: &AtomicBool,
+    tx: &Sender<DriveWorkerEvent>,
+) -> Result<()> {
+    check_canceled_with(
+        Some(cancel),
+        "Drive benchmark canceled during file preparation",
+    )?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .with_context(|| format!("failed to create benchmark file {}", path.display()))?;
+    file.set_len(file_size_bytes)
+        .with_context(|| format!("failed to size benchmark file {}", path.display()))?;
+
+    let mut buffer = vec![0_u8; DRIVE_SEQUENTIAL_BLOCK_BYTES];
+    let mut written = 0_u64;
+    let started = Instant::now();
+    let mut last_emit = Instant::now() - Duration::from_secs(1);
+    let mut block_seed = 0xA5A5_5A5A_D15C_BEAD_u64;
+
+    while written < file_size_bytes {
+        check_canceled_with(
+            Some(cancel),
+            "Drive benchmark canceled during file preparation",
+        )?;
+        fill_drive_buffer(&mut buffer, block_seed);
+        block_seed = splitmix64(&mut block_seed);
+        let remaining = (file_size_bytes - written) as usize;
+        let len = remaining.min(buffer.len());
+        file.write_all(&buffer[..len])
+            .context("failed to initialize benchmark file")?;
+        written += len as u64;
+
+        let now = Instant::now();
+        if now.duration_since(last_emit) >= Duration::from_millis(PROGRESS_SAMPLE_MS) {
+            last_emit = now;
+            let progress = (written as f32 / file_size_bytes.max(1) as f32).clamp(0.0, 1.0);
+            let elapsed_s = started.elapsed().as_secs_f64();
+            let eta_s = if progress > 0.001 && progress < 1.0 {
+                let total = elapsed_s / progress as f64;
+                Some((total - elapsed_s).max(0.0))
+            } else {
+                None
+            };
+            let _ = tx.send(DriveWorkerEvent::Progress(DriveProgress {
+                current_test: "Preparing read file".to_owned(),
+                current_progress: progress,
+                suite_progress: 0.0,
+                elapsed_s,
+                eta_s,
+                bytes_processed: written,
+                operations: 0,
+            }));
+        }
+    }
+
+    file.sync_all()
+        .context("failed to flush prepared benchmark file")?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_drive_test(
+    path: &PathBuf,
+    file_size_bytes: u64,
+    profile: DriveProfile,
+    test: DriveTestKind,
+    test_index: usize,
+    total_tests: usize,
+    suite_started: Instant,
+    cancel: &AtomicBool,
+    tx: &Sender<DriveWorkerEvent>,
+) -> Result<DriveBenchmarkResult> {
+    match test {
+        DriveTestKind::SequentialRead => run_sequential_drive_read(
+            path,
+            file_size_bytes,
+            profile,
+            test,
+            test_index,
+            total_tests,
+            suite_started,
+            cancel,
+            tx,
+        ),
+        DriveTestKind::SequentialWrite => run_sequential_drive_write(
+            path,
+            file_size_bytes,
+            profile,
+            test,
+            test_index,
+            total_tests,
+            suite_started,
+            cancel,
+            tx,
+        ),
+        DriveTestKind::RandomRead4K => run_random_drive_test(
+            path,
+            file_size_bytes,
+            profile,
+            test,
+            test_index,
+            total_tests,
+            suite_started,
+            cancel,
+            tx,
+            false,
+        ),
+        DriveTestKind::RandomWrite4K => run_random_drive_test(
+            path,
+            file_size_bytes,
+            profile,
+            test,
+            test_index,
+            total_tests,
+            suite_started,
+            cancel,
+            tx,
+            true,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_sequential_drive_write(
+    path: &PathBuf,
+    file_size_bytes: u64,
+    profile: DriveProfile,
+    test: DriveTestKind,
+    test_index: usize,
+    total_tests: usize,
+    suite_started: Instant,
+    cancel: &AtomicBool,
+    tx: &Sender<DriveWorkerEvent>,
+) -> Result<DriveBenchmarkResult> {
+    let opened = open_drive_file_direct_preferred(path, true, true, true, false, true)?;
+    let mut file = opened.file;
+    let mut notes = Vec::new();
+    if let Some(note) = opened.fallback_note {
+        notes.push(note);
+    }
+    file.set_len(file_size_bytes)
+        .context("failed to size benchmark file for sequential write")?;
+    file.seek(SeekFrom::Start(0))
+        .context("failed to seek benchmark file")?;
+
+    let target_duration = profile.target_duration();
+    let mut buffer = AlignedBuffer::new(DRIVE_SEQUENTIAL_BLOCK_BYTES, DRIVE_RANDOM_BLOCK_BYTES);
+    let mut offset = 0_u64;
+    let mut bytes_processed = 0_u64;
+    let mut operations = 0_u64;
+    let mut seed = 0x5151_5151_BEEF_CAFE_u64;
+    let started = Instant::now();
+    let mut last_emit = Instant::now() - Duration::from_secs(1);
+
+    while should_continue_drive_test(started, target_duration) {
+        check_canceled_with(Some(cancel), "Drive benchmark canceled")?;
+        if offset >= file_size_bytes {
+            offset = 0;
+            file.seek(SeekFrom::Start(0))
+                .context("failed to rewind benchmark file")?;
+        }
+        fill_drive_buffer(buffer.as_mut_slice(), seed);
+        seed = splitmix64(&mut seed);
+        let len = ((file_size_bytes - offset) as usize).min(buffer.len());
+        let op_started = Instant::now();
+        file.write_all(&buffer.as_slice()[..len])
+            .context("sequential write failed")?;
+        let _op_elapsed = op_started.elapsed();
+        offset += len as u64;
+        bytes_processed += len as u64;
+        operations += 1;
+        emit_drive_progress(
+            tx,
+            test,
+            test_index,
+            total_tests,
+            started,
+            suite_started,
+            target_duration,
+            bytes_processed,
+            operations,
+            &mut last_emit,
+            false,
+        );
+    }
+
+    check_canceled_with(Some(cancel), "Drive benchmark canceled before flush")?;
+    file.sync_all().context("sequential write flush failed")?;
+    emit_drive_progress(
+        tx,
+        test,
+        test_index,
+        total_tests,
+        started,
+        suite_started,
+        target_duration,
+        bytes_processed,
+        operations,
+        &mut last_emit,
+        true,
+    );
+
+    notes.push("Flush included".to_owned());
+    Ok(make_drive_result(
+        test,
+        bytes_processed,
+        operations,
+        started.elapsed(),
+        file_size_bytes,
+        opened.io_mode,
+        Vec::new(),
+        notes,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_sequential_drive_read(
+    path: &PathBuf,
+    file_size_bytes: u64,
+    profile: DriveProfile,
+    test: DriveTestKind,
+    test_index: usize,
+    total_tests: usize,
+    suite_started: Instant,
+    cancel: &AtomicBool,
+    tx: &Sender<DriveWorkerEvent>,
+) -> Result<DriveBenchmarkResult> {
+    let opened = open_drive_file_direct_preferred(path, true, false, false, false, true)?;
+    let mut file = opened.file;
+    let mut notes = Vec::new();
+    if let Some(note) = opened.fallback_note {
+        notes.push(note);
+    }
+    let target_duration = profile.target_duration();
+    let mut buffer = AlignedBuffer::new(DRIVE_SEQUENTIAL_BLOCK_BYTES, DRIVE_RANDOM_BLOCK_BYTES);
+    let mut offset = 0_u64;
+    let mut bytes_processed = 0_u64;
+    let mut operations = 0_u64;
+    let mut checksum = 0_u64;
+    let started = Instant::now();
+    let mut last_emit = Instant::now() - Duration::from_secs(1);
+
+    while should_continue_drive_test(started, target_duration) {
+        check_canceled_with(Some(cancel), "Drive benchmark canceled")?;
+        if offset >= file_size_bytes {
+            offset = 0;
+            file.seek(SeekFrom::Start(0))
+                .context("failed to rewind benchmark file")?;
+        }
+        let len = ((file_size_bytes - offset) as usize).min(buffer.len());
+        file.read_exact(&mut buffer.as_mut_slice()[..len])
+            .context("sequential read failed")?;
+        checksum = checksum
+            .wrapping_add(buffer.as_slice()[0] as u64)
+            .wrapping_add(buffer.as_slice()[len - 1] as u64);
+        offset += len as u64;
+        bytes_processed += len as u64;
+        operations += 1;
+        emit_drive_progress(
+            tx,
+            test,
+            test_index,
+            total_tests,
+            started,
+            suite_started,
+            target_duration,
+            bytes_processed,
+            operations,
+            &mut last_emit,
+            false,
+        );
+    }
+
+    emit_drive_progress(
+        tx,
+        test,
+        test_index,
+        total_tests,
+        started,
+        suite_started,
+        target_duration,
+        bytes_processed,
+        operations,
+        &mut last_emit,
+        true,
+    );
+
+    notes.push(format!("Checksum {checksum:016X}"));
+    Ok(make_drive_result(
+        test,
+        bytes_processed,
+        operations,
+        started.elapsed(),
+        file_size_bytes,
+        opened.io_mode,
+        Vec::new(),
+        notes,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_random_drive_test(
+    path: &PathBuf,
+    file_size_bytes: u64,
+    profile: DriveProfile,
+    test: DriveTestKind,
+    test_index: usize,
+    total_tests: usize,
+    suite_started: Instant,
+    cancel: &AtomicBool,
+    tx: &Sender<DriveWorkerEvent>,
+    write_mode: bool,
+) -> Result<DriveBenchmarkResult> {
+    let opened =
+        open_drive_file_direct_preferred(path, true, write_mode, write_mode, false, false)?;
+    let mut file = opened.file;
+    let mut notes = Vec::new();
+    if let Some(note) = opened.fallback_note {
+        notes.push(note);
+    }
+    if write_mode {
+        file.set_len(file_size_bytes)
+            .context("failed to size benchmark file for random write")?;
+    }
+
+    let target_duration = profile.target_duration();
+    let block_count = (file_size_bytes / DRIVE_RANDOM_BLOCK_BYTES as u64).max(1);
+    let mut buffer = AlignedBuffer::new(DRIVE_RANDOM_BLOCK_BYTES, DRIVE_RANDOM_BLOCK_BYTES);
+    fill_drive_buffer(buffer.as_mut_slice(), 0x4449_534B_524E_4434_u64);
+    let mut rng = 0xC001_D00D_F00D_BAAD_u64;
+    let mut bytes_processed = 0_u64;
+    let mut operations = 0_u64;
+    let mut latency_samples_ms = Vec::new();
+    let mut latency_total_ms = 0.0_f64;
+    let mut checksum = 0_u64;
+    let started = Instant::now();
+    let mut last_emit = Instant::now() - Duration::from_secs(1);
+
+    while should_continue_drive_test(started, target_duration) {
+        check_canceled_with(Some(cancel), "Drive benchmark canceled")?;
+        let block_index = splitmix64(&mut rng) % block_count;
+        let offset = block_index * DRIVE_RANDOM_BLOCK_BYTES as u64;
+        file.seek(SeekFrom::Start(offset))
+            .context("random seek failed")?;
+        if write_mode {
+            buffer.as_mut_slice()[..8].copy_from_slice(&operations.to_le_bytes());
+        }
+
+        let op_started = Instant::now();
+        if write_mode {
+            file.write_all(buffer.as_slice())
+                .context("random write failed")?;
+        } else {
+            file.read_exact(buffer.as_mut_slice())
+                .context("random read failed")?;
+            checksum = checksum
+                .wrapping_add(buffer.as_slice()[0] as u64)
+                .wrapping_add(buffer.as_slice()[DRIVE_RANDOM_BLOCK_BYTES - 1] as u64);
+        }
+        let op_ms = op_started.elapsed().as_secs_f64() * 1000.0;
+        latency_total_ms += op_ms;
+        record_latency_sample(&mut latency_samples_ms, operations, op_ms);
+        bytes_processed += DRIVE_RANDOM_BLOCK_BYTES as u64;
+        operations += 1;
+
+        emit_drive_progress(
+            tx,
+            test,
+            test_index,
+            total_tests,
+            started,
+            suite_started,
+            target_duration,
+            bytes_processed,
+            operations,
+            &mut last_emit,
+            false,
+        );
+    }
+
+    if write_mode {
+        check_canceled_with(Some(cancel), "Drive benchmark canceled before flush")?;
+        file.sync_all().context("random write flush failed")?;
+    }
+
+    emit_drive_progress(
+        tx,
+        test,
+        test_index,
+        total_tests,
+        started,
+        suite_started,
+        target_duration,
+        bytes_processed,
+        operations,
+        &mut last_emit,
+        true,
+    );
+
+    if write_mode {
+        notes.push("Flush included".to_owned());
+    } else {
+        notes.push(format!("Checksum {checksum:016X}"));
+    }
+
+    let mut result = make_drive_result(
+        test,
+        bytes_processed,
+        operations,
+        started.elapsed(),
+        file_size_bytes,
+        opened.io_mode,
+        latency_samples_ms,
+        notes,
+    );
+    result.avg_latency_ms = (operations > 0).then_some(latency_total_ms / operations as f64);
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_drive_progress(
+    tx: &Sender<DriveWorkerEvent>,
+    test: DriveTestKind,
+    test_index: usize,
+    total_tests: usize,
+    test_started: Instant,
+    suite_started: Instant,
+    target_duration: Duration,
+    bytes_processed: u64,
+    operations: u64,
+    last_emit: &mut Instant,
+    force: bool,
+) {
+    let now = Instant::now();
+    if !force && now.duration_since(*last_emit) < Duration::from_millis(PROGRESS_SAMPLE_MS) {
+        return;
+    }
+    *last_emit = now;
+    let elapsed_s = test_started.elapsed().as_secs_f64();
+    let target_s = target_duration.as_secs_f64().max(0.001);
+    let current_progress = (elapsed_s / target_s).clamp(0.0, 1.0) as f32;
+    let suite_progress =
+        ((test_index as f32 + current_progress) / total_tests.max(1) as f32).clamp(0.0, 1.0);
+    let suite_elapsed_s = suite_started.elapsed().as_secs_f64();
+    let eta_s = if suite_progress > 0.001 && suite_progress < 1.0 {
+        let total = suite_elapsed_s / suite_progress as f64;
+        Some((total - suite_elapsed_s).max(0.0))
+    } else {
+        None
+    };
+
+    let _ = tx.send(DriveWorkerEvent::Progress(DriveProgress {
+        current_test: test.label().to_owned(),
+        current_progress,
+        suite_progress,
+        elapsed_s: suite_elapsed_s,
+        eta_s,
+        bytes_processed,
+        operations,
+    }));
+}
+
+fn should_continue_drive_test(started: Instant, target_duration: Duration) -> bool {
+    let elapsed = started.elapsed();
+    elapsed < target_duration && elapsed.as_secs_f64() < DRIVE_MAX_TEST_SECONDS
+}
+
+fn make_drive_result(
+    test: DriveTestKind,
+    bytes_processed: u64,
+    operations: u64,
+    elapsed: Duration,
+    file_size_bytes: u64,
+    io_mode: DriveIoMode,
+    latency_samples_ms: Vec<f64>,
+    mut notes: Vec<String>,
+) -> DriveBenchmarkResult {
+    let elapsed_s = elapsed.as_secs_f64().max(0.001);
+    let mbps = bytes_processed as f64 / DECIMAL_MB / elapsed_s;
+    if elapsed.as_secs_f64() >= DRIVE_MAX_TEST_SECONDS {
+        notes.push("Capped at 30s".to_owned());
+    }
+    let p95_latency_ms = percentile_latency_ms(latency_samples_ms, 0.95);
+    let iops = matches!(
+        test,
+        DriveTestKind::RandomRead4K | DriveTestKind::RandomWrite4K
+    )
+    .then_some(operations as f64 / elapsed_s);
+
+    DriveBenchmarkResult {
+        test,
+        read_mbps: test.is_read().then_some(mbps),
+        write_mbps: test.is_write().then_some(mbps),
+        iops,
+        avg_latency_ms: None,
+        p95_latency_ms,
+        duration_ms: elapsed.as_secs_f64() * 1000.0,
+        file_size_bytes,
+        io_mode,
+        notes,
+    }
+}
+
+fn record_latency_sample(samples: &mut Vec<f64>, operation: u64, latency_ms: f64) {
+    if samples.len() < DRIVE_LATENCY_SAMPLE_LIMIT || operation % 64 == 0 {
+        if samples.len() < DRIVE_LATENCY_SAMPLE_LIMIT {
+            samples.push(latency_ms);
+        }
+    }
+}
+
+fn percentile_latency_ms(mut samples: Vec<f64>, percentile: f64) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_by(|a, b| a.total_cmp(b));
+    let index = ((samples.len() - 1) as f64 * percentile.clamp(0.0, 1.0)).round() as usize;
+    samples.get(index).copied()
+}
+
+fn fill_drive_buffer(buffer: &mut [u8], mut seed: u64) {
+    for chunk in buffer.chunks_mut(8) {
+        let value = splitmix64(&mut seed).to_le_bytes();
+        let len = chunk.len();
+        chunk.copy_from_slice(&value[..len]);
+    }
+}
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 fn matrix_buffers_bytes(size: usize, matrix_count: u64) -> Option<u64> {
@@ -3896,6 +5297,42 @@ fn format_speedup(value: f64) -> String {
     }
 }
 
+fn format_optional_rate(value: Option<f64>) -> String {
+    match value {
+        Some(value) if value >= 1000.0 => format!("{value:.0}"),
+        Some(value) if value >= 100.0 => format!("{value:.1}"),
+        Some(value) => format!("{value:.2}"),
+        None => "N/A".to_owned(),
+    }
+}
+
+fn format_drive_speed(result: &DriveBenchmarkResult) -> String {
+    if result.test.is_read() {
+        format_optional_rate(result.read_mbps)
+    } else {
+        format_optional_rate(result.write_mbps)
+    }
+}
+
+fn format_optional_iops(value: Option<f64>) -> String {
+    match value {
+        Some(value) if value >= 1_000_000.0 => format!("{:.2}M", value / 1_000_000.0),
+        Some(value) if value >= 10_000.0 => format!("{:.0}K", value / 1_000.0),
+        Some(value) if value >= 1000.0 => format!("{:.1}K", value / 1_000.0),
+        Some(value) => format!("{value:.0}"),
+        None => "N/A".to_owned(),
+    }
+}
+
+fn format_optional_latency(value: Option<f64>) -> String {
+    match value {
+        Some(value) if value < 1.0 => format!("{:.0} us", value * 1000.0),
+        Some(value) if value < 100.0 => format!("{value:.2} ms"),
+        Some(value) => format!("{value:.1} ms"),
+        None => "N/A".to_owned(),
+    }
+}
+
 fn device_type_label(value: wgpu::DeviceType) -> &'static str {
     match value {
         wgpu::DeviceType::IntegratedGpu => "Integrated GPU",
@@ -4017,9 +5454,9 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "Hardware Acceleration Tester",
+        "BenchScope",
         options,
-        Box::new(|cc| Ok(Box::new(HardwareAccelApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(BenchScopeApp::new(cc)))),
     )
 }
 
@@ -4341,5 +5778,74 @@ mod tests {
             adapter_memory_limit_bytes(&adapter),
             Some((8_724_152_320, "reported GPU/shared memory"))
         );
+    }
+
+    #[test]
+    fn drive_auto_file_size_tracks_profile() {
+        assert_eq!(auto_drive_file_size(DriveProfile::Quick), 256 * 1024 * 1024);
+        assert_eq!(
+            auto_drive_file_size(DriveProfile::Balanced),
+            512 * 1024 * 1024
+        );
+        assert_eq!(
+            auto_drive_file_size(DriveProfile::Thorough),
+            1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn drive_profiles_stay_under_hard_cap() {
+        for profile in DriveProfile::ALL {
+            assert!(profile.target_duration().as_secs_f64() < DRIVE_MAX_TEST_SECONDS);
+        }
+    }
+
+    #[test]
+    fn drive_latency_percentile_uses_sorted_samples() {
+        let samples = vec![5.0, 1.0, 3.0, 2.0, 4.0];
+
+        assert_eq!(percentile_latency_ms(samples, 0.95), Some(5.0));
+    }
+
+    #[test]
+    fn drive_result_calculates_random_iops_and_rate() {
+        let result = make_drive_result(
+            DriveTestKind::RandomRead4K,
+            4096 * 1000,
+            1000,
+            Duration::from_secs(2),
+            256 * 1024 * 1024,
+            DriveIoMode::Direct,
+            vec![0.1, 0.2, 0.3],
+            vec!["test note".to_owned()],
+        );
+
+        assert_eq!(result.read_mbps, Some(2.048));
+        assert_eq!(result.write_mbps, None);
+        assert_eq!(result.iops, Some(500.0));
+        assert_eq!(result.p95_latency_ms, Some(0.3));
+        assert_eq!(result.io_mode, DriveIoMode::Direct);
+        assert_eq!(format_drive_speed(&result), "2.05");
+    }
+
+    #[test]
+    fn drive_buffer_fill_is_deterministic_and_nonzero() {
+        let mut a = vec![0_u8; 64];
+        let mut b = vec![0_u8; 64];
+
+        fill_drive_buffer(&mut a, 42);
+        fill_drive_buffer(&mut b, 42);
+
+        assert_eq!(a, b);
+        assert!(a.iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn aligned_drive_buffer_meets_direct_io_alignment() {
+        let mut buffer = AlignedBuffer::new(DRIVE_RANDOM_BLOCK_BYTES, DRIVE_RANDOM_BLOCK_BYTES);
+        let ptr = buffer.as_mut_slice().as_ptr() as usize;
+
+        assert_eq!(ptr % DRIVE_RANDOM_BLOCK_BYTES, 0);
+        assert_eq!(buffer.len(), DRIVE_RANDOM_BLOCK_BYTES);
     }
 }

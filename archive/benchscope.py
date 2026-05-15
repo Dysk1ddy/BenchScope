@@ -18,7 +18,7 @@ except ImportError as exc:  # pragma: no cover - startup guard
     raise SystemExit("NumPy is required. Install it with: python -m pip install numpy") from exc
 
 
-APP_TITLE = "Hardware Acceleration Tester"
+APP_TITLE = "BenchScope"
 DEFAULT_SIZES = [128, 256, 512, 1024, 2048]
 REPEAT_SECONDS = 60.0
 TILE_SIZE = 16
@@ -1064,7 +1064,7 @@ def format_speedup(value: float) -> str:
     return f"{value:.2f}x"
 
 
-class HardwareAccelApp:
+class BenchScopeApp:
     def __init__(self) -> None:
         import tkinter as tk
         from tkinter import ttk
@@ -1483,7 +1483,7 @@ def main(argv: list[str]) -> int:
         return 0
     if args.self_test:
         return run_self_test(args.size, args.adapter)
-    app = HardwareAccelApp()
+    app = BenchScopeApp()
     app.run()
     return 0
 

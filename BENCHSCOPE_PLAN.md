@@ -1,4 +1,4 @@
-# Hardware Acceleration Tester Plan
+# BenchScope Plan
 
 ## Purpose
 
