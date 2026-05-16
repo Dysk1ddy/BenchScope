@@ -1,5 +1,6 @@
 use std::{
     any::Any,
+    collections::HashMap,
     fmt,
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
@@ -65,9 +66,10 @@ const LOG_TEXT_SIZE: f32 = 13.0;
 const SENSOR_POLL_MS: u64 = 1_000;
 const SENSOR_STALE_AFTER_MS: u64 = 5_000;
 const SENSOR_BOX_RESERVED_HEIGHT: f32 = 112.0;
-const PANEL_VERTICAL_CHROME_HEIGHT: f32 = 56.0;
+const PANEL_VERTICAL_CHROME_HEIGHT: f32 = 92.0;
 const MIN_LOG_HEIGHT: f32 = 64.0;
 const MIN_CONTENT_HEIGHT: f32 = 96.0;
+const CONTROLS_ACTION_HEIGHT: f32 = 104.0;
 const CREATE_NO_WINDOW_RAW: u32 = 0x0800_0000;
 #[cfg(windows)]
 const FILE_FLAG_WRITE_THROUGH_RAW: u32 = 0x8000_0000;
@@ -990,12 +992,24 @@ impl AlignedBuffer {
 struct DriveInfo {
     root: PathBuf,
     label: String,
+    device_name: Option<String>,
 }
 
 impl DriveInfo {
-    fn new(root: PathBuf) -> Self {
-        let label = format!("{} drive", root.display());
-        Self { root, label }
+    fn with_device_name(root: PathBuf, device_name: Option<String>) -> Self {
+        let clean_name = device_name.and_then(|name| {
+            let name = name.trim();
+            (!name.is_empty()).then(|| name.to_owned())
+        });
+        let label = clean_name
+            .as_ref()
+            .map(|name| format!("{} - {}", root.display(), name))
+            .unwrap_or_else(|| format!("{} drive", root.display()));
+        Self {
+            root,
+            label,
+            device_name: clean_name,
+        }
     }
 }
 
@@ -1128,6 +1142,12 @@ impl DriveBenchmarkState {
             .get(self.selected_drive)
             .map(|drive| drive.label.clone())
             .unwrap_or_else(|| "No drives detected".to_owned())
+    }
+
+    fn selected_drive_device_name(&self) -> Option<&str> {
+        self.drives
+            .get(self.selected_drive)
+            .and_then(|drive| drive.device_name.as_deref())
     }
 
     fn select_drive(&mut self, index: usize) {
@@ -4497,28 +4517,41 @@ impl BenchScopeApp {
             .resizable(false)
             .min_size(350.0)
             .show_inside(ui, |ui| {
-                ui.heading("Controls");
-                ui.add_space(8.0);
+                let settings_height = (ui.available_height() - CONTROLS_ACTION_HEIGHT).max(120.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), settings_height),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("drive_controls_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.heading("Controls");
+                                ui.add_space(8.0);
 
-                self.drive.sync_selected_drive_to_target();
-                ui.label("Target drive");
-                ui.add_enabled_ui(!self.drive.running, |ui| {
-                    let mut selected_drive = self.drive.selected_drive;
-                    egui::ComboBox::from_id_salt("drive_picker_combo")
-                        .selected_text(self.drive.selected_drive_label())
-                        .show_ui(ui, |ui| {
-                            for (index, drive) in self.drive.drives.iter().enumerate() {
-                                ui.selectable_value(&mut selected_drive, index, &drive.label);
-                            }
-                        });
-                    if selected_drive != self.drive.selected_drive {
-                        self.drive.select_drive(selected_drive);
-                    }
-                    if ui.button("Refresh drives").clicked() {
-                        self.drive.refresh_drives();
-                    }
-                });
-                ui.small("Selecting a drive sets the target folder to that drive root.");
+                                self.drive.sync_selected_drive_to_target();
+                                ui.label("Target drive");
+                                ui.add_enabled_ui(!self.drive.running, |ui| {
+                                    let mut selected_drive = self.drive.selected_drive;
+                                    egui::ComboBox::from_id_salt("drive_picker_combo")
+                                        .selected_text(self.drive.selected_drive_label())
+                                        .width(320.0)
+                                        .show_ui(ui, |ui| {
+                                            for (index, drive) in self.drive.drives.iter().enumerate() {
+                                                ui.selectable_value(&mut selected_drive, index, &drive.label);
+                                            }
+                                        });
+                                    if selected_drive != self.drive.selected_drive {
+                                        self.drive.select_drive(selected_drive);
+                                    }
+                                    if ui.button("Refresh drives").clicked() {
+                                        self.drive.refresh_drives();
+                                    }
+                                });
+                                if let Some(name) = self.drive.selected_drive_device_name() {
+                                    ui.small(format!("Device: {name}"));
+                                }
+                                ui.small("Selecting a drive sets the target folder to that drive root.");
 
                 ui.label("Target folder");
                 ui.add_enabled_ui(!self.drive.running, |ui| {
@@ -4587,6 +4620,9 @@ impl BenchScopeApp {
                     );
                 }
 
+                            });
+                    },
+                );
                 ui.separator();
                 ui.add_enabled_ui(!self.drive.running, |ui| {
                     if ui.button("Run drive benchmark").clicked() {
@@ -4732,8 +4768,17 @@ impl BenchScopeApp {
             .resizable(false)
             .min_size(330.0)
             .show_inside(ui, |ui| {
-                ui.heading("Stress Controls");
-                ui.add_space(8.0);
+                let settings_height = (ui.available_height() - CONTROLS_ACTION_HEIGHT).max(120.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), settings_height),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("stress_controls_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.heading("Stress Controls");
+                                ui.add_space(8.0);
 
                 ui.small(format!("CPU: {}", self.cpu_info.label()));
                 ui.add_space(4.0);
@@ -4862,6 +4907,10 @@ impl BenchScopeApp {
                         );
                     });
                 });
+                            });
+                    },
+                );
+                ui.separator();
 
                 ui.add_enabled_ui(!self.running && !self.adapters.is_empty(), |ui| {
                     if ui.button("Start stress test").clicked() {
@@ -5046,8 +5095,17 @@ impl eframe::App for BenchScopeApp {
             .resizable(false)
             .min_size(330.0)
             .show_inside(ui, |ui| {
-                ui.heading("Controls");
-                ui.add_space(8.0);
+                let settings_height = (ui.available_height() - CONTROLS_ACTION_HEIGHT).max(120.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), settings_height),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("matrix_controls_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.heading("Controls");
+                                ui.add_space(8.0);
 
                 ui.small(format!("CPU: {}", self.cpu_info.label()));
                 ui.add_space(4.0);
@@ -5176,6 +5234,10 @@ impl eframe::App for BenchScopeApp {
                         );
                     }
                 }
+                            });
+                    },
+                );
+                ui.separator();
 
                 ui.add_enabled_ui(!self.running && !self.adapters.is_empty(), |ui| {
                     if ui.button("Run benchmark").clicked() {
@@ -5344,11 +5406,16 @@ fn auto_drive_file_size(profile: DriveProfile) -> u64 {
 fn detect_drives() -> Vec<DriveInfo> {
     #[cfg(windows)]
     {
+        let device_names = windows_drive_device_names();
         let mut drives = Vec::new();
         for letter in b'A'..=b'Z' {
-            let root = PathBuf::from(format!("{}:\\", letter as char));
+            let letter = letter as char;
+            let root = PathBuf::from(format!("{letter}:\\"));
             if root.is_dir() {
-                drives.push(DriveInfo::new(root));
+                drives.push(DriveInfo::with_device_name(
+                    root,
+                    device_names.get(&letter).cloned(),
+                ));
             }
         }
         drives
@@ -5356,8 +5423,57 @@ fn detect_drives() -> Vec<DriveInfo> {
 
     #[cfg(not(windows))]
     {
-        vec![DriveInfo::new(PathBuf::from("/"))]
+        vec![DriveInfo::with_device_name(PathBuf::from("/"), None)]
     }
+}
+
+#[cfg(windows)]
+fn windows_drive_device_names() -> HashMap<char, String> {
+    let script = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+Get-Volume |
+    Where-Object { $_.DriveLetter } |
+    Sort-Object DriveLetter |
+    ForEach-Object {
+        $letter = $_.DriveLetter
+        $partition = Get-Partition -DriveLetter $letter -ErrorAction SilentlyContinue | Select-Object -First 1
+        $disk = $null
+        if ($partition) {
+            $disk = $partition | Get-Disk -ErrorAction SilentlyContinue
+        }
+        $name = ''
+        if ($disk) {
+            $name = $disk.FriendlyName
+            if (-not $name) {
+                $name = $disk.Model
+            }
+        }
+        if (-not $name) {
+            $name = $_.FileSystemLabel
+        }
+        "$letter`t$name"
+    }
+"#;
+    run_powershell_sensor_script(script)
+        .ok()
+        .map(|output| parse_drive_device_names(&output))
+        .unwrap_or_default()
+}
+
+#[cfg(windows)]
+fn parse_drive_device_names(output: &str) -> HashMap<char, String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (letter, name) = line.split_once('\t')?;
+            let letter = letter.trim().chars().next()?.to_ascii_uppercase();
+            if !letter.is_ascii_alphabetic() {
+                return None;
+            }
+            let name = name.trim();
+            (!name.is_empty()).then(|| (letter, name.to_owned()))
+        })
+        .collect()
 }
 
 fn selected_drive_for_path(drives: &[DriveInfo], path: &PathBuf) -> Option<usize> {
@@ -7893,5 +8009,18 @@ mod tests {
                     <= available + 0.1
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_device_name_parser_reads_tab_separated_names() {
+        let names =
+            parse_drive_device_names("C\tSamsung SSD 990 PRO 2TB\r\nD\tWD_BLACK SN850X\r\n");
+
+        assert_eq!(
+            names.get(&'C').map(String::as_str),
+            Some("Samsung SSD 990 PRO 2TB")
+        );
+        assert_eq!(names.get(&'D').map(String::as_str), Some("WD_BLACK SN850X"));
     }
 }
