@@ -6,6 +6,7 @@ public sealed record SensorSnapshot(
     SensorReading? Cpu,
     SensorReading? Gpu,
     SensorReading? Drive,
+    SensorReading? Memory,
     string[] Diagnostics)
 {
     public static SensorSnapshot Error(bool isElevated, string message)
@@ -17,6 +18,7 @@ public sealed record SensorSnapshot(
             SensorReading.Error("CPU", message),
             SensorReading.Error("GPU", message),
             SensorReading.Error("SSD", message),
+            SensorReading.Error("RAM", message),
             diagnostics);
     }
 }

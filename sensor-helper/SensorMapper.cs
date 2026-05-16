@@ -29,6 +29,7 @@ public static class SensorMapper
             PickCpuSensor(temperatureSensors, loadSensors),
             PickGpuSensor(temperatureSensors, loadSensors),
             PickDriveSensor(temperatureSensors, loadSensors),
+            PickMemorySensor(temperatureSensors, loadSensors),
             diagnostics.ToArray());
     }
 
@@ -173,6 +174,40 @@ public static class SensorMapper
                 "temperature",
                 "composite",
                 "drive"
+            ])
+            .WithUtilization(utilization);
+    }
+
+    private static SensorReading PickMemorySensor(
+        IReadOnlyCollection<HardwareSensor> temperatureSensors,
+        IReadOnlyCollection<HardwareSensor> loadSensors)
+    {
+        var memorySensors = temperatureSensors
+            .Where(item => item.Hardware.HardwareType == HardwareType.Memory)
+            .ToList();
+        var utilization = PickUtilization(
+            loadSensors,
+            item => item.Hardware.HardwareType == HardwareType.Memory,
+            [
+                "memory",
+                "used",
+                "load"
+            ]);
+
+        if (memorySensors.Count == 0)
+        {
+            return SensorReading
+                .Unsupported("RAM", "No RAM temperature sensor found")
+                .WithUtilization(utilization);
+        }
+
+        return PickPreferred(
+            memorySensors,
+            "RAM",
+            [
+                "temperature",
+                "dimm",
+                "memory"
             ])
             .WithUtilization(utilization);
     }

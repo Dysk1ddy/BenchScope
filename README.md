@@ -1,6 +1,6 @@
 # BenchScope
 
-Native desktop tool for comparing CPU matrix multiplication against GPU compute, with a drive read/write benchmark tool built into the same app.
+Native desktop tool for comparing CPU matrix multiplication against GPU compute, with storage, memory, battery, and network diagnostic tools built into the same app.
 
 The primary implementation is now Rust + `wgpu` + `egui`. The earlier Python Direct3D prototype remains archived in `archive/benchscope.py` as a fallback/reference implementation.
 
@@ -42,6 +42,13 @@ Run a small CPU/GPU smoke test:
 .\target\release\benchscope.exe --self-test --size 64
 ```
 
+Run a Memtest-style user-mode RAM test:
+
+```powershell
+.\target\release\benchscope.exe --ram-test --ram-size auto
+.\target\release\benchscope.exe --ram-test --ram-size 1g
+```
+
 Select a specific adapter:
 
 ```powershell
@@ -64,7 +71,10 @@ Choose the GPU submission intensity used by self-test:
 
 ## Current Features
 
-- Main menu with separate tool views for the matrix benchmark, matrix stress test, and drive benchmark.
+- Main menu with separate tool views for the matrix benchmark, matrix stress test, drive benchmark, storage health checker, RAM tester, battery health diagnostic, and network hardware diagnostic.
+- SSD / HDD Health Checker tool with SMART/NVMe health snapshots, temperature, life estimates, bad-sector warning counters, read-only sampled scans, quick benchmark hook, and Markdown report export.
+- RAM tester tool with Memtest-style moving inversions, walking-bit samples, address-sensitive patterns, pseudo-random verification, modulo-stride checks, and block-move stress.
+- RAM tester runtime is capped to 2 minutes per installed 8 GiB of system memory and reports tested bytes separately from installed RAM.
 - Each tool view has a Back control that returns to the main menu; active tests ask for cancellation before leaving.
 - CPU-only matrix multiplication timing by default, with an opt-in sampled estimate mode.
 - CPU exact timing uses parallel worker threads for larger matrices while leaving one logical processor free for system responsiveness.
@@ -91,12 +101,18 @@ Choose the GPU submission intensity used by self-test:
 - Drive tests report MB/s, IOPS for random tests, average latency, p95 latency, duration, file size, I/O mode, and notes.
 - Bottom-right sensor panel shows CPU/GPU temperature and utilization for matrix benchmark and stress views, plus SSD temperature and utilization for the selected drive benchmark target when the operating system/provider exposes readings.
 - Fullscreen can be toggled with the on-screen button or `F11`.
-- Bundled LibreHardwareMonitor-based sensor helper is auto-launched when present, with command-based Windows/NVIDIA probes kept as fallbacks.
+- Windows/NVIDIA sensor probes are used by default; BenchScope does not launch the LibreHardwareMonitor helper from the UI because its low-level WinRing driver can be blocked by Microsoft Defender.
 - Benchmark logs and result tables include start/end/max temperature summaries when readings are available.
 - Drive tests prefer Windows direct/no-buffering I/O and fall back to cached file I/O when direct mode is unavailable.
 - Drive benchmark profiles keep measured subtests below a 30 second hard cap, with shorter Quick/Balanced/Thorough targets.
 - Drive benchmark runs on a background worker, reports current-test and whole-suite progress, and can be canceled mid-run.
 - Drive benchmark uses a temporary file in the selected target folder and attempts cleanup after completion or failure.
+- Network hardware diagnostic tool for Wi-Fi and Ethernet adapter troubleshooting.
+- Network tool lists adapters, labels physical versus virtual interfaces, and shows connection state, link speed, IP, gateway, DNS, Wi-Fi signal, and driver details.
+- Network quick diagnosis runs gateway, DNS-server, public-IP, hostname, and DNS lookup checks with packet loss, latency, and jitter reporting.
+- Network continuous monitor samples adapter state, Wi-Fi signal/link speed, and gateway latency over time for intermittent issues.
+- Network findings call out likely weak Wi-Fi, low Ethernet negotiation/bad cable symptoms, DNS failures, gateway problems, packet loss, high jitter, and driver/device warnings.
+- Network reports export to Markdown for troubleshooting notes.
 
 ## Build and Test
 
@@ -104,7 +120,6 @@ Choose the GPU submission intensity used by self-test:
 $env:CARGO_NET_OFFLINE='false'
 & "$env:USERPROFILE\.cargo\bin\cargo.exe" check
 & "$env:USERPROFILE\.cargo\bin\cargo.exe" test
-dotnet build sensor-helper\BenchScope.SensorHelper.csproj -c Release --configfile config\NuGet.Config
 & "$env:USERPROFILE\.cargo\bin\cargo.exe" build --release
 ```
 
@@ -122,4 +137,6 @@ On Windows, a large compute dispatch that keeps the GPU busy for too long can tr
 
 The drive benchmark prefers direct/no-buffering I/O on Windows. If the selected path or filesystem rejects direct mode, the app falls back to cached I/O and labels the result. Cached mode is useful for quick comparisons, but it can include operating-system RAM cache effects, especially on repeated reads.
 
-Temperature and utilization readings are supplemental telemetry and are sampled continuously at 1 Hz, even when no benchmark is running. BenchScope first tries the bundled `BenchScope.SensorHelper.exe`, which uses LibreHardwareMonitor when it has been built or shipped beside the app. On launch, BenchScope requests an elevated helper through the standard Windows UAC flow so hardware sensors can be opened without a separate setup step. GPU readings include dedicated GPU sensors plus Intel/AMD iGPU readings that LibreHardwareMonitor exposes as CPU/APU `GT`, `Graphics`, `GFX`, or `iGPU` sensors. If an integrated GPU has no separate temperature sensor, BenchScope uses the shared CPU package temperature for that GPU row when the selected target adapter is integrated graphics. Any individual missing helper reading can still fall back to `nvidia-smi`/NVML for GPU temperature, Windows performance counters for utilization, Windows storage reliability counters for the selected drive letter, or the Windows ACPI thermal-zone path for CPU temperature. Unsupported or permission-blocked sensors show `N/A` and never prevent benchmarks from running.
+Temperature and utilization readings are supplemental telemetry and are sampled continuously at 1 Hz, even when no benchmark is running. BenchScope uses command-based Windows/NVIDIA probes by default: `nvidia-smi`/NVML for GPU temperature when available, Windows performance counters for utilization, Windows storage reliability counters for the selected drive letter, and the Windows ACPI thermal-zone path for CPU temperature. Unsupported or permission-blocked sensors show `N/A` and never prevent benchmarks from running.
+
+The optional `sensor-helper/` project uses LibreHardwareMonitor for broader hardware coverage, but LibreHardwareMonitor can create/load a WinRing driver on Windows. Microsoft Defender may identify that driver as `VulnerableDriver:WinNT/Winring0`, so BenchScope does not start the helper automatically and does not offer helper launch buttons in the UI. For local experiments only, build the helper and launch BenchScope with `BENCHSCOPE_ENABLE_SENSOR_HELPER=1`; if Defender blocks it, use the safe default probes instead.
