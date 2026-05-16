@@ -4,9 +4,18 @@ Native desktop tool for comparing CPU matrix multiplication against GPU compute,
 
 The primary implementation is now Rust + `wgpu` + `egui`. The earlier Python Direct3D prototype remains archived in `archive/benchscope.py` as a fallback/reference implementation.
 
+## Project Layout
+
+- `src/` - main Rust desktop application.
+- `sensor-helper/` - C# LibreHardwareMonitor sensor helper.
+- `plans/` - implementation and feature planning notes.
+- `scripts/` - local launcher and utility scripts.
+- `config/` - tool configuration files.
+- `archive/` - older prototype/reference code.
+
 ## Run
 
-Double-click `RUN_TESTER.bat`, or run the release binary directly:
+Double-click `scripts\RUN_TESTER.bat`, or run the release binary directly:
 
 ```powershell
 .\target\release\benchscope.exe
@@ -80,7 +89,9 @@ Choose the GPU submission intensity used by self-test:
 - Drive benchmark tool with sequential read, sequential write, random 4 KiB read, and random 4 KiB write tests.
 - Drive benchmark includes a detected-drive picker and editable target folder.
 - Drive tests report MB/s, IOPS for random tests, average latency, p95 latency, duration, file size, I/O mode, and notes.
-- Bottom-right sensor panel shows CPU/GPU temperatures for matrix benchmark and stress views, plus SSD temperature for the selected drive benchmark target when the operating system/provider exposes readings.
+- Bottom-right sensor panel shows CPU/GPU temperature and utilization for matrix benchmark and stress views, plus SSD temperature and utilization for the selected drive benchmark target when the operating system/provider exposes readings.
+- Fullscreen can be toggled with the on-screen button or `F11`.
+- Bundled LibreHardwareMonitor-based sensor helper is auto-launched when present, with command-based Windows/NVIDIA probes kept as fallbacks.
 - Benchmark logs and result tables include start/end/max temperature summaries when readings are available.
 - Drive tests prefer Windows direct/no-buffering I/O and fall back to cached file I/O when direct mode is unavailable.
 - Drive benchmark profiles keep measured subtests below a 30 second hard cap, with shorter Quick/Balanced/Thorough targets.
@@ -93,6 +104,7 @@ Choose the GPU submission intensity used by self-test:
 $env:CARGO_NET_OFFLINE='false'
 & "$env:USERPROFILE\.cargo\bin\cargo.exe" check
 & "$env:USERPROFILE\.cargo\bin\cargo.exe" test
+dotnet build sensor-helper\BenchScope.SensorHelper.csproj -c Release --configfile config\NuGet.Config
 & "$env:USERPROFILE\.cargo\bin\cargo.exe" build --release
 ```
 
@@ -110,4 +122,4 @@ On Windows, a large compute dispatch that keeps the GPU busy for too long can tr
 
 The drive benchmark prefers direct/no-buffering I/O on Windows. If the selected path or filesystem rejects direct mode, the app falls back to cached I/O and labels the result. Cached mode is useful for quick comparisons, but it can include operating-system RAM cache effects, especially on repeated reads.
 
-Temperature readings are supplemental telemetry. GPU temperature currently uses `nvidia-smi`/NVML when available, SSD temperature uses Windows storage reliability counters for the selected drive letter when available, and CPU temperature uses the Windows ACPI thermal-zone fallback. Unsupported or permission-blocked sensors show `N/A` and never prevent benchmarks from running.
+Temperature and utilization readings are supplemental telemetry and are sampled continuously at 1 Hz, even when no benchmark is running. BenchScope first tries the bundled `BenchScope.SensorHelper.exe`, which uses LibreHardwareMonitor when it has been built or shipped beside the app. On launch, BenchScope requests an elevated helper through the standard Windows UAC flow so hardware sensors can be opened without a separate setup step. GPU readings include dedicated GPU sensors plus Intel/AMD iGPU readings that LibreHardwareMonitor exposes as CPU/APU `GT`, `Graphics`, `GFX`, or `iGPU` sensors. If an integrated GPU has no separate temperature sensor, BenchScope uses the shared CPU package temperature for that GPU row when the selected target adapter is integrated graphics. Any individual missing helper reading can still fall back to `nvidia-smi`/NVML for GPU temperature, Windows performance counters for utilization, Windows storage reliability counters for the selected drive letter, or the Windows ACPI thermal-zone path for CPU temperature. Unsupported or permission-blocked sensors show `N/A` and never prevent benchmarks from running.

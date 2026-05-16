@@ -2,17 +2,17 @@ use std::{
     any::Any,
     fmt,
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     panic::{self, AssertUnwindSafe},
     path::PathBuf,
-    process::Command,
+    process::{Command, Stdio},
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(windows)]
@@ -59,11 +59,15 @@ const DRIVE_SEQUENTIAL_BLOCK_BYTES: usize = 8 * 1024 * 1024;
 const DRIVE_RANDOM_BLOCK_BYTES: usize = 4 * 1024;
 const DRIVE_LATENCY_SAMPLE_LIMIT: usize = 200_000;
 const DECIMAL_MB: f64 = 1_000_000.0;
-const RESULT_HEADER_TEXT_SIZE: f32 = 16.0;
-const RESULT_CELL_TEXT_SIZE: f32 = 15.0;
-const SENSOR_IDLE_POLL_MS: u64 = 2_000;
-const SENSOR_ACTIVE_POLL_MS: u64 = 500;
+const RESULT_HEADER_TEXT_SIZE: f32 = 18.0;
+const RESULT_CELL_TEXT_SIZE: f32 = 17.0;
+const LOG_TEXT_SIZE: f32 = 13.0;
+const SENSOR_POLL_MS: u64 = 1_000;
 const SENSOR_STALE_AFTER_MS: u64 = 5_000;
+const SENSOR_BOX_RESERVED_HEIGHT: f32 = 112.0;
+const PANEL_VERTICAL_CHROME_HEIGHT: f32 = 56.0;
+const MIN_LOG_HEIGHT: f32 = 64.0;
+const MIN_CONTENT_HEIGHT: f32 = 96.0;
 const CREATE_NO_WINDOW_RAW: u32 = 0x0800_0000;
 #[cfg(windows)]
 const FILE_FLAG_WRITE_THROUGH_RAW: u32 = 0x8000_0000;
@@ -329,6 +333,7 @@ struct SensorReading {
     kind: SensorKind,
     label: String,
     temperature_c: Option<f32>,
+    utilization_percent: Option<f32>,
     provider: String,
     updated_at: Instant,
     status: SensorStatus,
@@ -340,6 +345,7 @@ impl SensorReading {
             kind,
             label: label.into(),
             temperature_c: Some(temperature_c),
+            utilization_percent: None,
             provider: provider.to_owned(),
             updated_at: Instant::now(),
             status: SensorStatus::Ok,
@@ -356,6 +362,7 @@ impl SensorReading {
             kind,
             label: label.into(),
             temperature_c: None,
+            utilization_percent: None,
             provider: provider.to_owned(),
             updated_at: Instant::now(),
             status,
@@ -363,14 +370,23 @@ impl SensorReading {
     }
 
     fn mark_stale(mut self) -> Self {
-        if self.temperature_c.is_some() {
+        if self.temperature_c.is_some() || self.utilization_percent.is_some() {
             self.status = SensorStatus::Stale;
         }
         self
     }
 
     fn is_ok(&self) -> bool {
+        self.status == SensorStatus::Ok
+            && (self.temperature_c.is_some() || self.utilization_percent.is_some())
+    }
+
+    fn has_temperature(&self) -> bool {
         self.status == SensorStatus::Ok && self.temperature_c.is_some()
+    }
+
+    fn has_utilization(&self) -> bool {
+        self.status == SensorStatus::Ok && self.utilization_percent.is_some()
     }
 }
 
@@ -379,6 +395,7 @@ struct SensorSnapshot {
     cpu: Option<SensorReading>,
     gpu: Option<SensorReading>,
     drive: Option<SensorReading>,
+    helper_elevated: Option<bool>,
 }
 
 impl SensorSnapshot {
@@ -388,6 +405,7 @@ impl SensorSnapshot {
             cpu: stale_checked_reading(self.cpu.clone(), now, stale_after),
             gpu: stale_checked_reading(self.gpu.clone(), now, stale_after),
             drive: stale_checked_reading(self.drive.clone(), now, stale_after),
+            helper_elevated: self.helper_elevated,
         }
     }
 }
@@ -479,41 +497,72 @@ struct TemperatureRunReport {
 
 struct SensorManager {
     latest: Arc<RwLock<SensorSnapshot>>,
-    active: Arc<AtomicBool>,
     target_drive_letter: Arc<RwLock<Option<char>>>,
+    target_gpu_uses_shared_cpu_temperature: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 }
 
 impl SensorManager {
     fn new(initial_drive_letter: Option<char>) -> Self {
         let latest = Arc::new(RwLock::new(SensorSnapshot::default()));
-        let active = Arc::new(AtomicBool::new(false));
         let target_drive_letter = Arc::new(RwLock::new(initial_drive_letter));
+        let target_gpu_uses_shared_cpu_temperature = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let thread_latest = Arc::clone(&latest);
-        let thread_active = Arc::clone(&active);
         let thread_target_drive_letter = Arc::clone(&target_drive_letter);
+        let thread_target_gpu_uses_shared_cpu_temperature =
+            Arc::clone(&target_gpu_uses_shared_cpu_temperature);
         let thread_shutdown = Arc::clone(&shutdown);
 
         let _ = thread::Builder::new()
             .name("benchscope-sensors".to_owned())
             .spawn(move || {
+                let helper_rx = start_sensor_helper_reader();
+                let mut helper_snapshot: Option<SensorSnapshot> = None;
+                let elevated_helper_path = start_elevated_sensor_helper_file();
+                let mut elevated_helper_snapshot: Option<SensorSnapshot> = None;
+                let mut elevated_helper_modified: Option<SystemTime> = None;
                 while !thread_shutdown.load(Ordering::Relaxed) {
                     let drive_letter = thread_target_drive_letter
                         .read()
                         .map(|guard| *guard)
                         .unwrap_or(None);
-                    let snapshot = collect_sensor_snapshot(drive_letter);
+                    let use_shared_gpu_temperature =
+                        thread_target_gpu_uses_shared_cpu_temperature.load(Ordering::Relaxed);
+                    if let Some(helper_rx) = &helper_rx {
+                        while let Ok(snapshot) = helper_rx.try_recv() {
+                            helper_snapshot = Some(snapshot);
+                        }
+                    }
+                    if let Some(path) = &elevated_helper_path {
+                        if let Some(snapshot) =
+                            read_sensor_helper_snapshot_file(path, &mut elevated_helper_modified)
+                        {
+                            elevated_helper_snapshot = Some(snapshot);
+                        }
+                    }
+
+                    let helper_preferred_snapshot = elevated_helper_snapshot
+                        .clone()
+                        .or_else(|| helper_snapshot.clone());
+                    let fallback_snapshot =
+                        helper_preferred_snapshot.as_ref().and_then(|snapshot| {
+                            helper_snapshot_has_gaps(snapshot)
+                                .then(|| collect_sensor_snapshot(drive_letter))
+                        });
+                    let snapshot =
+                        merge_sensor_snapshots(helper_preferred_snapshot, fallback_snapshot)
+                            .unwrap_or_else(|| collect_sensor_snapshot(drive_letter));
+                    let snapshot = apply_integrated_gpu_temperature_fallback(
+                        snapshot,
+                        use_shared_gpu_temperature,
+                    );
                     if let Ok(mut latest) = thread_latest.write() {
                         *latest = snapshot;
                     }
 
-                    let sleep_for = if thread_active.load(Ordering::Relaxed) {
-                        Duration::from_millis(SENSOR_ACTIVE_POLL_MS)
-                    } else {
-                        Duration::from_millis(SENSOR_IDLE_POLL_MS)
-                    };
+                    let sleep_for = Duration::from_millis(SENSOR_POLL_MS);
                     let sleep_until = Instant::now() + sleep_for;
                     while Instant::now() < sleep_until {
                         if thread_shutdown.load(Ordering::Relaxed) {
@@ -526,8 +575,8 @@ impl SensorManager {
 
         Self {
             latest,
-            active,
             target_drive_letter,
+            target_gpu_uses_shared_cpu_temperature,
             shutdown,
         }
     }
@@ -539,14 +588,15 @@ impl SensorManager {
             .unwrap_or_default()
     }
 
-    fn set_active(&self, active: bool) {
-        self.active.store(active, Ordering::Relaxed);
-    }
-
     fn set_target_drive_letter(&self, drive_letter: Option<char>) {
         if let Ok(mut target) = self.target_drive_letter.write() {
             *target = drive_letter.map(|letter| letter.to_ascii_uppercase());
         }
+    }
+
+    fn set_target_gpu_uses_shared_cpu_temperature(&self, value: bool) {
+        self.target_gpu_uses_shared_cpu_temperature
+            .store(value, Ordering::Relaxed);
     }
 }
 
@@ -3758,10 +3808,12 @@ struct BenchScopeApp {
     drive: DriveBenchmarkState,
     sensors: SensorManager,
     temperature_run: Option<TemperatureRunTracker>,
+    fullscreen: bool,
 }
 
 impl BenchScopeApp {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        configure_ui_style(&cc.egui_ctx);
         let (tx, rx) = mpsc::channel();
         let adapters = enumerate_adapters();
         let cpu_info = detect_cpu_info();
@@ -3803,6 +3855,7 @@ impl BenchScopeApp {
             drive,
             sensors,
             temperature_run: None,
+            fullscreen: false,
         };
         app.log("Application started");
         if app.adapters.is_empty() {
@@ -3860,14 +3913,19 @@ impl BenchScopeApp {
     }
 
     fn sync_sensor_state(&mut self) {
-        self.sensors.set_active(self.running || self.drive.running);
         self.sensors
             .set_target_drive_letter(drive_letter_for_path(&PathBuf::from(
                 self.drive.target_folder_text.trim(),
             )));
+        let gpu_uses_shared_cpu_temperature = self
+            .adapters
+            .get(self.selected_adapter)
+            .is_some_and(adapter_uses_shared_cpu_temperature);
+        self.sensors
+            .set_target_gpu_uses_shared_cpu_temperature(gpu_uses_shared_cpu_temperature);
     }
 
-    fn ui_sensor_panel(&mut self, ctx: &egui::Context) {
+    fn ui_sensor_panel(&mut self, ui: &mut egui::Ui) {
         let snapshot = self.sensors.latest();
         let rows: Vec<(&str, Option<&SensorReading>)> = match self.view {
             AppView::MatrixBenchmark | AppView::MatrixStressTest => {
@@ -3877,28 +3935,30 @@ impl BenchScopeApp {
                 ]
             }
             AppView::DriveBenchmark => vec![("SSD", snapshot.drive.as_ref())],
-            AppView::MainMenu => vec![
-                ("CPU", snapshot.cpu.as_ref()),
-                ("GPU", snapshot.gpu.as_ref()),
-                ("SSD", snapshot.drive.as_ref()),
-            ],
+            AppView::MainMenu => return,
         };
 
-        egui::Area::new(egui::Id::new("sensor_panel"))
-            .anchor(egui::Align2::RIGHT_BOTTOM, [-12.0, -12.0])
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                egui::Frame::window(ui.style())
-                    .inner_margin(egui::Margin::symmetric(10, 8))
-                    .show(ui, |ui| {
-                        ui.set_min_width(150.0);
-                        ui.label(egui::RichText::new("Sensors").strong());
-                        ui.add_space(3.0);
-                        for (label, reading) in rows {
-                            ui_sensor_row(ui, label, reading);
-                        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
+            egui::Frame::group(ui.style())
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.set_min_width(210.0);
+                    ui.label(egui::RichText::new("Sensors").strong());
+                    ui.horizontal(|ui| {
+                        ui.set_min_width(188.0);
+                        ui.label(egui::RichText::new("").monospace());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(egui::RichText::new("Util %").small());
+                            ui.add_space(12.0);
+                            ui.label(egui::RichText::new("Temp").small());
+                        });
                     });
-            });
+                    ui.add_space(3.0);
+                    for (label, reading) in rows {
+                        ui_sensor_row(ui, label, reading);
+                    }
+                });
+        });
     }
 
     fn selected_size(&self) -> Result<usize> {
@@ -4302,35 +4362,77 @@ impl BenchScopeApp {
 
     fn ui_main_menu(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show_inside(ui, |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                self.ui_fullscreen_button(ui);
+            });
             ui.vertical_centered(|ui| {
                 ui.add_space(80.0);
-                ui.heading("BenchScope");
-                ui.add_space(20.0);
+                ui.heading(egui::RichText::new("BenchScope").size(34.0));
+                ui.add_space(24.0);
                 if ui
-                    .add_sized([280.0, 44.0], egui::Button::new("Matrix CPU/GPU Benchmark"))
+                    .add_sized(
+                        [360.0, 58.0],
+                        egui::Button::new(
+                            egui::RichText::new("Matrix CPU/GPU Benchmark").size(19.0),
+                        ),
+                    )
                     .clicked()
                 {
                     self.view = AppView::MatrixBenchmark;
                 }
-                ui.add_space(8.0);
+                ui.add_space(10.0);
                 if ui
-                    .add_sized([280.0, 44.0], egui::Button::new("Matrix Stress Test"))
+                    .add_sized(
+                        [360.0, 58.0],
+                        egui::Button::new(egui::RichText::new("Matrix Stress Test").size(19.0)),
+                    )
                     .clicked()
                 {
                     self.view = AppView::MatrixStressTest;
                 }
-                ui.add_space(8.0);
+                ui.add_space(10.0);
                 if ui
-                    .add_sized([280.0, 44.0], egui::Button::new("Drive Benchmark"))
+                    .add_sized(
+                        [360.0, 58.0],
+                        egui::Button::new(egui::RichText::new("Drive Benchmark").size(19.0)),
+                    )
                     .clicked()
                 {
                     self.view = AppView::DriveBenchmark;
                 }
-                ui.add_space(18.0);
+                ui.add_space(22.0);
                 ui.small(format!("CPU: {}", self.cpu_info.label()));
                 ui.small(format!("GPU adapters detected: {}", self.adapters.len()));
             });
         });
+    }
+
+    fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
+        self.fullscreen = !self.fullscreen;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+    }
+
+    fn handle_global_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F11)) {
+            self.toggle_fullscreen(ctx);
+        }
+    }
+
+    fn ui_fullscreen_button(&mut self, ui: &mut egui::Ui) {
+        let label = if self.fullscreen {
+            "Exit fullscreen"
+        } else {
+            "Fullscreen"
+        };
+        let response = ui
+            .add_sized(
+                [156.0, 38.0],
+                egui::Button::new(egui::RichText::new(label).size(17.0)),
+            )
+            .on_hover_text("Toggle fullscreen (F11)");
+        if response.clicked() {
+            self.toggle_fullscreen(ui.ctx());
+        }
     }
 
     fn request_matrix_back_to_menu(&mut self) {
@@ -4362,9 +4464,10 @@ impl BenchScopeApp {
 
         egui::Panel::top("drive_top_panel").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Back").clicked() {
+                if ui_large_back_button(ui).clicked() {
                     self.request_drive_back_to_menu();
                 }
+                self.ui_fullscreen_button(ui);
                 ui.separator();
                 ui.heading("Drive Benchmark");
                 ui.separator();
@@ -4503,8 +4606,8 @@ impl BenchScopeApp {
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let available_height = ui.available_height();
-            let log_height = (available_height * 0.18).clamp(110.0, 150.0);
-            let results_height = (available_height - log_height - 56.0).max(260.0);
+            let (results_height, log_height) =
+                panel_content_log_heights(available_height, 0.18, 150.0);
 
             ui.heading("Drive Results");
             ui.add_space(6.0);
@@ -4572,9 +4675,11 @@ impl BenchScopeApp {
                 .max_height(log_height)
                 .show(ui, |ui| {
                     for line in &self.drive.log {
-                        ui.monospace(line);
+                        ui_log_line(ui, line);
                     }
                 });
+            ui.add_space(6.0);
+            self.ui_sensor_panel(ui);
         });
 
         if self.drive_back_confirm {
@@ -4603,9 +4708,10 @@ impl BenchScopeApp {
 
         egui::Panel::top("stress_top_panel").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Back").clicked() {
+                if ui_large_back_button(ui).clicked() {
                     self.request_stress_back_to_menu();
                 }
+                self.ui_fullscreen_button(ui);
                 ui.separator();
                 ui.heading("Matrix Stress Test");
                 ui.separator();
@@ -4771,8 +4877,8 @@ impl BenchScopeApp {
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let available_height = ui.available_height();
-            let log_height = (available_height * 0.35).clamp(160.0, 260.0);
-            let summary_height = (available_height - log_height - 56.0).max(220.0);
+            let (summary_height, log_height) =
+                panel_content_log_heights(available_height, 0.35, 220.0);
 
             ui.heading("Stress Test");
             ui.add_space(6.0);
@@ -4797,9 +4903,11 @@ impl BenchScopeApp {
                 .max_height(log_height)
                 .show(ui, |ui| {
                     for line in &self.log {
-                        ui.monospace(line);
+                        ui_log_line(ui, line);
                     }
                 });
+            ui.add_space(6.0);
+            self.ui_sensor_panel(ui);
         });
 
         if let Some(warning) = self.pending_vram_warning.clone() {
@@ -4861,6 +4969,7 @@ impl BenchScopeApp {
 impl eframe::App for BenchScopeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.handle_global_shortcuts(&ctx);
         self.sync_sensor_state();
         let drive_was_running = self.drive.running;
         let drive_result_count_before = self.drive.results.len();
@@ -4882,22 +4991,21 @@ impl eframe::App for BenchScopeApp {
         self.sync_sensor_state();
         if self.running || self.drive.running {
             ctx.request_repaint_after(Duration::from_millis(100));
+        } else if self.view != AppView::MainMenu {
+            ctx.request_repaint_after(Duration::from_millis(SENSOR_POLL_MS));
         }
 
         match self.view {
             AppView::MainMenu => {
                 self.ui_main_menu(ui);
-                self.ui_sensor_panel(&ctx);
                 return;
             }
             AppView::DriveBenchmark => {
                 self.ui_drive_benchmark(ui);
-                self.ui_sensor_panel(&ctx);
                 return;
             }
             AppView::MatrixStressTest => {
                 self.ui_matrix_stress_test(ui);
-                self.ui_sensor_panel(&ctx);
                 return;
             }
             AppView::MatrixBenchmark => {}
@@ -4905,9 +5013,10 @@ impl eframe::App for BenchScopeApp {
 
         egui::Panel::top("top_panel").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Back").clicked() {
+                if ui_large_back_button(ui).clicked() {
                     self.request_matrix_back_to_menu();
                 }
+                self.ui_fullscreen_button(ui);
                 ui.separator();
                 ui.heading("BenchScope");
                 ui.separator();
@@ -5082,8 +5191,8 @@ impl eframe::App for BenchScopeApp {
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let available_height = ui.available_height();
-            let log_height = (available_height * 0.18).clamp(110.0, 150.0);
-            let results_height = (available_height - log_height - 56.0).max(260.0);
+            let (results_height, log_height) =
+                panel_content_log_heights(available_height, 0.18, 150.0);
 
             ui.heading("Results");
             ui.add_space(6.0);
@@ -5157,9 +5266,11 @@ impl eframe::App for BenchScopeApp {
                 .max_height(log_height)
                 .show(ui, |ui| {
                     for line in &self.log {
-                        ui.monospace(line);
+                        ui_log_line(ui, line);
                     }
                 });
+            ui.add_space(6.0);
+            self.ui_sensor_panel(ui);
         });
 
         if let Some(warning) = self.pending_vram_warning.clone() {
@@ -5219,7 +5330,6 @@ impl eframe::App for BenchScopeApp {
                     });
                 });
         }
-        self.ui_sensor_panel(&ctx);
     }
 }
 
@@ -5302,6 +5412,439 @@ fn drive_letter_for_path(path: &PathBuf) -> Option<char> {
     }
 }
 
+fn start_sensor_helper_reader() -> Option<Receiver<SensorSnapshot>> {
+    let helper_path = sensor_helper_path()?;
+    let mut command = Command::new(&helper_path);
+    command
+        .arg("--stream")
+        .arg("--parent-pid")
+        .arg(std::process::id().to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW_RAW);
+
+    let mut child = command.spawn().ok()?;
+    let stdout = child.stdout.take()?;
+    let (tx, rx) = mpsc::channel();
+
+    let _ = thread::Builder::new()
+        .name("benchscope-sensor-helper".to_owned())
+        .spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                if let Some(snapshot) = parse_helper_snapshot(&line) {
+                    let _ = tx.send(snapshot);
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+
+    Some(rx)
+}
+
+fn read_sensor_helper_snapshot_file(
+    path: &PathBuf,
+    last_modified: &mut Option<SystemTime>,
+) -> Option<SensorSnapshot> {
+    let modified = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    if let (Some(modified), Some(previous)) = (modified, *last_modified) {
+        if modified <= previous {
+            return None;
+        }
+    }
+
+    let contents = fs::read_to_string(path).ok()?;
+    let snapshot = parse_helper_snapshot(contents.trim())?;
+    if let Some(modified) = modified {
+        *last_modified = Some(modified);
+    }
+    Some(snapshot)
+}
+
+#[cfg(test)]
+fn helper_snapshot_needs_elevation(snapshot: &SensorSnapshot) -> bool {
+    snapshot.helper_elevated == Some(false)
+        && [
+            snapshot.cpu.as_ref(),
+            snapshot.gpu.as_ref(),
+            snapshot.drive.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|reading| {
+            reading.temperature_c.is_none()
+                && reading
+                    .provider
+                    .eq_ignore_ascii_case("LibreHardwareMonitor")
+        })
+}
+
+fn helper_snapshot_has_gaps(snapshot: &SensorSnapshot) -> bool {
+    sensor_reading_has_gap(snapshot.cpu.as_ref())
+        || sensor_reading_has_gap(snapshot.gpu.as_ref())
+        || sensor_reading_has_gap(snapshot.drive.as_ref())
+}
+
+fn sensor_reading_has_gap(reading: Option<&SensorReading>) -> bool {
+    match reading {
+        Some(reading) => !reading.has_temperature() || !reading.has_utilization(),
+        None => true,
+    }
+}
+
+fn merge_sensor_snapshots(
+    primary: Option<SensorSnapshot>,
+    fallback: Option<SensorSnapshot>,
+) -> Option<SensorSnapshot> {
+    match (primary, fallback) {
+        (Some(primary), Some(fallback)) => Some(SensorSnapshot {
+            cpu: prefer_sensor_reading(primary.cpu, fallback.cpu),
+            gpu: prefer_sensor_reading(primary.gpu, fallback.gpu),
+            drive: prefer_sensor_reading(primary.drive, fallback.drive),
+            helper_elevated: primary.helper_elevated,
+        }),
+        (Some(primary), None) => Some(primary),
+        (None, Some(fallback)) => Some(fallback),
+        (None, None) => None,
+    }
+}
+
+fn prefer_sensor_reading(
+    primary: Option<SensorReading>,
+    fallback: Option<SensorReading>,
+) -> Option<SensorReading> {
+    match (primary, fallback) {
+        (Some(primary), Some(fallback)) => Some(merge_sensor_reading(primary, fallback)),
+        (Some(primary), None) => Some(primary),
+        (None, fallback) => fallback,
+    }
+}
+
+fn merge_sensor_reading(mut primary: SensorReading, fallback: SensorReading) -> SensorReading {
+    if primary.temperature_c.is_none() && fallback.temperature_c.is_some() {
+        primary.temperature_c = fallback.temperature_c;
+        if primary.label.is_empty() || !primary.has_utilization() {
+            primary.label = fallback.label.clone();
+        }
+    }
+    if primary.utilization_percent.is_none() && fallback.utilization_percent.is_some() {
+        primary.utilization_percent = fallback.utilization_percent;
+    }
+    if !primary.is_ok()
+        && (primary.temperature_c.is_some() || primary.utilization_percent.is_some())
+    {
+        primary.status = SensorStatus::Ok;
+    }
+    if primary.provider != fallback.provider
+        && (fallback.temperature_c.is_some() || fallback.utilization_percent.is_some())
+    {
+        primary.provider = format!("{} + {}", primary.provider, fallback.provider);
+    }
+    primary
+}
+
+fn apply_integrated_gpu_temperature_fallback(
+    mut snapshot: SensorSnapshot,
+    enabled: bool,
+) -> SensorSnapshot {
+    if !enabled {
+        return snapshot;
+    }
+
+    let Some(cpu) = snapshot.cpu.as_ref() else {
+        return snapshot;
+    };
+    let Some(cpu_temperature) = cpu.temperature_c else {
+        return snapshot;
+    };
+    if snapshot
+        .gpu
+        .as_ref()
+        .is_some_and(|reading| reading.temperature_c.is_some())
+    {
+        return snapshot;
+    }
+
+    let utilization_percent = snapshot
+        .gpu
+        .as_ref()
+        .and_then(|reading| reading.utilization_percent);
+    snapshot.gpu = Some(SensorReading {
+        kind: SensorKind::Gpu,
+        label: "iGPU shared CPU package".to_owned(),
+        temperature_c: Some(cpu_temperature),
+        utilization_percent,
+        provider: format!("Shared CPU package ({})", cpu.provider),
+        updated_at: Instant::now(),
+        status: SensorStatus::Ok,
+    });
+    snapshot
+}
+
+#[cfg(windows)]
+fn start_elevated_sensor_helper_file() -> Option<PathBuf> {
+    let helper_path = sensor_helper_path()?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    let output_path = std::env::temp_dir().join(format!(
+        "BenchScope.SensorHelper-{}-{timestamp}.json",
+        std::process::id()
+    ));
+    let arguments = [
+        windows_command_arg("--out-file"),
+        windows_command_arg(&output_path.display().to_string()),
+        windows_command_arg("--parent-pid"),
+        windows_command_arg(&std::process::id().to_string()),
+    ]
+    .join(" ");
+    let script = format!(
+        "Start-Process -FilePath {} -ArgumentList {} -Verb RunAs -WindowStyle Hidden",
+        powershell_quote(&helper_path.display().to_string()),
+        powershell_quote(&arguments)
+    );
+    let status = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ])
+        .creation_flags(CREATE_NO_WINDOW_RAW)
+        .status()
+        .ok()?;
+    status.success().then_some(output_path)
+}
+
+#[cfg(not(windows))]
+fn start_elevated_sensor_helper_file() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(windows)]
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(windows)]
+fn windows_command_arg(value: &str) -> String {
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0;
+    for ch in value.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.push_str(&"\\".repeat(backslashes));
+                backslashes = 0;
+                quoted.push(ch);
+            }
+        }
+    }
+    quoted.push_str(&"\\".repeat(backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
+fn sensor_helper_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(dir) = exe_path.parent() {
+            candidates.push(dir.join("BenchScope.SensorHelper.exe"));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("target/release/BenchScope.SensorHelper.exe"));
+        candidates.push(cwd.join("target/debug/BenchScope.SensorHelper.exe"));
+        candidates.push(
+            cwd.join("sensor-helper/bin/Release/net10.0-windows/BenchScope.SensorHelper.exe"),
+        );
+        candidates
+            .push(cwd.join("sensor-helper/bin/Debug/net10.0-windows/BenchScope.SensorHelper.exe"));
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn parse_helper_snapshot(line: &str) -> Option<SensorSnapshot> {
+    if !line.contains("\"timestampUtc\"") && !line.contains("\"cpu\"") {
+        return None;
+    }
+
+    Some(SensorSnapshot {
+        cpu: parse_helper_reading(line, "cpu", SensorKind::Cpu, "CPU"),
+        gpu: parse_helper_reading(line, "gpu", SensorKind::Gpu, "GPU"),
+        drive: parse_helper_reading(line, "drive", SensorKind::Drive, "SSD"),
+        helper_elevated: json_bool_for_key(line, "isElevated"),
+    })
+}
+
+fn parse_helper_reading(
+    line: &str,
+    key: &str,
+    kind: SensorKind,
+    fallback_label: &str,
+) -> Option<SensorReading> {
+    let object = json_object_for_key(line, key)?;
+    let label = json_string_for_key(object, "label").unwrap_or_else(|| fallback_label.to_owned());
+    let provider = json_string_for_key(object, "provider")
+        .unwrap_or_else(|| "LibreHardwareMonitor".to_owned());
+    let status_text =
+        json_string_for_key(object, "status").unwrap_or_else(|| "unsupported".to_owned());
+    let message = json_string_for_key(object, "message");
+    let temperature_c = json_number_for_key(object, "temperatureC");
+    let utilization_percent = json_number_for_key(object, "utilizationPercent").map(clamp_percent);
+    let status = helper_sensor_status(&status_text, message);
+
+    Some(SensorReading {
+        kind,
+        label,
+        temperature_c,
+        utilization_percent,
+        provider,
+        updated_at: Instant::now(),
+        status,
+    })
+}
+
+fn helper_sensor_status(status: &str, message: Option<String>) -> SensorStatus {
+    match status.to_ascii_lowercase().as_str() {
+        "ok" => SensorStatus::Ok,
+        "permissiondenied" | "permission_denied" | "permission" => SensorStatus::PermissionDenied,
+        "unsupported" => message
+            .map(SensorStatus::Error)
+            .unwrap_or(SensorStatus::Unsupported),
+        "stale" => SensorStatus::Stale,
+        "error" => SensorStatus::Error(message.unwrap_or_else(|| "Sensor helper error".to_owned())),
+        _ => SensorStatus::Error(
+            message.unwrap_or_else(|| format!("Unknown helper status: {status}")),
+        ),
+    }
+}
+
+fn json_object_for_key<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let pattern = format!("\"{key}\":");
+    let start = line.find(&pattern)? + pattern.len();
+    let bytes = line.as_bytes();
+    let mut index = start;
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    if bytes.get(index).copied()? != b'{' {
+        return None;
+    }
+
+    let object_start = index;
+    let mut depth = 0_i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in line[object_start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let end = object_start + offset + ch.len_utf8();
+                    return Some(&line[object_start..end]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn json_string_for_key(object: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{key}\":");
+    let start = object.find(&pattern)? + pattern.len();
+    let mut index = start;
+    let bytes = object.as_bytes();
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    if bytes.get(index).copied()? != b'"' {
+        return None;
+    }
+    index += 1;
+    let mut value = String::new();
+    let mut escaped = false;
+    for ch in object[index..].chars() {
+        if escaped {
+            value.push(match ch {
+                '"' => '"',
+                '\\' => '\\',
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                other => other,
+            });
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return Some(value);
+        } else {
+            value.push(ch);
+        }
+    }
+    None
+}
+
+fn json_number_for_key(object: &str, key: &str) -> Option<f32> {
+    let pattern = format!("\"{key}\":");
+    let start = object.find(&pattern)? + pattern.len();
+    let mut value = String::new();
+    let mut started = false;
+    for ch in object[start..].chars() {
+        if ch.is_ascii_digit() || ch == '.' || ch == '-' {
+            value.push(ch);
+            started = true;
+        } else if started {
+            break;
+        } else if ch == 'n' {
+            return None;
+        } else if !ch.is_ascii_whitespace() {
+            return None;
+        }
+    }
+    value.parse::<f32>().ok()
+}
+
+fn json_bool_for_key(object: &str, key: &str) -> Option<bool> {
+    let pattern = format!("\"{key}\":");
+    let start = object.find(&pattern)? + pattern.len();
+    let value = object[start..].trim_start();
+    if value.starts_with("true") {
+        Some(true)
+    } else if value.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn stale_checked_reading(
     reading: Option<SensorReading>,
     now: Instant,
@@ -5323,10 +5866,18 @@ fn sensor_temperature(reading: Option<&SensorReading>) -> Option<f32> {
 }
 
 fn collect_sensor_snapshot(drive_letter: Option<char>) -> SensorSnapshot {
+    let mut cpu = query_cpu_temperature();
+    cpu.utilization_percent = query_cpu_utilization();
+    let mut gpu = query_gpu_temperature();
+    gpu.utilization_percent = query_gpu_utilization();
+    let mut drive = query_drive_temperature(drive_letter);
+    drive.utilization_percent = query_drive_utilization(drive_letter);
+
     SensorSnapshot {
-        cpu: Some(query_cpu_temperature()),
-        gpu: Some(query_gpu_temperature()),
-        drive: Some(query_drive_temperature(drive_letter)),
+        cpu: Some(cpu),
+        gpu: Some(gpu),
+        drive: Some(drive),
+        helper_elevated: None,
     }
 }
 
@@ -5373,13 +5924,7 @@ if ($zone -and $zone.CurrentTemperature) {
 fn query_gpu_temperature() -> SensorReading {
     #[cfg(windows)]
     {
-        match run_command_no_window(
-            "nvidia-smi",
-            &[
-                "--query-gpu=temperature.gpu",
-                "--format=csv,noheader,nounits",
-            ],
-        ) {
+        match run_nvidia_smi_temperature_query() {
             Ok(output) => parse_first_temperature(&output)
                 .map(|temp| SensorReading::ok(SensorKind::Gpu, "GPU", temp, "NVML/nvidia-smi"))
                 .unwrap_or_else(|| {
@@ -5425,16 +5970,17 @@ fn query_drive_temperature(drive_letter: Option<char>) -> SensorReading {
     {
         let script = format!(
             r#"
+$ErrorActionPreference = 'Stop'
 $letter = '{drive_letter}'
-$partition = Get-Partition -DriveLetter $letter -ErrorAction SilentlyContinue | Select-Object -First 1
+$partition = Get-Partition -DriveLetter $letter | Select-Object -First 1
 if ($partition) {{
-    $disk = $partition | Get-Disk -ErrorAction SilentlyContinue
+    $disk = $partition | Get-Disk
     if ($disk) {{
-        $physical = Get-PhysicalDisk -ErrorAction SilentlyContinue |
+        $physical = Get-PhysicalDisk |
             Where-Object {{ $_.DeviceId -eq "$($disk.Number)" -or $_.SerialNumber -eq $disk.SerialNumber }} |
             Select-Object -First 1
         if ($physical) {{
-            $counter = $physical | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue
+            $counter = $physical | Get-StorageReliabilityCounter
             if ($counter -and $counter.Temperature) {{
                 [math]::Round($counter.Temperature, 1)
             }}
@@ -5482,12 +6028,91 @@ if ($partition) {{
     }
 }
 
+fn query_cpu_utilization() -> Option<f32> {
+    #[cfg(windows)]
+    {
+        let script = r#"
+$counter = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'" -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($counter) {
+    [math]::Round([math]::Min(100, [math]::Max(0, $counter.PercentProcessorTime)), 1)
+}
+"#;
+        return run_powershell_sensor_script(script)
+            .ok()
+            .and_then(|output| parse_first_utilization(&output));
+    }
+
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+fn query_gpu_utilization() -> Option<f32> {
+    #[cfg(windows)]
+    {
+        let script = r#"
+$engines = Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine -ErrorAction SilentlyContinue
+if ($engines) {
+    $sum = ($engines | Measure-Object -Property UtilizationPercentage -Sum).Sum
+    [math]::Round([math]::Min(100, [math]::Max(0, $sum)), 1)
+}
+"#;
+        return run_powershell_sensor_script(script)
+            .ok()
+            .and_then(|output| parse_first_utilization(&output));
+    }
+
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+fn query_drive_utilization(drive_letter: Option<char>) -> Option<f32> {
+    let drive_letter = drive_letter?;
+
+    #[cfg(windows)]
+    {
+        let script = format!(
+            r#"
+$counter = Get-CimInstance Win32_PerfFormattedData_PerfDisk_LogicalDisk -Filter "Name='{drive_letter}:'" -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($counter) {{
+    [math]::Round([math]::Min(100, [math]::Max(0, $counter.PercentDiskTime)), 1)
+}}
+"#
+        );
+        return run_powershell_sensor_script(&script)
+            .ok()
+            .and_then(|output| parse_first_utilization(&output));
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = drive_letter;
+        None
+    }
+}
+
 fn parse_first_temperature(output: &str) -> Option<f32> {
     output
         .split(|ch: char| !(ch.is_ascii_digit() || ch == '.' || ch == '-'))
         .filter(|token| !token.is_empty())
         .filter_map(|token| token.parse::<f32>().ok())
         .find(|value| (-40.0..=130.0).contains(value))
+}
+
+fn parse_first_utilization(output: &str) -> Option<f32> {
+    output
+        .split(|ch: char| !(ch.is_ascii_digit() || ch == '.' || ch == '-'))
+        .filter(|token| !token.is_empty())
+        .filter_map(|token| token.parse::<f32>().ok())
+        .find(|value| (0.0..=10_000.0).contains(value))
+        .map(clamp_percent)
+}
+
+fn clamp_percent(value: f32) -> f32 {
+    (value.clamp(0.0, 100.0) * 10.0).round() / 10.0
 }
 
 fn sensor_error_status(err: anyhow::Error) -> SensorStatus {
@@ -5519,6 +6144,26 @@ fn run_powershell_sensor_script(script: &str) -> Result<String> {
             script,
         ],
     )
+}
+
+#[cfg(windows)]
+fn run_nvidia_smi_temperature_query() -> Result<String> {
+    const NVIDIA_SMI_ARGS: &[&str] = &[
+        "--query-gpu=temperature.gpu",
+        "--format=csv,noheader,nounits",
+    ];
+
+    match run_command_no_window("nvidia-smi", NVIDIA_SMI_ARGS) {
+        Ok(output) => Ok(output),
+        Err(path_err) => {
+            let fallback = r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe";
+            run_command_no_window(fallback, NVIDIA_SMI_ARGS).map_err(|fallback_err| {
+                anyhow!(
+                    "nvidia-smi unavailable on PATH ({path_err}) or at default install path ({fallback_err})"
+                )
+            })
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -6387,6 +7032,12 @@ fn format_temperature_value(value: Option<f32>) -> String {
         .unwrap_or_else(|| "N/A".to_owned())
 }
 
+fn format_utilization_value(value: Option<f32>) -> String {
+    value
+        .map(|value| format!("{value:.0}%"))
+        .unwrap_or_else(|| "N/A".to_owned())
+}
+
 fn format_temperature_summary(summary: &TemperatureSummary) -> String {
     if !summary.has_any_value() {
         return "N/A".to_owned();
@@ -6423,39 +7074,90 @@ fn temperature_color(kind: SensorKind, value: Option<f32>, status: &SensorStatus
 }
 
 fn ui_sensor_row(ui: &mut egui::Ui, label: &str, reading: Option<&SensorReading>) {
-    let (value, color, tooltip) = if let Some(reading) = reading {
-        let value = if reading.status == SensorStatus::Stale {
-            "-- C".to_owned()
+    let (temperature, utilization, temperature_color, utilization_color, tooltip) =
+        if let Some(reading) = reading {
+            let (temperature, utilization) = if reading.status == SensorStatus::Stale {
+                ("-- C".to_owned(), "--%".to_owned())
+            } else {
+                (
+                    format_temperature_value(reading.temperature_c),
+                    format_utilization_value(reading.utilization_percent),
+                )
+            };
+            let tooltip = format!(
+                "{}\nProvider: {}\nStatus: {}\nUtilization: {}",
+                reading.label,
+                reading.provider,
+                reading.status.detail(),
+                format_utilization_value(reading.utilization_percent)
+            );
+            (
+                temperature,
+                utilization,
+                temperature_color(reading.kind, reading.temperature_c, &reading.status),
+                if reading.utilization_percent.is_some() {
+                    egui::Color32::WHITE
+                } else {
+                    egui::Color32::GRAY
+                },
+                tooltip,
+            )
         } else {
-            format_temperature_value(reading.temperature_c)
+            (
+                "N/A".to_owned(),
+                "N/A".to_owned(),
+                egui::Color32::GRAY,
+                egui::Color32::GRAY,
+                "No sensor provider initialized".to_owned(),
+            )
         };
-        let tooltip = format!(
-            "{}\nProvider: {}\nStatus: {}",
-            reading.label,
-            reading.provider,
-            reading.status.detail()
-        );
-        (
-            value,
-            temperature_color(reading.kind, reading.temperature_c, &reading.status),
-            tooltip,
-        )
-    } else {
-        (
-            "N/A".to_owned(),
-            egui::Color32::GRAY,
-            "No sensor provider initialized".to_owned(),
-        )
-    };
 
     ui.horizontal(|ui| {
-        ui.set_min_width(132.0);
+        ui.set_min_width(188.0);
         ui.label(egui::RichText::new(label).monospace());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(egui::RichText::new(value).monospace().color(color))
-                .on_hover_text(tooltip);
+            ui.label(
+                egui::RichText::new(utilization)
+                    .monospace()
+                    .color(utilization_color),
+            )
+            .on_hover_text(tooltip.clone());
+            ui.add_space(12.0);
+            ui.label(
+                egui::RichText::new(temperature)
+                    .monospace()
+                    .color(temperature_color),
+            )
+            .on_hover_text(tooltip);
         });
     });
+}
+
+fn ui_large_back_button(ui: &mut egui::Ui) -> egui::Response {
+    ui.add(
+        egui::Button::new(egui::RichText::new("Back").size(20.0).strong())
+            .min_size(egui::vec2(104.0, 42.0)),
+    )
+}
+
+fn panel_content_log_heights(available_height: f32, log_fraction: f32, log_max: f32) -> (f32, f32) {
+    let fixed_height = SENSOR_BOX_RESERVED_HEIGHT + PANEL_VERTICAL_CHROME_HEIGHT;
+    let usable_height = (available_height - fixed_height).max(0.0);
+    if usable_height <= MIN_CONTENT_HEIGHT + MIN_LOG_HEIGHT {
+        let log_height = (usable_height * 0.34)
+            .clamp(40.0, MIN_LOG_HEIGHT)
+            .min(usable_height * 0.5);
+        return ((usable_height - log_height).max(40.0), log_height.max(32.0));
+    }
+
+    let log_height = (available_height * log_fraction)
+        .clamp(MIN_LOG_HEIGHT, log_max)
+        .min(usable_height - MIN_CONTENT_HEIGHT);
+    (usable_height - log_height, log_height)
+}
+
+fn ui_log_line(ui: &mut egui::Ui, line: &str) {
+    ui.label(egui::RichText::new(line).monospace().size(LOG_TEXT_SIZE));
 }
 
 fn result_header(ui: &mut egui::Ui, text: &str) {
@@ -6478,6 +7180,48 @@ fn device_type_label(value: wgpu::DeviceType) -> &'static str {
         wgpu::DeviceType::Cpu => "CPU/Software",
         wgpu::DeviceType::Other => "Other GPU",
     }
+}
+
+fn adapter_uses_shared_cpu_temperature(adapter: &AdapterInfo) -> bool {
+    if adapter.device_type == wgpu::DeviceType::IntegratedGpu {
+        return true;
+    }
+
+    let name = adapter.name.to_ascii_lowercase();
+    adapter.vendor == 0x8086
+        && (name.contains("xe")
+            || name.contains("iris")
+            || name.contains("uhd")
+            || name.contains("integrated")
+            || name.contains("graphics"))
+        || adapter.vendor == 0x1002
+            && (name.contains("radeon graphics")
+                || name.contains("vega")
+                || name.contains("apu")
+                || name.contains("integrated"))
+}
+
+fn configure_ui_style(ctx: &egui::Context) {
+    let mut style = (*ctx.global_style()).clone();
+    style
+        .text_styles
+        .insert(egui::TextStyle::Heading, egui::FontId::proportional(26.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Body, egui::FontId::proportional(17.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Button, egui::FontId::proportional(17.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Small, egui::FontId::proportional(14.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Monospace, egui::FontId::monospace(16.0));
+    style.spacing.button_padding = egui::vec2(14.0, 9.0);
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    style.spacing.interact_size = egui::vec2(44.0, 34.0);
+    ctx.set_global_style(style);
 }
 
 fn empty_to_unknown(value: &str) -> &str {
@@ -7039,5 +7783,115 @@ mod tests {
             temperature_color(SensorKind::Cpu, None, &SensorStatus::Unsupported),
             egui::Color32::GRAY
         );
+    }
+
+    #[test]
+    fn helper_snapshot_parser_reads_temperatures() {
+        let line = r#"{"timestampUtc":"2026-05-16T03:36:28Z","isElevated":false,"cpu":{"label":"CPU Package","temperatureC":63.5,"provider":"LibreHardwareMonitor","status":"ok","utilizationPercent":12.5},"gpu":{"label":"GPU Core","temperatureC":57.0,"provider":"LibreHardwareMonitor","status":"ok","utilizationPercent":84.0},"drive":{"label":"NVMe SSD","temperatureC":41.0,"provider":"LibreHardwareMonitor","status":"ok","utilizationPercent":6.0},"diagnostics":[]}"#;
+
+        let snapshot = parse_helper_snapshot(line).unwrap();
+
+        assert_eq!(sensor_temperature(snapshot.cpu.as_ref()), Some(63.5));
+        assert_eq!(sensor_temperature(snapshot.gpu.as_ref()), Some(57.0));
+        assert_eq!(sensor_temperature(snapshot.drive.as_ref()), Some(41.0));
+        assert_eq!(
+            snapshot
+                .gpu
+                .as_ref()
+                .and_then(|reading| reading.utilization_percent),
+            Some(84.0)
+        );
+        assert_eq!(snapshot.helper_elevated, Some(false));
+        assert_eq!(snapshot.cpu.unwrap().label, "CPU Package");
+    }
+
+    #[test]
+    fn helper_snapshot_parser_preserves_unsupported_status() {
+        let line = r#"{"timestampUtc":"2026-05-16T03:36:28Z","cpu":{"label":"CPU","provider":"LibreHardwareMonitor","status":"unsupported","message":"No CPU temperature sensor found"}}"#;
+
+        let snapshot = parse_helper_snapshot(line).unwrap();
+        let cpu = snapshot.cpu.unwrap();
+
+        assert_eq!(cpu.temperature_c, None);
+        assert_eq!(
+            cpu.status,
+            SensorStatus::Error("No CPU temperature sensor found".to_owned())
+        );
+    }
+
+    #[test]
+    fn helper_snapshot_requests_elevation_when_non_elevated_sensor_is_hidden() {
+        let line = r#"{"timestampUtc":"2026-05-16T03:36:28Z","isElevated":false,"cpu":{"label":"CPU","provider":"LibreHardwareMonitor","status":"unsupported","message":"No CPU temperature sensor found"}}"#;
+        let snapshot = parse_helper_snapshot(line).unwrap();
+
+        assert!(helper_snapshot_needs_elevation(&snapshot));
+    }
+
+    #[test]
+    fn merge_sensor_snapshots_uses_fallback_for_missing_helper_reading() {
+        let helper = parse_helper_snapshot(
+            r#"{"timestampUtc":"2026-05-16T03:36:28Z","isElevated":true,"gpu":{"label":"GPU","provider":"LibreHardwareMonitor","status":"unsupported","message":"No GPU temperature sensor found"}}"#,
+        )
+        .unwrap();
+        let fallback = SensorSnapshot {
+            cpu: None,
+            gpu: Some(SensorReading::ok(
+                SensorKind::Gpu,
+                "GPU",
+                61.0,
+                "NVML/nvidia-smi",
+            )),
+            drive: None,
+            helper_elevated: None,
+        };
+
+        let merged = merge_sensor_snapshots(Some(helper), Some(fallback)).unwrap();
+
+        assert_eq!(sensor_temperature(merged.gpu.as_ref()), Some(61.0));
+        assert!(merged.gpu.unwrap().provider.contains("NVML/nvidia-smi"));
+        assert_eq!(merged.helper_elevated, Some(true));
+    }
+
+    #[test]
+    fn integrated_gpu_fallback_uses_cpu_package_temperature() {
+        let snapshot = SensorSnapshot {
+            cpu: Some(SensorReading::ok(
+                SensorKind::Cpu,
+                "CPU Package",
+                54.0,
+                "LibreHardwareMonitor",
+            )),
+            gpu: Some(SensorReading {
+                kind: SensorKind::Gpu,
+                label: "Intel Xe Graphics".to_owned(),
+                temperature_c: None,
+                utilization_percent: Some(33.0),
+                provider: "LibreHardwareMonitor".to_owned(),
+                updated_at: Instant::now(),
+                status: SensorStatus::Ok,
+            }),
+            drive: None,
+            helper_elevated: Some(true),
+        };
+
+        let snapshot = apply_integrated_gpu_temperature_fallback(snapshot, true);
+        let gpu = snapshot.gpu.unwrap();
+
+        assert_eq!(gpu.temperature_c, Some(54.0));
+        assert_eq!(gpu.utilization_percent, Some(33.0));
+        assert_eq!(gpu.label, "iGPU shared CPU package");
+    }
+
+    #[test]
+    fn panel_height_split_keeps_sensor_space_visible() {
+        for available in [320.0, 480.0, 760.0] {
+            let (content, log) = panel_content_log_heights(available, 0.18, 150.0);
+            assert!(content >= 40.0);
+            assert!(log >= 32.0);
+            assert!(
+                content + log + SENSOR_BOX_RESERVED_HEIGHT + PANEL_VERTICAL_CHROME_HEIGHT
+                    <= available + 0.1
+            );
+        }
     }
 }

@@ -1,2 +1,6 @@
 /target
 __pycache__/
+.dotnet_home/
+.nuget/
+sensor-helper/bin/
+sensor-helper/obj/

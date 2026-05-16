@@ -163,9 +163,8 @@ Use one background polling thread owned by `SensorManager`.
 
 Polling interval:
 
-- Idle: every 2 seconds.
-- Benchmark running: every 500 milliseconds.
-- Back off to every 5 seconds after repeated provider errors.
+- Poll continuously at 1 Hz whether a benchmark is running or idle.
+- Back off to every 5 seconds after repeated provider errors if this becomes necessary later.
 
 The UI should never query hardware directly. It should only read the latest snapshot from an `Arc<RwLock<SensorSnapshot>>` or receive updates through an `mpsc` channel.
 
@@ -338,7 +337,7 @@ At start:
 
 During run:
 
-- Poll SSD temperature every 500 ms while the drive benchmark is active.
+- Reuse the continuous 1 Hz SSD polling stream while the drive benchmark is active.
 - Track max SSD temperature.
 
 At completion:
