@@ -151,7 +151,7 @@ impl BenchScopeApp {
                 egui::vec2(ui.available_width(), content_height),
                 egui::Layout::top_down(egui::Align::LEFT),
                 |ui| {
-                    egui::ScrollArea::vertical()
+                    egui::ScrollArea::both()
                         .id_salt("storage_health_content_scroll")
                         .auto_shrink([false, false])
                         .show(ui, |ui| {

@@ -3,6 +3,8 @@ enum AppView {
     MainMenu,
     MatrixBenchmark,
     MatrixStressTest,
+    GpuMemoryBenchmark,
+    AiTrainingBenchmark,
     DriveBenchmark,
     StorageHealth,
     RamTester,

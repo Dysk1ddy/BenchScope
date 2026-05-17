@@ -42,6 +42,30 @@ Run a small CPU/GPU smoke test:
 .\target\release\BenchScope.exe --self-test --size 64
 ```
 
+Run an AI training GPU smoke test:
+
+```powershell
+.\target\release\BenchScope.exe --ai-training-smoke-test
+.\target\release\BenchScope.exe --ai-training-smoke-test --ai-workload mlp
+.\target\release\BenchScope.exe --ai-training-smoke-test --ai-workload transformer
+.\target\release\BenchScope.exe --ai-training-smoke-test --ai-workload optimizer
+```
+
+Probe an optional PyTorch CUDA backend:
+
+```powershell
+.\target\release\BenchScope.exe --probe-pytorch-cuda
+.\target\release\BenchScope.exe --probe-pytorch-cuda --python C:\path\to\python.exe
+```
+
+Run the current PyTorch CUDA training smoke path:
+
+```powershell
+.\target\release\BenchScope.exe --ai-training-smoke-test --ai-training-backend pytorch-cuda --ai-workload linear
+.\target\release\BenchScope.exe --ai-training-smoke-test --ai-training-backend pytorch-cuda --ai-workload linear --python C:\path\to\python.exe
+.\target\release\BenchScope.exe --ai-training-smoke-test --ai-training-backend pytorch-cuda --ai-workload linear --cuda-device 1
+```
+
 Run a Memtest-style user-mode RAM test:
 
 ```powershell
@@ -94,6 +118,8 @@ Choose the GPU submission intensity used by self-test:
 - Correctness validation against CPU output, using sampled validation when the CPU estimate mode is enabled.
 - Cancelable single benchmark runs.
 - Matrix stress test tool with cancelable 1-minute, 5-minute, or infinite CPU/GPU repeat runs.
+- GPU Memory Bandwidth tool with separate internal read/write, GPU buffer copy, CPU-to-GPU upload, GPU-to-CPU readback, and optional round-trip transfer tests.
+- AI Training GPU Benchmark tool with linear-layer, MLP, transformer-proxy, and optimizer-stress workloads reporting FLOPs, throughput, latency, estimated tensor memory, timestamp-query compute timing, and smoke-test validation for the linear reference path.
 - Separate CPU and GPU progress bars with roughly 5Hz progress sampling and an estimated time remaining during single benchmark runs.
 - Large GPU runs report real chunk/block progress so the progress bar keeps moving through long matrix computations.
 - GPU matrices that exceed an adapter's storage-buffer binding limit use intensity-controlled legal row/column blocks instead of binding the whole matrix at once.

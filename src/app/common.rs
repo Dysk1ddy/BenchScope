@@ -97,6 +97,10 @@ fn load_startup_data(tx: &Sender<StartupEvent>) -> StartupData {
     let network = NetworkDiagnosticState::new();
     startup_progress(tx, 0.95, "Preparing device information viewer");
     let device_info = DeviceInfoState::new();
+    startup_progress(tx, 0.97, "Preparing AI training benchmark");
+    let ai_training = AiTrainingBenchmarkState::new();
+    startup_progress(tx, 0.975, "Preparing GPU memory benchmark");
+    let gpu_memory = GpuMemoryBenchmarkState::new();
     startup_progress(tx, 0.98, "Starting safe sensor sampler");
 
     StartupData {
@@ -108,6 +112,8 @@ fn load_startup_data(tx: &Sender<StartupEvent>) -> StartupData {
         battery,
         network,
         device_info,
+        ai_training,
+        gpu_memory,
     }
 }
 
@@ -129,6 +135,8 @@ impl BenchScopeApp {
             battery,
             network,
             device_info,
+            ai_training,
+            gpu_memory,
         } = data;
         let (tx, rx) = mpsc::channel();
         let selected_adapter = adapters
@@ -140,6 +148,7 @@ impl BenchScopeApp {
         )));
         let mut app = Self {
             view: AppView::MainMenu,
+            main_menu_category: None,
             adapters,
             cpu_info,
             selected_adapter,
@@ -168,7 +177,11 @@ impl BenchScopeApp {
             ram_back_confirm: false,
             battery_back_confirm: false,
             network_back_confirm: false,
+            ai_training_back_confirm: false,
+            gpu_memory_back_confirm: false,
             device_info,
+            ai_training,
+            gpu_memory,
             drive,
             storage_health_back_confirm: false,
             storage_health,
@@ -257,12 +270,19 @@ impl BenchScopeApp {
         snapshot: &'a SensorSnapshot,
     ) -> Option<Vec<(&'static str, Option<&'a SensorReading>)>> {
         let rows = match self.view {
-            AppView::MatrixBenchmark | AppView::MatrixStressTest => {
+            AppView::MatrixBenchmark
+            | AppView::MatrixStressTest
+            | AppView::AiTrainingBenchmark => {
                 vec![
                     ("CPU", snapshot.cpu.as_ref()),
                     ("GPU", snapshot.gpu.as_ref()),
                 ]
             }
+            AppView::GpuMemoryBenchmark => vec![
+                ("GPU", snapshot.gpu.as_ref()),
+                ("VRAM", snapshot.gpu_memory.as_ref()),
+                ("CPU", snapshot.cpu.as_ref()),
+            ],
             AppView::DriveBenchmark | AppView::StorageHealth => {
                 vec![("SSD", snapshot.drive.as_ref())]
             }
@@ -301,7 +321,7 @@ impl BenchScopeApp {
 
         egui::Window::new("Sensors")
             .id(egui::Id::new("sensor_metrics_window"))
-            .default_pos(egui::pos2(620.0, 118.0))
+            .default_pos(sensor_window_default_pos(ctx))
             .default_size(egui::vec2(
                 SENSOR_WINDOW_DEFAULT_WIDTH,
                 SENSOR_WINDOW_DEFAULT_HEIGHT,
@@ -324,13 +344,7 @@ impl BenchScopeApp {
                     });
                 });
                 ui.separator();
-                egui::ScrollArea::both()
-                    .id_salt("sensor_metrics_window_scroll")
-                    .auto_shrink([false, false])
-                    .max_height(ui.available_height().max(80.0))
-                    .show(ui, |ui| {
-                        ui_sensor_table(ui, &rows);
-                    });
+                ui_sensor_table(ui, &rows);
             });
     }
 }
@@ -346,4 +360,12 @@ fn sensor_minimized_label(rows: &[(&str, Option<&SensorReading>)]) -> String {
     } else {
         format!("Sensors: {labels}")
     }
+}
+
+fn sensor_window_default_pos(ctx: &egui::Context) -> egui::Pos2 {
+    let rect = ctx.content_rect();
+    egui::pos2(
+        (rect.right() - SENSOR_WINDOW_DEFAULT_WIDTH).max(rect.left()),
+        (rect.bottom() - SENSOR_WINDOW_DEFAULT_HEIGHT).max(rect.top()),
+    )
 }

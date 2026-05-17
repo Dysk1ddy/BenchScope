@@ -72,12 +72,83 @@ fn open_drive_file_direct_preferred(
     }
 }
 
+struct DriveBenchmarkTempFile {
+    path: PathBuf,
+    cleanup_needed: bool,
+}
+
+impl DriveBenchmarkTempFile {
+    fn create(target_folder: &PathBuf) -> Result<Self> {
+        let timestamp_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let process_id = std::process::id();
+
+        for attempt in 0..128_u16 {
+            let file_name = format!(
+                "{DRIVE_BENCHMARK_FILE_PREFIX}-{process_id}-{timestamp_ns}-{attempt}.{DRIVE_BENCHMARK_FILE_EXTENSION}"
+            );
+            let path = target_folder.join(file_name);
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(_) => {
+                    return Ok(Self {
+                        path,
+                        cleanup_needed: true,
+                    });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("failed to reserve benchmark file {}", path.display())
+                    });
+                }
+            }
+        }
+
+        Err(anyhow!(
+            "failed to reserve a unique benchmark file in {}",
+            target_folder.display()
+        ))
+    }
+
+    fn path(&self) -> &PathBuf {
+        &self.path
+    }
+
+    fn cleanup(&mut self, tx: &Sender<DriveWorkerEvent>) {
+        if !self.cleanup_needed {
+            return;
+        }
+        match fs::remove_file(&self.path) {
+            Ok(()) => {
+                self.cleanup_needed = false;
+            }
+            Err(err) => {
+                let _ = tx.send(DriveWorkerEvent::Log(format!(
+                    "Could not delete temporary benchmark file {}: {err}",
+                    self.path.display()
+                )));
+            }
+        }
+    }
+}
+
+impl Drop for DriveBenchmarkTempFile {
+    fn drop(&mut self) {
+        if self.cleanup_needed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 fn run_drive_benchmark(
     config: DriveBenchmarkConfig,
     cancel: Arc<AtomicBool>,
     tx: Sender<DriveWorkerEvent>,
 ) -> Result<Vec<DriveBenchmarkResult>> {
-    let test_path = config.target_folder.join(DRIVE_BENCHMARK_FILE_NAME);
+    let mut temp_file = DriveBenchmarkTempFile::create(&config.target_folder)?;
+    let test_path = temp_file.path().clone();
     let _ = tx.send(DriveWorkerEvent::Log(format!(
         "Using direct file I/O when available, with cached fallback."
     )));
@@ -117,12 +188,7 @@ fn run_drive_benchmark(
         results.push(result);
     }
 
-    if let Err(err) = fs::remove_file(&test_path) {
-        let _ = tx.send(DriveWorkerEvent::Log(format!(
-            "Could not delete temporary benchmark file {}: {err}",
-            test_path.display()
-        )));
-    }
+    temp_file.cleanup(&tx);
 
     Ok(results)
 }
@@ -138,12 +204,12 @@ fn prepare_drive_benchmark_file(
         "Drive benchmark canceled during file preparation",
     )?;
     let mut file = OpenOptions::new()
-        .create(true)
+        .create(false)
         .read(true)
         .write(true)
         .truncate(true)
         .open(path)
-        .with_context(|| format!("failed to create benchmark file {}", path.display()))?;
+        .with_context(|| format!("failed to open benchmark file {}", path.display()))?;
     file.set_len(file_size_bytes)
         .with_context(|| format!("failed to size benchmark file {}", path.display()))?;
 
@@ -268,7 +334,7 @@ fn run_sequential_drive_write(
     cancel: &AtomicBool,
     tx: &Sender<DriveWorkerEvent>,
 ) -> Result<DriveBenchmarkResult> {
-    let opened = open_drive_file_direct_preferred(path, true, true, true, false, true)?;
+    let opened = open_drive_file_direct_preferred(path, true, true, false, false, true)?;
     let mut file = opened.file;
     let mut notes = Vec::new();
     if let Some(note) = opened.fallback_note {
@@ -447,8 +513,7 @@ fn run_random_drive_test(
     tx: &Sender<DriveWorkerEvent>,
     write_mode: bool,
 ) -> Result<DriveBenchmarkResult> {
-    let opened =
-        open_drive_file_direct_preferred(path, true, write_mode, write_mode, false, false)?;
+    let opened = open_drive_file_direct_preferred(path, true, write_mode, false, false, false)?;
     let mut file = opened.file;
     let mut notes = Vec::new();
     if let Some(note) = opened.fallback_note {

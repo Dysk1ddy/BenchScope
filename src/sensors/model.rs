@@ -2,6 +2,7 @@
 enum SensorKind {
     Cpu,
     Gpu,
+    GpuMemory,
     Drive,
     Memory,
 }
@@ -11,6 +12,7 @@ impl SensorKind {
         match self {
             SensorKind::Cpu => 85.0,
             SensorKind::Gpu => 80.0,
+            SensorKind::GpuMemory => 90.0,
             SensorKind::Drive => 60.0,
             SensorKind::Memory => 70.0,
         }
@@ -20,6 +22,7 @@ impl SensorKind {
         match self {
             SensorKind::Cpu => 95.0,
             SensorKind::Gpu => 90.0,
+            SensorKind::GpuMemory => 100.0,
             SensorKind::Drive => 70.0,
             SensorKind::Memory => 85.0,
         }
@@ -53,26 +56,18 @@ impl SensorStatus {
 enum SensorMetricKind {
     Temperature,
     Utilization,
+    MemoryUsage,
     Voltage,
     Power,
     Clock,
 }
 
 impl SensorMetricKind {
-    fn group_label(self) -> &'static str {
-        match self {
-            SensorMetricKind::Temperature => "Temperatures",
-            SensorMetricKind::Utilization => "Utilization",
-            SensorMetricKind::Voltage => "Voltages",
-            SensorMetricKind::Power => "Powers",
-            SensorMetricKind::Clock => "Clocks",
-        }
-    }
-
     fn default_label(self) -> &'static str {
         match self {
             SensorMetricKind::Temperature => "Temperature",
             SensorMetricKind::Utilization => "Utilization",
+            SensorMetricKind::MemoryUsage => "VRAM Used",
             SensorMetricKind::Voltage => "Voltage",
             SensorMetricKind::Power => "Power",
             SensorMetricKind::Clock => "Clock",
@@ -251,7 +246,9 @@ fn sensor_metric_slots_match(left: &SensorMetric, right: &SensorMetric) -> bool 
     left.label.eq_ignore_ascii_case(&right.label)
         || (matches!(
             left.kind,
-            SensorMetricKind::Temperature | SensorMetricKind::Utilization
+            SensorMetricKind::Temperature
+                | SensorMetricKind::Utilization
+                | SensorMetricKind::MemoryUsage
         ) && (sensor_metric_label_is_generic(&left.label)
             || sensor_metric_label_is_generic(&right.label)))
 }
@@ -262,11 +259,16 @@ fn sensor_metric_label_is_generic(label: &str) -> bool {
         label.as_str(),
         "" | "cpu"
             | "gpu"
+            | "vram"
+            | "gpu memory"
             | "ssd"
             | "ram"
             | "temperature"
             | "temperatures"
             | "utilization"
+            | "memory usage"
+            | "vram used"
+            | "used"
             | "load"
             | "loads"
             | "voltage"
@@ -282,6 +284,7 @@ fn sensor_metric_label_is_generic(label: &str) -> bool {
 struct SensorSnapshot {
     cpu: Option<SensorReading>,
     gpu: Option<SensorReading>,
+    gpu_memory: Option<SensorReading>,
     drive: Option<SensorReading>,
     memory: Option<SensorReading>,
     helper_elevated: Option<bool>,
@@ -293,6 +296,7 @@ impl SensorSnapshot {
         Self {
             cpu: stale_checked_reading(self.cpu.clone(), now, stale_after),
             gpu: stale_checked_reading(self.gpu.clone(), now, stale_after),
+            gpu_memory: stale_checked_reading(self.gpu_memory.clone(), now, stale_after),
             drive: stale_checked_reading(self.drive.clone(), now, stale_after),
             memory: stale_checked_reading(self.memory.clone(), now, stale_after),
             helper_elevated: self.helper_elevated,
@@ -302,6 +306,10 @@ impl SensorSnapshot {
     fn with_tracked_metric_ranges(mut self, previous: Option<&SensorSnapshot>) -> Self {
         track_reading_metric_ranges(&mut self.cpu, previous.and_then(|snapshot| snapshot.cpu.as_ref()));
         track_reading_metric_ranges(&mut self.gpu, previous.and_then(|snapshot| snapshot.gpu.as_ref()));
+        track_reading_metric_ranges(
+            &mut self.gpu_memory,
+            previous.and_then(|snapshot| snapshot.gpu_memory.as_ref()),
+        );
         track_reading_metric_ranges(
             &mut self.drive,
             previous.and_then(|snapshot| snapshot.drive.as_ref()),
@@ -428,6 +436,34 @@ struct TemperatureRunReport {
     drive: TemperatureSummary,
 }
 
+fn drain_sensor_bridge_receiver(
+    rx: &mut Option<Receiver<SensorSnapshot>>,
+    snapshot: &mut Option<SensorSnapshot>,
+) -> bool {
+    let mut disconnected = false;
+    if let Some(receiver) = rx.as_ref() {
+        loop {
+            match receiver.try_recv() {
+                Ok(next_snapshot) => {
+                    *snapshot = Some(next_snapshot);
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if disconnected {
+        *rx = None;
+        *snapshot = None;
+    }
+
+    disconnected
+}
+
 struct SensorManager {
     latest: Arc<RwLock<SensorSnapshot>>,
     target_drive_letter: Arc<RwLock<Option<char>>>,
@@ -454,19 +490,22 @@ impl SensorManager {
             .name("benchscope-sensors".to_owned())
             .spawn(move || {
                 let mut service_rx: Option<Receiver<SensorSnapshot>> = None;
-                let mut service_start_attempted = false;
                 let mut service_snapshot: Option<SensorSnapshot> = None;
                 let mut helper_rx: Option<Receiver<SensorSnapshot>> = None;
-                let mut helper_start_attempted = false;
                 let mut helper_snapshot: Option<SensorSnapshot> = None;
+                let mut next_service_start = Instant::now();
+                let mut next_helper_start = Instant::now();
                 while !thread_shutdown.load(Ordering::Relaxed) {
-                    if service_rx.is_none() && !service_start_attempted && service_enabled {
+                    let now = Instant::now();
+                    if service_rx.is_none() && service_enabled && now >= next_service_start {
                         service_rx = start_sensor_service_reader();
-                        service_start_attempted = true;
+                        next_service_start =
+                            now + Duration::from_millis(SENSOR_BRIDGE_RESTART_BACKOFF_MS);
                     }
-                    if helper_rx.is_none() && !helper_start_attempted && helper_enabled {
+                    if helper_rx.is_none() && helper_enabled && now >= next_helper_start {
                         helper_rx = start_sensor_helper_reader();
-                        helper_start_attempted = true;
+                        next_helper_start =
+                            now + Duration::from_millis(SENSOR_BRIDGE_RESTART_BACKOFF_MS);
                     }
                     let drive_letter = thread_target_drive_letter
                         .read()
@@ -474,25 +513,28 @@ impl SensorManager {
                         .unwrap_or(None);
                     let use_shared_gpu_temperature =
                         thread_target_gpu_uses_shared_cpu_temperature.load(Ordering::Relaxed);
-                    if let Some(helper_rx) = &helper_rx {
-                        while let Ok(snapshot) = helper_rx.try_recv() {
-                            helper_snapshot = Some(snapshot);
-                        }
+                    if drain_sensor_bridge_receiver(&mut helper_rx, &mut helper_snapshot) {
+                        next_helper_start =
+                            Instant::now() + Duration::from_millis(SENSOR_BRIDGE_RESTART_BACKOFF_MS);
                     }
-                    if let Some(service_rx) = &service_rx {
-                        while let Ok(snapshot) = service_rx.try_recv() {
-                            service_snapshot = Some(snapshot);
-                        }
+                    if drain_sensor_bridge_receiver(&mut service_rx, &mut service_snapshot) {
+                        next_service_start =
+                            Instant::now() + Duration::from_millis(SENSOR_BRIDGE_RESTART_BACKOFF_MS);
                     }
 
                     let primary_snapshot =
                         merge_sensor_snapshots(service_snapshot.clone(), helper_snapshot.clone());
+                    let snapshot_now = Instant::now();
                     let fallback_snapshot = primary_snapshot.as_ref().and_then(|snapshot| {
-                        helper_snapshot_has_gaps(snapshot)
+                        sensor_snapshot_needs_fallback(snapshot, snapshot_now)
                             .then(|| collect_sensor_snapshot(drive_letter))
                     });
-                    let snapshot = merge_sensor_snapshots(primary_snapshot, fallback_snapshot)
-                        .unwrap_or_else(|| collect_sensor_snapshot(drive_letter));
+                    let snapshot = merge_sensor_snapshots_prefer_fresh(
+                        primary_snapshot,
+                        fallback_snapshot,
+                        snapshot_now,
+                    )
+                    .unwrap_or_else(|| collect_sensor_snapshot(drive_letter));
                     let snapshot = apply_integrated_gpu_temperature_fallback(
                         snapshot,
                         use_shared_gpu_temperature,

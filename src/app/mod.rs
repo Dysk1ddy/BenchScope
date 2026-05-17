@@ -19,6 +19,8 @@ struct StartupData {
     battery: BatteryDiagnosticState,
     network: NetworkDiagnosticState,
     device_info: DeviceInfoState,
+    ai_training: AiTrainingBenchmarkState,
+    gpu_memory: GpuMemoryBenchmarkState,
 }
 
 struct BenchScopeRoot {
@@ -30,6 +32,7 @@ struct BenchScopeRoot {
 
 struct BenchScopeApp {
     view: AppView,
+    main_menu_category: Option<MenuCategory>,
     adapters: Vec<AdapterInfo>,
     cpu_info: CpuInfo,
     selected_adapter: usize,
@@ -58,6 +61,8 @@ struct BenchScopeApp {
     ram_back_confirm: bool,
     battery_back_confirm: bool,
     network_back_confirm: bool,
+    ai_training_back_confirm: bool,
+    gpu_memory_back_confirm: bool,
     device_info: DeviceInfoState,
     drive: DriveBenchmarkState,
     storage_health_back_confirm: bool,
@@ -65,6 +70,8 @@ struct BenchScopeApp {
     ram: RamTestState,
     battery: BatteryDiagnosticState,
     network: NetworkDiagnosticState,
+    ai_training: AiTrainingBenchmarkState,
+    gpu_memory: GpuMemoryBenchmarkState,
     sensors: SensorManager,
     temperature_run: Option<TemperatureRunTracker>,
     sensor_window_minimized: bool,

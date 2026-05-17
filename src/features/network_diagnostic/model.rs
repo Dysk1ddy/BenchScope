@@ -363,6 +363,10 @@ impl NetworkDiagnosticState {
             .unwrap_or(0);
     }
 
+    fn update_adapter_snapshot(&mut self, snapshot: NetworkAdapterSnapshot) {
+        self.selected_adapter = upsert_network_adapter_snapshot(&mut self.adapters, snapshot);
+    }
+
     fn refresh_adapters(&mut self) {
         match detect_network_adapters() {
             Ok(adapters) => {
@@ -545,8 +549,7 @@ impl NetworkDiagnosticState {
                     self.cancel = None;
                     match result {
                         Ok(result) => {
-                            self.replace_adapters(vec![result.snapshot.clone()]);
-                            self.selected_adapter = 0;
+                            self.update_adapter_snapshot(result.snapshot.clone());
                             self.probe_results = result.probes;
                             self.findings = result.findings;
                             self.progress = 1.0;
@@ -592,8 +595,7 @@ impl NetworkDiagnosticState {
                     }
                 }
                 NetworkWorkerEvent::MonitorSample(sample) => {
-                    self.replace_adapters(vec![sample.snapshot.clone()]);
-                    self.selected_adapter = 0;
+                    self.update_adapter_snapshot(sample.snapshot.clone());
                     self.push_signal_sample(sample.signal);
                     if let Some(probe) = sample.gateway_probe {
                         self.probe_results.push(probe);
@@ -622,5 +624,21 @@ impl NetworkDiagnosticState {
                 NetworkWorkerEvent::Log(message) => self.log(message),
             }
         }
+    }
+}
+
+fn upsert_network_adapter_snapshot(
+    adapters: &mut Vec<NetworkAdapterSnapshot>,
+    snapshot: NetworkAdapterSnapshot,
+) -> usize {
+    if let Some(index) = adapters
+        .iter()
+        .position(|adapter| adapter.id == snapshot.id)
+    {
+        adapters[index] = snapshot;
+        index
+    } else {
+        adapters.push(snapshot);
+        adapters.len() - 1
     }
 }

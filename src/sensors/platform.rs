@@ -50,7 +50,12 @@ fn restart_app_as_admin() -> Result<()> {
         "-Command",
         script.as_str(),
     ];
-    run_command_no_window("powershell", &command_args).map(|_| ())
+    run_command_no_window_timeout(
+        "powershell",
+        &command_args,
+        Duration::from_millis(ELEVATION_COMMAND_TIMEOUT_MS),
+    )
+    .map(|_| ())
 }
 
 #[cfg(not(windows))]
@@ -133,6 +138,7 @@ fn helper_snapshot_needs_elevation(snapshot: &SensorSnapshot) -> bool {
         && [
             snapshot.cpu.as_ref(),
             snapshot.gpu.as_ref(),
+            snapshot.gpu_memory.as_ref(),
             snapshot.drive.as_ref(),
             snapshot.memory.as_ref(),
         ]
@@ -153,11 +159,35 @@ fn helper_snapshot_has_gaps(snapshot: &SensorSnapshot) -> bool {
         || sensor_reading_has_gap(snapshot.memory.as_ref())
 }
 
+fn sensor_snapshot_needs_fallback(snapshot: &SensorSnapshot, now: Instant) -> bool {
+    helper_snapshot_has_gaps(snapshot) || sensor_snapshot_has_stale_data(snapshot, now)
+}
+
+fn sensor_snapshot_has_stale_data(snapshot: &SensorSnapshot, now: Instant) -> bool {
+    [
+        snapshot.cpu.as_ref(),
+        snapshot.gpu.as_ref(),
+        snapshot.gpu_memory.as_ref(),
+        snapshot.drive.as_ref(),
+        snapshot.memory.as_ref(),
+    ]
+    .into_iter()
+    .any(|reading| sensor_reading_is_stale(reading, now))
+}
+
 fn sensor_reading_has_gap(reading: Option<&SensorReading>) -> bool {
     match reading {
         Some(reading) => !reading.has_temperature() || !reading.has_utilization(),
         None => true,
     }
+}
+
+fn sensor_reading_is_stale(reading: Option<&SensorReading>, now: Instant) -> bool {
+    reading.is_some_and(|reading| {
+        reading.has_any_value()
+            && now.saturating_duration_since(reading.updated_at)
+                > Duration::from_millis(SENSOR_STALE_AFTER_MS)
+    })
 }
 
 fn merge_sensor_snapshots(
@@ -168,8 +198,33 @@ fn merge_sensor_snapshots(
         (Some(primary), Some(fallback)) => Some(SensorSnapshot {
             cpu: prefer_sensor_reading(primary.cpu, fallback.cpu),
             gpu: prefer_sensor_reading(primary.gpu, fallback.gpu),
+            gpu_memory: prefer_sensor_reading(primary.gpu_memory, fallback.gpu_memory),
             drive: prefer_sensor_reading(primary.drive, fallback.drive),
             memory: prefer_sensor_reading(primary.memory, fallback.memory),
+            helper_elevated: primary.helper_elevated,
+        }),
+        (Some(primary), None) => Some(primary),
+        (None, Some(fallback)) => Some(fallback),
+        (None, None) => None,
+    }
+}
+
+fn merge_sensor_snapshots_prefer_fresh(
+    primary: Option<SensorSnapshot>,
+    fallback: Option<SensorSnapshot>,
+    now: Instant,
+) -> Option<SensorSnapshot> {
+    match (primary, fallback) {
+        (Some(primary), Some(fallback)) => Some(SensorSnapshot {
+            cpu: prefer_sensor_reading_prefer_fresh(primary.cpu, fallback.cpu, now),
+            gpu: prefer_sensor_reading_prefer_fresh(primary.gpu, fallback.gpu, now),
+            gpu_memory: prefer_sensor_reading_prefer_fresh(
+                primary.gpu_memory,
+                fallback.gpu_memory,
+                now,
+            ),
+            drive: prefer_sensor_reading_prefer_fresh(primary.drive, fallback.drive, now),
+            memory: prefer_sensor_reading_prefer_fresh(primary.memory, fallback.memory, now),
             helper_elevated: primary.helper_elevated,
         }),
         (Some(primary), None) => Some(primary),
@@ -183,6 +238,23 @@ fn prefer_sensor_reading(
     fallback: Option<SensorReading>,
 ) -> Option<SensorReading> {
     match (primary, fallback) {
+        (Some(primary), Some(fallback)) => Some(merge_sensor_reading(primary, fallback)),
+        (Some(primary), None) => Some(primary),
+        (None, fallback) => fallback,
+    }
+}
+
+fn prefer_sensor_reading_prefer_fresh(
+    primary: Option<SensorReading>,
+    fallback: Option<SensorReading>,
+    now: Instant,
+) -> Option<SensorReading> {
+    match (primary, fallback) {
+        (Some(primary), Some(fallback))
+            if sensor_reading_is_stale(Some(&primary), now) && fallback.has_any_value() =>
+        {
+            Some(fallback)
+        }
         (Some(primary), Some(fallback)) => Some(merge_sensor_reading(primary, fallback)),
         (Some(primary), None) => Some(primary),
         (None, fallback) => fallback,
@@ -334,6 +406,8 @@ fn parse_helper_snapshot(line: &str) -> Option<SensorSnapshot> {
     Some(SensorSnapshot {
         cpu: parse_helper_reading(line, "cpu", SensorKind::Cpu, "CPU"),
         gpu: parse_helper_reading(line, "gpu", SensorKind::Gpu, "GPU"),
+        gpu_memory: parse_helper_reading(line, "gpuMemory", SensorKind::GpuMemory, "VRAM")
+            .or_else(|| parse_helper_reading(line, "vram", SensorKind::GpuMemory, "VRAM")),
         drive: parse_helper_reading(line, "drive", SensorKind::Drive, "SSD"),
         memory: parse_helper_reading(line, "memory", SensorKind::Memory, "RAM"),
         helper_elevated: json_bool_for_key(line, "isElevated"),
@@ -410,6 +484,9 @@ fn sensor_metric_kind_from_json(value: &str) -> Option<SensorMetricKind> {
         "temperature" | "temperatures" | "temp" => Some(SensorMetricKind::Temperature),
         "utilization" | "utilisation" | "load" | "loads" | "usage" => {
             Some(SensorMetricKind::Utilization)
+        }
+        "memoryusage" | "memory_usage" | "vram" | "vramusage" | "vram_usage" => {
+            Some(SensorMetricKind::MemoryUsage)
         }
         "voltage" | "voltages" | "volt" | "volts" => Some(SensorMetricKind::Voltage),
         "power" | "powers" | "watt" | "watts" => Some(SensorMetricKind::Power),
@@ -657,7 +734,7 @@ fn sensor_temperature(reading: Option<&SensorReading>) -> Option<f32> {
 }
 
 fn collect_sensor_snapshot(drive_letter: Option<char>) -> SensorSnapshot {
-    let (cpu, gpu, drive, memory) = thread::scope(|scope| {
+    let (cpu, gpu, gpu_memory, drive, memory) = thread::scope(|scope| {
         let cpu = scope.spawn(|| {
             let mut cpu = query_cpu_temperature();
             attach_utilization(
@@ -678,6 +755,7 @@ fn collect_sensor_snapshot(drive_letter: Option<char>) -> SensorSnapshot {
             );
             gpu
         });
+        let gpu_memory = scope.spawn(query_gpu_memory_sensor);
         let drive = scope.spawn(|| {
             let mut drive = query_drive_temperature(drive_letter);
             drive.utilization_percent = query_drive_utilization(drive_letter);
@@ -702,6 +780,14 @@ fn collect_sensor_snapshot(drive_letter: Option<char>) -> SensorSnapshot {
                     SensorStatus::Error("GPU sensor worker panicked".to_owned()),
                 )
             }),
+            gpu_memory.join().unwrap_or_else(|_| {
+                SensorReading::unavailable(
+                    SensorKind::GpuMemory,
+                    "VRAM",
+                    "NVML/nvidia-smi",
+                    SensorStatus::Error("VRAM sensor worker panicked".to_owned()),
+                )
+            }),
             drive.join().unwrap_or_else(|_| {
                 SensorReading::unavailable(
                     SensorKind::Drive,
@@ -724,6 +810,7 @@ fn collect_sensor_snapshot(drive_letter: Option<char>) -> SensorSnapshot {
     SensorSnapshot {
         cpu: Some(cpu),
         gpu: Some(gpu),
+        gpu_memory: Some(gpu_memory),
         drive: Some(drive),
         memory: Some(memory),
         helper_elevated: None,
@@ -827,6 +914,92 @@ fn query_gpu_temperature() -> SensorReading {
             SensorStatus::Unsupported,
         )
     }
+}
+
+fn query_gpu_memory_sensor() -> SensorReading {
+    #[cfg(windows)]
+    {
+        match run_nvidia_smi_gpu_memory_query() {
+            Ok(output) => parse_nvidia_smi_gpu_memory_reading(&output).unwrap_or_else(|| {
+                SensorReading::unavailable(
+                    SensorKind::GpuMemory,
+                    "VRAM",
+                    "NVML/nvidia-smi",
+                    SensorStatus::Unsupported,
+                )
+            }),
+            Err(err) => SensorReading::unavailable(
+                SensorKind::GpuMemory,
+                "VRAM",
+                "NVML/nvidia-smi",
+                sensor_error_status(err),
+            ),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        SensorReading::unavailable(
+            SensorKind::GpuMemory,
+            "VRAM",
+            "Windows sensors",
+            SensorStatus::Unsupported,
+        )
+    }
+}
+
+fn parse_nvidia_smi_gpu_memory_reading(output: &str) -> Option<SensorReading> {
+    let line = output.lines().find(|line| !line.trim().is_empty())?;
+    let columns = line.split(',').map(str::trim).collect::<Vec<_>>();
+    let has_temperature_column = columns.len() >= 4;
+    let temperature_c = has_temperature_column
+        .then(|| columns.get(1).and_then(|value| parse_metric_number(value)))
+        .flatten()
+        .filter(|value| (-40.0..=130.0).contains(value));
+    let used_mib_column = if has_temperature_column { 2 } else { 1 };
+    let total_mib_column = if has_temperature_column { 3 } else { 2 };
+    let used_gb = columns
+        .get(used_mib_column)
+        .and_then(|value| parse_metric_number(value))
+        .map(mib_to_gb);
+    let total_gb = columns
+        .get(total_mib_column)
+        .and_then(|value| parse_metric_number(value))
+        .map(mib_to_gb)
+        .filter(|value| *value > 0.0);
+    if temperature_c.is_none() && used_gb.is_none() {
+        return None;
+    }
+
+    let mut metrics = Vec::new();
+    if let Some(value) = temperature_c {
+        metrics.push(SensorMetric::new(
+            SensorMetricKind::Temperature,
+            "VRAM",
+            Some(value),
+        ));
+    }
+    if let Some(value) = used_gb {
+        metrics.push(SensorMetric::new(
+            SensorMetricKind::MemoryUsage,
+            SensorMetricKind::MemoryUsage.default_label(),
+            Some(value),
+        )
+        .with_range(None, total_gb));
+    }
+
+    let mut reading = SensorReading {
+        kind: SensorKind::GpuMemory,
+        label: "VRAM".to_owned(),
+        temperature_c,
+        utilization_percent: None,
+        metrics,
+        provider: "NVML/nvidia-smi".to_owned(),
+        updated_at: Instant::now(),
+        status: SensorStatus::Ok,
+    };
+    reading.sync_legacy_metrics();
+    Some(reading)
 }
 
 #[cfg(windows)]
@@ -1130,6 +1303,18 @@ fn parse_first_utilization(output: &str) -> Option<f32> {
         .map(clamp_percent)
 }
 
+fn parse_metric_number(value: &str) -> Option<f32> {
+    value
+        .split(|ch: char| !(ch.is_ascii_digit() || ch == '.' || ch == '-'))
+        .filter(|token| !token.is_empty())
+        .filter_map(|token| token.parse::<f32>().ok())
+        .find(|value| value.is_finite())
+}
+
+fn mib_to_gb(value: f32) -> f32 {
+    ((value / 1024.0) * 10.0).round() / 10.0
+}
+
 fn clamp_percent(value: f32) -> f32 {
     (value.clamp(0.0, 100.0) * 10.0).round() / 10.0
 }
@@ -1172,13 +1357,32 @@ fn run_nvidia_smi_temperature_query() -> Result<String> {
         "--format=csv,noheader,nounits",
     ];
 
-    match run_command_no_window("nvidia-smi", NVIDIA_SMI_ARGS) {
+    run_nvidia_smi_query(NVIDIA_SMI_ARGS)
+}
+
+#[cfg(windows)]
+fn run_nvidia_smi_gpu_memory_query() -> Result<String> {
+    const NVIDIA_SMI_MEMORY_ARGS: &[&str] = &[
+        "--query-gpu=name,temperature.memory,memory.used,memory.total",
+        "--format=csv,noheader,nounits",
+    ];
+    const NVIDIA_SMI_MEMORY_FALLBACK_ARGS: &[&str] = &[
+        "--query-gpu=name,memory.used,memory.total",
+        "--format=csv,noheader,nounits",
+    ];
+
+    run_nvidia_smi_query(NVIDIA_SMI_MEMORY_ARGS)
+        .or_else(|_| run_nvidia_smi_query(NVIDIA_SMI_MEMORY_FALLBACK_ARGS))
+}
+
+#[cfg(windows)]
+fn run_nvidia_smi_query(args: &[&str]) -> Result<String> {
+    match run_command_no_window("nvidia-smi", args) {
         Ok(output) => Ok(output),
         Err(path_err) => {
             for fallback in nvidia_smi_fallback_paths() {
                 if fallback.is_file() {
-                    if let Ok(output) =
-                        run_command_no_window(&fallback.display().to_string(), NVIDIA_SMI_ARGS)
+                    if let Ok(output) = run_command_no_window(&fallback.display().to_string(), args)
                     {
                         return Ok(output);
                     }
@@ -1205,11 +1409,50 @@ fn nvidia_smi_fallback_paths() -> Vec<PathBuf> {
 
 #[cfg(windows)]
 fn run_command_no_window(program: &str, args: &[&str]) -> Result<String> {
-    let output = Command::new(program)
+    run_command_no_window_timeout(
+        program,
+        args,
+        Duration::from_millis(SENSOR_COMMAND_TIMEOUT_MS),
+    )
+}
+
+#[cfg(windows)]
+fn run_command_no_window_timeout(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String> {
+    let mut child = Command::new(program)
         .args(args)
         .creation_flags(CREATE_NO_WINDOW_RAW)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .with_context(|| format!("failed to start {program}"))?;
+    let started = Instant::now();
+    loop {
+        if child
+            .try_wait()
+            .with_context(|| format!("failed to query {program} status"))?
+            .is_some()
+        {
+            break;
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!(
+                "{} timed out after {} ms",
+                program,
+                timeout.as_millis()
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed to collect {program} output"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         return Err(anyhow!(

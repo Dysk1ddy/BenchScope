@@ -52,6 +52,7 @@ const DRIVER_START_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 enum BridgeMetricKind {
     Temperature,
     Utilization,
+    MemoryUsage,
     Voltage,
     Power,
     Clock,
@@ -62,6 +63,7 @@ impl BridgeMetricKind {
         match self {
             BridgeMetricKind::Temperature => "temperature",
             BridgeMetricKind::Utilization => "utilization",
+            BridgeMetricKind::MemoryUsage => "memoryUsage",
             BridgeMetricKind::Voltage => "voltage",
             BridgeMetricKind::Power => "power",
             BridgeMetricKind::Clock => "clock",
@@ -72,6 +74,7 @@ impl BridgeMetricKind {
         match self {
             BridgeMetricKind::Temperature => "Temperature",
             BridgeMetricKind::Utilization => "Utilization",
+            BridgeMetricKind::MemoryUsage => "VRAM Used",
             BridgeMetricKind::Voltage => "Voltage",
             BridgeMetricKind::Power => "Power",
             BridgeMetricKind::Clock => "Clock",
@@ -327,7 +330,9 @@ fn bridge_metric_slots_match(left: &BridgeMetric, right: &BridgeMetric) -> bool 
     left.label.eq_ignore_ascii_case(&right.label)
         || (matches!(
             left.kind,
-            BridgeMetricKind::Temperature | BridgeMetricKind::Utilization
+            BridgeMetricKind::Temperature
+                | BridgeMetricKind::Utilization
+                | BridgeMetricKind::MemoryUsage
         ) && (bridge_metric_label_is_generic(&left.label)
             || bridge_metric_label_is_generic(&right.label)))
 }
@@ -338,11 +343,16 @@ fn bridge_metric_label_is_generic(label: &str) -> bool {
         label.as_str(),
         "" | "cpu"
             | "gpu"
+            | "vram"
+            | "gpu memory"
             | "ssd"
             | "ram"
             | "temperature"
             | "temperatures"
             | "utilization"
+            | "memory usage"
+            | "vram used"
+            | "used"
             | "load"
             | "loads"
             | "voltage"
@@ -578,6 +588,7 @@ struct BridgeState {
     cpu_utilization: CachedReading,
     gpu_temperature: AsyncCachedReading,
     gpu_utilization: AsyncCachedReading,
+    gpu_memory: AsyncCachedReading,
     drive_temperature: AsyncCachedReading,
     memory_utilization: CachedReading,
     cpu_energy_sample: Option<(u64, Instant)>,
@@ -598,6 +609,7 @@ impl BridgeState {
             cpu_utilization: CachedReading::new(FAST_PROVIDER_TTL),
             gpu_temperature: AsyncCachedReading::new(GPU_TEMP_TTL),
             gpu_utilization: AsyncCachedReading::new(FAST_PROVIDER_TTL),
+            gpu_memory: AsyncCachedReading::new(FAST_PROVIDER_TTL),
             drive_temperature: AsyncCachedReading::new(DRIVE_TEMP_TTL),
             memory_utilization: CachedReading::new(FAST_PROVIDER_TTL),
             cpu_energy_sample: None,
@@ -629,11 +641,13 @@ impl BridgeState {
             self.cpu_temperature.collect_finished(now);
             self.gpu_temperature.collect_finished(now);
             self.gpu_utilization.collect_finished(now);
+            self.gpu_memory.collect_finished(now);
             self.drive_temperature.collect_finished(now);
 
             if !self.cpu_temperature.is_pending()
                 && !self.gpu_temperature.is_pending()
                 && !self.gpu_utilization.is_pending()
+                && !self.gpu_memory.is_pending()
                 && !self.drive_temperature.is_pending()
             {
                 break;
@@ -695,6 +709,12 @@ impl BridgeState {
                 "unavailable",
                 Some(driver_error.to_owned()),
             ),
+            gpu_memory: BridgeReading::unavailable(
+                "VRAM",
+                provider,
+                "unavailable",
+                Some(driver_error.to_owned()),
+            ),
             drive: BridgeReading::unavailable(
                 "SSD",
                 provider,
@@ -733,6 +753,7 @@ impl BridgeState {
         let gpu_utilization = self
             .gpu_utilization
             .resolve_query(now, query_gpu_utilization);
+        let gpu_memory = self.gpu_memory.resolve_query(now, query_gpu_memory_sensor);
         let drive_temperature = self
             .drive_temperature
             .resolve_query(now, query_drive_temperature);
@@ -751,6 +772,9 @@ impl BridgeState {
         }
         if let Some(reading) = gpu_utilization {
             readings.gpu.merge_safe_provider(reading);
+        }
+        if let Some(reading) = gpu_memory {
+            readings.gpu_memory.merge_safe_provider(reading);
         }
         if let Some(reading) = drive_temperature {
             readings.drive.merge_safe_provider(reading);
@@ -916,6 +940,7 @@ fn cpu_utilization_reading(value: f32) -> BridgeReading {
 struct BridgeReadings {
     cpu: BridgeReading,
     gpu: BridgeReading,
+    gpu_memory: BridgeReading,
     drive: BridgeReading,
     memory: BridgeReading,
 }
@@ -982,6 +1007,12 @@ fn driver_readings_from_snapshot(
         ),
         gpu: BridgeReading::unavailable(
             "GPU",
+            "BenchScope sensor driver bridge",
+            "unsupported",
+            None,
+        ),
+        gpu_memory: BridgeReading::unavailable(
+            "VRAM",
             "BenchScope sensor driver bridge",
             "unsupported",
             None,
@@ -1121,6 +1152,10 @@ fn snapshot_json_from_parts(
         ),
         format!("\"cpu\":{}", bridge_reading_json(&readings.cpu)),
         format!("\"gpu\":{}", bridge_reading_json(&readings.gpu)),
+        format!(
+            "\"gpuMemory\":{}",
+            bridge_reading_json(&readings.gpu_memory)
+        ),
         format!("\"drive\":{}", bridge_reading_json(&readings.drive)),
         format!("\"memory\":{}", bridge_reading_json(&readings.memory)),
     ];
@@ -1402,16 +1437,19 @@ fn query_gpu_temperature() -> Option<BridgeReading> {
         "--query-gpu=temperature.gpu,name,utilization.gpu,power.draw,clocks.gr,clocks.mem",
         "--format=csv,noheader,nounits",
     ];
-    run_command("nvidia-smi", NVIDIA_SMI_ARGS)
-        .ok()
-        .or_else(|| {
-            nvidia_smi_fallback_paths()
-                .into_iter()
-                .find(|path| path.is_file())
-                .and_then(|path| run_command(&path.display().to_string(), NVIDIA_SMI_ARGS).ok())
-        })
+    run_nvidia_smi_query(NVIDIA_SMI_ARGS)
         .and_then(|output| nvidia_smi_gpu_reading(&output))
         .or_else(|| query_external_hardware_metrics("GPU", external_gpu_metrics_script()))
+}
+
+#[cfg(windows)]
+fn run_nvidia_smi_query(args: &[&str]) -> Option<String> {
+    run_command("nvidia-smi", args).ok().or_else(|| {
+        nvidia_smi_fallback_paths()
+            .into_iter()
+            .find(|path| path.is_file())
+            .and_then(|path| run_command(&path.display().to_string(), args).ok())
+    })
 }
 
 #[cfg(windows)]
@@ -1481,6 +1519,66 @@ fn nvidia_smi_gpu_reading(output: &str) -> Option<BridgeReading> {
     }
 
     (!metrics.is_empty()).then(|| BridgeReading::from_metrics(label, "NVML/nvidia-smi", metrics))
+}
+
+#[cfg(windows)]
+fn query_gpu_memory_sensor() -> Option<BridgeReading> {
+    const NVIDIA_SMI_MEMORY_ARGS: &[&str] = &[
+        "--query-gpu=name,temperature.memory,memory.used,memory.total",
+        "--format=csv,noheader,nounits",
+    ];
+    const NVIDIA_SMI_MEMORY_FALLBACK_ARGS: &[&str] = &[
+        "--query-gpu=name,memory.used,memory.total",
+        "--format=csv,noheader,nounits",
+    ];
+
+    run_nvidia_smi_query(NVIDIA_SMI_MEMORY_ARGS)
+        .or_else(|| run_nvidia_smi_query(NVIDIA_SMI_MEMORY_FALLBACK_ARGS))
+        .and_then(|output| nvidia_smi_gpu_memory_reading(&output))
+}
+
+#[cfg(windows)]
+fn nvidia_smi_gpu_memory_reading(output: &str) -> Option<BridgeReading> {
+    let line = output.lines().find(|line| !line.trim().is_empty())?;
+    let columns = line.split(',').map(str::trim).collect::<Vec<_>>();
+    let has_temperature_column = columns.len() >= 4;
+    let temperature_c = has_temperature_column
+        .then(|| columns.get(1).and_then(|value| parse_metric_number(value)))
+        .flatten()
+        .filter(|value| (-40.0..=130.0).contains(value))
+        .map(round_tenth);
+    let used_mib_column = if has_temperature_column { 2 } else { 1 };
+    let total_mib_column = if has_temperature_column { 3 } else { 2 };
+    let used_gb = columns
+        .get(used_mib_column)
+        .and_then(|value| parse_metric_number(value))
+        .map(mib_to_gb);
+    let total_gb = columns
+        .get(total_mib_column)
+        .and_then(|value| parse_metric_number(value))
+        .map(mib_to_gb)
+        .filter(|value| *value > 0.0);
+
+    let mut metrics = Vec::new();
+    if let Some(value) = temperature_c {
+        metrics.push(BridgeMetric::new(
+            BridgeMetricKind::Temperature,
+            "VRAM",
+            Some(value),
+        ));
+    }
+    if let Some(value) = used_gb {
+        metrics.push(
+            BridgeMetric::new(
+                BridgeMetricKind::MemoryUsage,
+                BridgeMetricKind::MemoryUsage.default_label(),
+                Some(value),
+            )
+            .with_range(None, total_gb),
+        );
+    }
+
+    (!metrics.is_empty()).then(|| BridgeReading::from_metrics("VRAM", "NVML/nvidia-smi", metrics))
 }
 
 #[cfg(windows)]
@@ -2202,10 +2300,15 @@ fn parse_metric_number(value: &str) -> Option<f32> {
         .find(|value| value.is_finite())
 }
 
+fn mib_to_gb(value: f32) -> f32 {
+    round_tenth(value / 1024.0)
+}
+
 fn metric_value_is_plausible(kind: BridgeMetricKind, value: f32) -> bool {
     match kind {
         BridgeMetricKind::Temperature => (-40.0..=130.0).contains(&value),
         BridgeMetricKind::Utilization => (0.0..=10_000.0).contains(&value),
+        BridgeMetricKind::MemoryUsage => (0.0..=1_000_000.0).contains(&value),
         BridgeMetricKind::Voltage => (0.0..=20.0).contains(&value),
         BridgeMetricKind::Power => (0.0..=2000.0).contains(&value),
         BridgeMetricKind::Clock => (0.0..=30_000.0).contains(&value),
@@ -2326,6 +2429,10 @@ fn fallback_snapshot_json(driver_error: &str, readings: BridgeReadings) -> Strin
         ),
         format!("\"cpu\":{}", bridge_reading_json(&readings.cpu)),
         format!("\"gpu\":{}", bridge_reading_json(&readings.gpu)),
+        format!(
+            "\"gpuMemory\":{}",
+            bridge_reading_json(&readings.gpu_memory)
+        ),
         format!("\"drive\":{}", bridge_reading_json(&readings.drive)),
         format!("\"memory\":{}", bridge_reading_json(&readings.memory)),
         format!("\"diagnostics\":[\"{}\"]", message),
@@ -2343,10 +2450,11 @@ fn error_snapshot_json(error: &str) -> String {
     let provider = "BenchScope sensor driver bridge";
     let message = json_escape(error);
     format!(
-        "{{\"timestampUtc\":\"{}\",\"isElevated\":false,\"source\":\"BenchScopeSensorService\",\"cpu\":{},\"gpu\":{},\"drive\":{},\"memory\":{},\"diagnostics\":[\"{}\"]}}",
+        "{{\"timestampUtc\":\"{}\",\"isElevated\":false,\"source\":\"BenchScopeSensorService\",\"cpu\":{},\"gpu\":{},\"gpuMemory\":{},\"drive\":{},\"memory\":{},\"diagnostics\":[\"{}\"]}}",
         json_escape(&timestamp_label()),
         unavailable_reading_json("CPU", provider, status, &message),
         unavailable_reading_json("GPU", provider, status, &message),
+        unavailable_reading_json("VRAM", provider, status, &message),
         unavailable_reading_json("SSD", provider, status, &message),
         unavailable_reading_json("RAM", provider, status, &message),
         message,
@@ -2460,6 +2568,7 @@ mod tests {
         let readings = BridgeReadings {
             cpu: BridgeReading::from_temperature("CPU Package", 63.5, "External hardware WMI"),
             gpu: BridgeReading::from_temperature("GPU Core", 57.0, "NVML/nvidia-smi"),
+            gpu_memory: nvidia_smi_gpu_memory_reading("GeForce RTX Test, 86, 6144, 12288").unwrap(),
             drive: BridgeReading::unavailable(
                 "SSD",
                 "BenchScope sensor driver bridge",
@@ -2474,6 +2583,8 @@ mod tests {
         assert!(json.contains("\"driver\":{\"available\":false"));
         assert!(json.contains("\"cpu\":{\"label\":\"CPU Package\",\"temperatureC\":63.5"));
         assert!(json.contains("\"gpu\":{\"label\":\"GPU Core\",\"temperatureC\":57.0"));
+        assert!(json.contains("\"gpuMemory\":{\"label\":\"VRAM\",\"temperatureC\":86.0"));
+        assert!(json.contains("\"kind\":\"memoryUsage\",\"label\":\"VRAM Used\",\"value\":6.0"));
         assert!(json.contains("\"memory\":{\"label\":\"System RAM\""));
     }
 }

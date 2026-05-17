@@ -1,0 +1,112 @@
+name: Windows Bundle
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_vc_redist:
+        description: "Download and include vc_redist.x64.exe in the bundle"
+        required: false
+        default: false
+        type: boolean
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    paths:
+      - ".cargo/config.toml"
+      - ".github/workflows/windows-bundle.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "packaging/windows/**"
+      - "scripts/Build-WindowsBundle.ps1"
+      - "scripts/Install-WindowsBundle.ps1"
+      - "scripts/Test-WindowsBundleLifecycle.ps1"
+      - "scripts/Test-WindowsRuntimePrereqs.ps1"
+      - "scripts/Uninstall-WindowsBundle.ps1"
+      - "src/**"
+      - "WINDOWS_INSTALL_REQUIREMENTS.md"
+
+jobs:
+  bundle:
+    name: Build Windows x64 Bundle
+    runs-on: windows-latest
+    env:
+      CARGO_NET_OFFLINE: "false"
+      INCLUDE_VC_REDIST: ${{ github.event_name == 'workflow_dispatch' && inputs.include_vc_redist || 'false' }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate PowerShell scripts
+        shell: pwsh
+        run: |
+          $files = @(
+            ".\scripts\Bootstrap-Developer.ps1",
+            ".\scripts\Build-WindowsBundle.ps1",
+            ".\scripts\Install-WindowsBundle.ps1",
+            ".\scripts\Test-WindowsBundleLifecycle.ps1",
+            ".\scripts\Test-WindowsRuntimePrereqs.ps1",
+            ".\scripts\Uninstall-WindowsBundle.ps1"
+          )
+          foreach ($file in $files) {
+            $null = [scriptblock]::Create((Get-Content -Raw $file))
+          }
+
+      - name: Cache Cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ../.cargo-target/BenchScope
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build release binaries
+        shell: pwsh
+        run: cargo build --bins --release
+
+      - name: Stage bundle
+        shell: pwsh
+        run: |
+          $stageArgs = @("-SkipBuild", "-Clean", "-Zip")
+          if ($env:INCLUDE_VC_REDIST -eq "true") {
+            $stageArgs += "-DownloadVcRedist"
+          }
+          & .\scripts\Build-WindowsBundle.ps1 @stageArgs
+
+      - name: Show bundle manifest
+        shell: pwsh
+        run: Get-Content -Raw .\dist\BenchScope-*-windows-x64\bundle-manifest.json
+
+      - name: Install/update/uninstall smoke test
+        shell: pwsh
+        run: |
+          $bundle = (Get-ChildItem -Directory .\dist\BenchScope-*-windows-x64 | Select-Object -First 1).FullName
+          $lifecycleArgs = @("-BundlePath", $bundle, "-ReportPath", ".\dist\bundle-lifecycle-smoke.md")
+          if ($env:INCLUDE_VC_REDIST -eq "true") {
+            $lifecycleArgs += "-InstallVcRedist"
+          }
+          .\scripts\Test-WindowsBundleLifecycle.ps1 @lifecycleArgs
+
+      - name: Upload bundle zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchscope-windows-x64-bundle
+          path: dist/BenchScope-*-windows-x64.zip
+          if-no-files-found: error
+
+      - name: Upload bundle reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchscope-windows-x64-reports
+          path: |
+            dist/BenchScope-*-windows-x64/bundle-manifest.json
+            dist/BenchScope-*-windows-x64/reports/*.md
+            dist/bundle-lifecycle-smoke.md
+          if-no-files-found: error

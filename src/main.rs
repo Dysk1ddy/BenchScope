@@ -29,6 +29,8 @@ use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTAT
 
 include!("constants.rs");
 include!("features/matrix_benchmark/mod.rs");
+include!("features/ai_training_benchmark/mod.rs");
+include!("features/gpu_memory_benchmark/mod.rs");
 include!("features/main_menu/mod.rs");
 include!("features/drive_benchmark/mod.rs");
 include!("features/storage_health/mod.rs");

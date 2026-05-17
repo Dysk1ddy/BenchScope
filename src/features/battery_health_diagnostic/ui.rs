@@ -87,7 +87,7 @@ impl BenchScopeApp {
             });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            egui::ScrollArea::vertical()
+            egui::ScrollArea::both()
                 .id_salt("battery_content_scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {

@@ -86,7 +86,10 @@ impl BenchScopeApp {
                 });
                 let target_path = PathBuf::from(self.drive.target_folder_text.trim());
                 if target_path.is_dir() {
-                    ui.small(format!("Benchmark file: {}", DRIVE_BENCHMARK_FILE_NAME));
+                    ui.small(format!(
+                        "Benchmark files use unique {}-*.{} names",
+                        DRIVE_BENCHMARK_FILE_PREFIX, DRIVE_BENCHMARK_FILE_EXTENSION
+                    ));
                 } else {
                     ui.colored_label(egui::Color32::YELLOW, "Target folder is not valid.");
                 }

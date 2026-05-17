@@ -243,6 +243,283 @@ mod tests {
     }
 
     #[test]
+    fn ai_linear_flop_accounting_matches_training_step_formula() {
+        let adapter = AdapterInfo {
+            index: 0,
+            name: "Test GPU".to_owned(),
+            backend: wgpu::Backend::Dx12,
+            device_type: wgpu::DeviceType::DiscreteGpu,
+            vendor: 0,
+            device: 0,
+            driver: String::new(),
+            timestamp_query: true,
+            dedicated_vram_bytes: None,
+            dedicated_system_memory_bytes: None,
+            shared_system_memory_bytes: None,
+        };
+        let config = AiTrainingConfig {
+            backend: AiTrainingBackend::PortableWgpu,
+            pytorch_python: "python".to_owned(),
+            pytorch_cuda_device: 0,
+            adapter,
+            workload: AiTrainingWorkload::LinearLayer,
+            profile: AiTrainingProfile::Quick,
+            precision: AiTrainingPrecision::F32,
+            preset: AiTrainingPreset::Custom,
+            dimensions: AiTrainingDimensions::linear(2, 3, 5),
+            warmup_steps: 1,
+            measured_steps: 2,
+            time_limit_s: 10.0,
+            gpu_intensity: GpuIntensity::Safe,
+            validation_enabled: true,
+            smoke_test: false,
+        };
+
+        assert_eq!(config_flops_per_step(&config), 210.0);
+    }
+
+    #[test]
+    fn ai_training_autosizer_reduces_linear_shape_for_memory_cap() {
+        let adapter = AdapterInfo {
+            index: 0,
+            name: "Test GPU".to_owned(),
+            backend: wgpu::Backend::Dx12,
+            device_type: wgpu::DeviceType::DiscreteGpu,
+            vendor: 0,
+            device: 0,
+            driver: String::new(),
+            timestamp_query: true,
+            dedicated_vram_bytes: None,
+            dedicated_system_memory_bytes: None,
+            shared_system_memory_bytes: None,
+        };
+        let mut config = AiTrainingConfig {
+            backend: AiTrainingBackend::PortableWgpu,
+            pytorch_python: "python".to_owned(),
+            pytorch_cuda_device: 0,
+            adapter,
+            workload: AiTrainingWorkload::LinearLayer,
+            profile: AiTrainingProfile::Quick,
+            precision: AiTrainingPrecision::F32,
+            preset: AiTrainingPreset::Custom,
+            dimensions: AiTrainingDimensions::linear(1024, 4096, 4096),
+            warmup_steps: 1,
+            measured_steps: 2,
+            time_limit_s: 10.0,
+            gpu_intensity: GpuIntensity::Safe,
+            validation_enabled: true,
+            smoke_test: false,
+        };
+
+        let note = auto_size_ai_training_config_for_limits(
+            &mut config,
+            Some(64 * 1024 * 1024),
+            Some(16 * 1024 * 1024),
+        );
+
+        assert!(note.is_some());
+        assert!(config_memory_bytes(&config) <= 64 * 1024 * 1024 * 9 / 10);
+    }
+
+    #[test]
+    fn ai_training_transpose_keeps_row_major_layout() {
+        let source = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+
+        assert_eq!(
+            transpose_row_major(&source, 2, 3),
+            vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]
+        );
+    }
+
+    #[test]
+    fn ai_training_percentile_uses_sorted_values() {
+        let values = vec![8.0, 2.0, 4.0, 10.0, 6.0];
+
+        assert_eq!(percentile_sorted_copy(&values, 0.95), 10.0);
+        assert_eq!(percentile_sorted_copy(&values, 0.50), 6.0);
+    }
+
+    #[test]
+    fn ai_mlp_flop_accounting_includes_two_training_blocks() {
+        let adapter = AdapterInfo {
+            index: 0,
+            name: "Test GPU".to_owned(),
+            backend: wgpu::Backend::Dx12,
+            device_type: wgpu::DeviceType::DiscreteGpu,
+            vendor: 0,
+            device: 0,
+            driver: String::new(),
+            timestamp_query: true,
+            dedicated_vram_bytes: None,
+            dedicated_system_memory_bytes: None,
+            shared_system_memory_bytes: None,
+        };
+        let config = AiTrainingConfig {
+            backend: AiTrainingBackend::PortableWgpu,
+            pytorch_python: "python".to_owned(),
+            pytorch_cuda_device: 0,
+            adapter,
+            workload: AiTrainingWorkload::Mlp,
+            profile: AiTrainingProfile::Quick,
+            precision: AiTrainingPrecision::F32,
+            preset: AiTrainingPreset::Custom,
+            dimensions: AiTrainingDimensions::mlp(2, 3, 5),
+            warmup_steps: 1,
+            measured_steps: 2,
+            time_limit_s: 10.0,
+            gpu_intensity: GpuIntensity::Safe,
+            validation_enabled: true,
+            smoke_test: false,
+        };
+
+        assert_eq!(config_flops_per_step(&config), 460.0);
+    }
+
+    #[test]
+    fn ai_transformer_proxy_builds_expected_block_sequence() {
+        let dims = AiTrainingDimensions::transformer(2, 4, 8, 2);
+        let specs = transformer_linear_block_specs(&dims).unwrap();
+
+        assert_eq!(specs.len(), 8);
+        assert_eq!(specs[0].batch, 8);
+        assert_eq!(specs[0].input, 8);
+        assert_eq!(specs[0].output, 8);
+        assert_eq!(specs[4].batch, 16);
+        assert_eq!(specs[4].input, 4);
+        assert_eq!(specs[4].output, 4);
+        assert_eq!(specs[6].input, 8);
+        assert_eq!(specs[6].output, 32);
+    }
+
+    #[test]
+    fn ai_optimizer_autosizer_respects_single_buffer_cap() {
+        let adapter = AdapterInfo {
+            index: 0,
+            name: "Test GPU".to_owned(),
+            backend: wgpu::Backend::Dx12,
+            device_type: wgpu::DeviceType::DiscreteGpu,
+            vendor: 0,
+            device: 0,
+            driver: String::new(),
+            timestamp_query: true,
+            dedicated_vram_bytes: None,
+            dedicated_system_memory_bytes: None,
+            shared_system_memory_bytes: None,
+        };
+        let mut config = AiTrainingConfig {
+            backend: AiTrainingBackend::PortableWgpu,
+            pytorch_python: "python".to_owned(),
+            pytorch_cuda_device: 0,
+            adapter,
+            workload: AiTrainingWorkload::OptimizerStress,
+            profile: AiTrainingProfile::Quick,
+            precision: AiTrainingPrecision::F32,
+            preset: AiTrainingPreset::Custom,
+            dimensions: AiTrainingDimensions::optimizer(64_000_000),
+            warmup_steps: 1,
+            measured_steps: 2,
+            time_limit_s: 10.0,
+            gpu_intensity: GpuIntensity::Safe,
+            validation_enabled: true,
+            smoke_test: false,
+        };
+
+        let note = auto_size_ai_training_config_for_limits(
+            &mut config,
+            Some(128 * 1024 * 1024),
+            Some(16 * 1024 * 1024),
+        );
+
+        assert!(note.is_some());
+        assert!(config.dimensions.parameter_count <= 4 * 1024 * 1024);
+        assert!(config_memory_bytes(&config) <= 128 * 1024 * 1024 * 9 / 10);
+    }
+
+    #[test]
+    fn pytorch_cuda_probe_parser_reads_environment_and_devices() {
+        let output = concat!(
+            "PYTHON\t3.13.1\n",
+            "TORCH\t2.11.0\n",
+            "CUDA\t12.8\n",
+            "CUDNN\t9000\n",
+            "DISTRIBUTED_AVAILABLE\tTrue\n",
+            "NCCL_AVAILABLE\tTrue\n",
+            "CUDA_AVAILABLE\tTrue\n",
+            "DEVICE_COUNT\t1\n",
+            "DEVICE\t0\tNVIDIA Test\t8\t9\t17179869184\n",
+        );
+
+        let environment = parse_pytorch_cuda_probe_output(output, r#"C:\Python\python.exe"#);
+
+        assert!(environment.cuda_available);
+        assert_eq!(environment.python, r#"C:\Python\python.exe"#);
+        assert_eq!(environment.python_version.as_deref(), Some("3.13.1"));
+        assert_eq!(environment.torch_version.as_deref(), Some("2.11.0"));
+        assert_eq!(environment.torch_cuda_version.as_deref(), Some("12.8"));
+        assert_eq!(environment.cudnn_version.as_deref(), Some("9000"));
+        assert!(environment.distributed_available);
+        assert!(environment.nccl_available);
+        assert_eq!(environment.device_count, 1);
+        assert_eq!(environment.devices[0].name, "NVIDIA Test");
+        assert_eq!(environment.devices[0].capability_major, 8);
+        assert_eq!(environment.devices[0].total_memory_bytes, 17_179_869_184);
+    }
+
+    #[test]
+    fn pytorch_cuda_benchmark_parser_reads_timings_and_memory() {
+        let output = concat!(
+            "PYTHON\t3.13.1\n",
+            "TORCH\t2.11.0\n",
+            "CUDA\t12.8\n",
+            "CUDNN\t9000\n",
+            "DISTRIBUTED_AVAILABLE\tTrue\n",
+            "NCCL_AVAILABLE\tTrue\n",
+            "CUDA_AVAILABLE\tTrue\n",
+            "DEVICE_COUNT\t1\n",
+            "DEVICE\t0\tNVIDIA Test\t8\t9\t17179869184\n",
+            "RESULT_DEVICE_INDEX\t0\n",
+            "RESULT_GPU_NAME\tNVIDIA Test\n",
+            "RESULT_MEASURED_STEPS\t2\n",
+            "RESULT_GPU_STEP_MS\t1.25\t1.50\n",
+            "RESULT_WALL_STEP_MS\t1.75\t2.25\n",
+            "RESULT_PEAK_ALLOCATED_BYTES\t1024\n",
+            "RESULT_PEAK_RESERVED_BYTES\t2048\n",
+            "RESULT_VALIDATION\tPassed: finite loss 0.5\n",
+            "RESULT_TIME_LIMITED\tFalse\n",
+            "NOTE\tbenchmark note\n",
+        );
+
+        let benchmark = parse_pytorch_cuda_benchmark_output(output, "python");
+
+        assert_eq!(benchmark.device_index, Some(0));
+        assert_eq!(benchmark.gpu_name.as_deref(), Some("NVIDIA Test"));
+        assert_eq!(benchmark.measured_steps, 2);
+        assert_eq!(benchmark.gpu_step_ms, vec![1.25, 1.50]);
+        assert_eq!(benchmark.wall_step_ms, vec![1.75, 2.25]);
+        assert_eq!(benchmark.peak_allocated_bytes, 1024);
+        assert_eq!(benchmark.peak_reserved_bytes, 2048);
+        assert_eq!(
+            benchmark.validation.as_deref(),
+            Some("Passed: finite loss 0.5")
+        );
+        assert!(!benchmark.time_limited);
+        assert_eq!(benchmark.environment.notes, vec!["benchmark note".to_owned()]);
+    }
+
+    #[test]
+    fn ai_training_backend_parser_accepts_aliases() {
+        assert_eq!(
+            parse_ai_training_backend("portable-wgpu").unwrap(),
+            AiTrainingBackend::PortableWgpu
+        );
+        assert_eq!(
+            parse_ai_training_backend("pytorch_cuda").unwrap(),
+            AiTrainingBackend::PyTorchCuda
+        );
+        assert!(parse_ai_training_backend("rocm").is_err());
+    }
+
+    #[test]
     fn cpu_worker_count_leaves_room_for_system() {
         assert_eq!(cpu_worker_count(64), 1);
         let available = thread::available_parallelism()
@@ -464,6 +741,34 @@ mod tests {
 
         assert_eq!(a, b);
         assert!(a.iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn drive_temp_file_uses_unique_owned_path_and_preserves_fixed_name() {
+        let timestamp_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temp_dir = std::env::current_dir()
+            .unwrap()
+            .join(format!(
+                "benchscope-drive-temp-test-{}-{timestamp_ns}",
+                std::process::id()
+            ));
+        fs::create_dir(&temp_dir).unwrap();
+        let fixed_name_path = temp_dir.join("benchscope_drive_benchmark.tmp");
+        fs::write(&fixed_name_path, b"user data").unwrap();
+
+        let temp_file = DriveBenchmarkTempFile::create(&temp_dir).unwrap();
+        let reserved_path = temp_file.path().clone();
+
+        assert_ne!(reserved_path, fixed_name_path);
+        assert!(reserved_path.exists());
+        drop(temp_file);
+        assert!(!reserved_path.exists());
+        assert_eq!(fs::read(&fixed_name_path).unwrap(), b"user data");
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
@@ -848,6 +1153,44 @@ mod tests {
     }
 
     #[test]
+    fn nvidia_smi_gpu_memory_parser_reads_vram_usage() {
+        let reading =
+            parse_nvidia_smi_gpu_memory_reading("GeForce RTX Test, 84, 4096, 12288").unwrap();
+        let usage = reading
+            .metrics
+            .iter()
+            .find(|metric| metric.kind == SensorMetricKind::MemoryUsage)
+            .unwrap();
+
+        assert_eq!(reading.kind, SensorKind::GpuMemory);
+        assert_eq!(reading.temperature_c, Some(84.0));
+        assert_eq!(usage.value, Some(4.0));
+        assert_eq!(usage.max, Some(12.0));
+        assert_eq!(
+            format_sensor_metric_current_value(usage, &SensorStatus::Ok),
+            "4.0/12.0 GB"
+        );
+    }
+
+    #[test]
+    fn helper_snapshot_parser_reads_gpu_memory_metrics() {
+        let line = r#"{"timestampUtc":"unix-ms:1770000000000","isElevated":true,"gpuMemory":{"label":"VRAM","temperatureC":86.0,"utilizationPercent":null,"provider":"NVML/nvidia-smi","status":"ok","metrics":[{"kind":"temperature","label":"VRAM","value":86.0,"min":82.0,"max":91.0},{"kind":"memoryUsage","label":"VRAM Used","value":5.5,"min":null,"max":16.0}]}}"#;
+
+        let snapshot = parse_helper_snapshot(line).unwrap();
+        let vram = snapshot.gpu_memory.unwrap();
+        let usage = vram
+            .metrics
+            .iter()
+            .find(|metric| metric.kind == SensorMetricKind::MemoryUsage)
+            .unwrap();
+
+        assert_eq!(vram.kind, SensorKind::GpuMemory);
+        assert_eq!(vram.temperature_c, Some(86.0));
+        assert_eq!(usage.value, Some(5.5));
+        assert_eq!(usage.max, Some(16.0));
+    }
+
+    #[test]
     fn helper_snapshot_parser_preserves_unsupported_status() {
         let line = r#"{"timestampUtc":"2026-05-16T03:36:28Z","cpu":{"label":"CPU","provider":"LibreHardwareMonitor","status":"unsupported","message":"No CPU temperature sensor found"}}"#;
 
@@ -896,6 +1239,19 @@ mod tests {
         assert!(helper_snapshot_needs_elevation(&snapshot));
     }
 
+    fn sensor_reading_with_temperature_and_utilization(
+        kind: SensorKind,
+        label: &str,
+        temperature_c: f32,
+        utilization_percent: f32,
+        provider: &str,
+    ) -> SensorReading {
+        let mut reading = SensorReading::ok(kind, label, temperature_c, provider);
+        reading.utilization_percent = Some(utilization_percent);
+        reading.sync_legacy_metrics();
+        reading
+    }
+
     #[test]
     fn merge_sensor_snapshots_uses_fallback_for_missing_helper_reading() {
         let helper = parse_helper_snapshot(
@@ -910,6 +1266,7 @@ mod tests {
                 61.0,
                 "NVML/nvidia-smi",
             )),
+            gpu_memory: None,
             drive: None,
             memory: None,
             helper_elevated: None,
@@ -948,6 +1305,116 @@ mod tests {
     }
 
     #[test]
+    fn stale_complete_sensor_snapshot_requests_fallback() {
+        let now = Instant::now();
+        let mut cpu = sensor_reading_with_temperature_and_utilization(
+            SensorKind::Cpu,
+            "CPU",
+            55.0,
+            12.0,
+            "stale service",
+        );
+        cpu.updated_at = now - Duration::from_millis(SENSOR_STALE_AFTER_MS + 1);
+        let snapshot = SensorSnapshot {
+            cpu: Some(cpu),
+            gpu: Some(sensor_reading_with_temperature_and_utilization(
+                SensorKind::Gpu,
+                "GPU",
+                50.0,
+                18.0,
+                "service",
+            )),
+            gpu_memory: None,
+            drive: Some(sensor_reading_with_temperature_and_utilization(
+                SensorKind::Drive,
+                "SSD",
+                41.0,
+                3.0,
+                "service",
+            )),
+            memory: Some(sensor_reading_with_temperature_and_utilization(
+                SensorKind::Memory,
+                "RAM",
+                35.0,
+                44.0,
+                "service",
+            )),
+            helper_elevated: Some(true),
+        };
+
+        assert!(sensor_snapshot_needs_fallback(&snapshot, now));
+    }
+
+    #[test]
+    fn fresh_fallback_replaces_stale_primary_reading() {
+        let now = Instant::now();
+        let mut primary_cpu = sensor_reading_with_temperature_and_utilization(
+            SensorKind::Cpu,
+            "CPU",
+            75.0,
+            90.0,
+            "stale service",
+        );
+        primary_cpu.updated_at = now - Duration::from_millis(SENSOR_STALE_AFTER_MS + 1);
+        let primary = SensorSnapshot {
+            cpu: Some(primary_cpu),
+            gpu: None,
+            gpu_memory: None,
+            drive: None,
+            memory: None,
+            helper_elevated: Some(true),
+        };
+        let fallback = SensorSnapshot {
+            cpu: Some(sensor_reading_with_temperature_and_utilization(
+                SensorKind::Cpu,
+                "CPU",
+                56.0,
+                13.0,
+                "fresh fallback",
+            )),
+            gpu: None,
+            gpu_memory: None,
+            drive: None,
+            memory: None,
+            helper_elevated: None,
+        };
+
+        let merged = merge_sensor_snapshots_prefer_fresh(Some(primary), Some(fallback), now)
+            .unwrap()
+            .cpu
+            .unwrap();
+
+        assert_eq!(merged.temperature_c, Some(56.0));
+        assert_eq!(merged.utilization_percent, Some(13.0));
+        assert_eq!(merged.provider, "fresh fallback");
+    }
+
+    #[test]
+    fn disconnected_sensor_bridge_clears_snapshot_for_fallback() {
+        let (tx, rx) = mpsc::channel();
+        let mut rx = Some(rx);
+        let mut snapshot = Some(SensorSnapshot {
+            cpu: Some(sensor_reading_with_temperature_and_utilization(
+                SensorKind::Cpu,
+                "CPU",
+                61.0,
+                25.0,
+                "service",
+            )),
+            gpu: None,
+            gpu_memory: None,
+            drive: None,
+            memory: None,
+            helper_elevated: Some(true),
+        });
+        drop(tx);
+
+        assert!(drain_sensor_bridge_receiver(&mut rx, &mut snapshot));
+        assert!(rx.is_none());
+        assert!(snapshot.is_none());
+    }
+
+    #[test]
     fn integrated_gpu_fallback_uses_cpu_package_temperature() {
         let snapshot = SensorSnapshot {
             cpu: Some(SensorReading::ok(
@@ -966,6 +1433,7 @@ mod tests {
                 updated_at: Instant::now(),
                 status: SensorStatus::Ok,
             }),
+            gpu_memory: None,
             drive: None,
             memory: None,
             helper_elevated: Some(true),
@@ -998,6 +1466,7 @@ mod tests {
                 updated_at: Instant::now(),
                 status: SensorStatus::Ok,
             }),
+            gpu_memory: None,
             drive: None,
             memory: None,
             helper_elevated: None,
@@ -1152,6 +1621,53 @@ mod tests {
         );
     }
 
+    fn test_network_adapter_snapshot(
+        id: &str,
+        name: &str,
+        status: NetworkHealthStatus,
+    ) -> NetworkAdapterSnapshot {
+        NetworkAdapterSnapshot {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            description: format!("{name} adapter"),
+            kind: NetworkAdapterKind::Ethernet,
+            status,
+            connected: true,
+            is_physical: true,
+            link_speed_bps: Some(1_000_000_000),
+            mac_address: None,
+            ipv4_addresses: Vec::new(),
+            ipv6_addresses: Vec::new(),
+            gateways: Vec::new(),
+            dns_servers: Vec::new(),
+            driver: None,
+            wifi: None,
+            counters: None,
+            provider_notes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn network_adapter_snapshot_update_preserves_other_adapters() {
+        let mut adapters = vec![
+            test_network_adapter_snapshot("wifi", "Wi-Fi", NetworkHealthStatus::Good),
+            test_network_adapter_snapshot("ethernet", "Ethernet", NetworkHealthStatus::Good),
+        ];
+        let mut updated =
+            test_network_adapter_snapshot("ethernet", "Ethernet", NetworkHealthStatus::Critical);
+        updated.link_speed_bps = Some(100_000_000);
+
+        let selected_index = upsert_network_adapter_snapshot(&mut adapters, updated);
+
+        assert_eq!(selected_index, 1);
+        assert_eq!(adapters.len(), 2);
+        assert_eq!(adapters[0].id, "wifi");
+        assert_eq!(adapters[0].status, NetworkHealthStatus::Good);
+        assert_eq!(adapters[1].id, "ethernet");
+        assert_eq!(adapters[1].status, NetworkHealthStatus::Critical);
+        assert_eq!(adapters[1].link_speed_bps, Some(100_000_000));
+    }
+
     #[test]
     fn network_diagnosis_flags_dns_specific_failure() {
         let snapshot = NetworkAdapterSnapshot {
@@ -1230,5 +1746,149 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("canceled"));
+    }
+
+    #[test]
+    fn gpu_memory_buffer_size_parser_accepts_common_sizes() {
+        assert_eq!(
+            GpuMemoryBufferSize::parse("auto"),
+            Some(GpuMemoryBufferSize::Auto)
+        );
+        assert_eq!(
+            GpuMemoryBufferSize::parse("64MiB"),
+            Some(GpuMemoryBufferSize::Mib64)
+        );
+        assert_eq!(
+            GpuMemoryBufferSize::parse("256 mb"),
+            Some(GpuMemoryBufferSize::Mib256)
+        );
+        assert_eq!(
+            GpuMemoryBufferSize::parse("1g"),
+            Some(GpuMemoryBufferSize::Gib1)
+        );
+        assert_eq!(GpuMemoryBufferSize::parse("bad"), None);
+    }
+
+    #[test]
+    fn gpu_memory_internal_byte_accounting_counts_two_reads_and_one_write() {
+        assert_eq!(
+            GpuMemoryTestKind::InternalReadWrite.bytes_per_iteration(1024),
+            3 * 1024
+        );
+        assert_eq!(
+            GpuMemoryTestKind::DeviceCopy.bytes_per_iteration(1024),
+            1024
+        );
+        assert_eq!(
+            GpuMemoryTestKind::RoundTrip.bytes_per_iteration(1024),
+            2048
+        );
+    }
+
+    #[test]
+    fn gpu_memory_bandwidth_uses_decimal_gbps() {
+        assert_eq!(gpu_memory_bandwidth_gbps(1_000_000_000, 1000.0), 1.0);
+        assert_eq!(format_gpu_memory_bandwidth(123.4), "123");
+        assert_eq!(format_gpu_memory_bandwidth(12.34), "12.3");
+    }
+
+    #[test]
+    fn gpu_memory_validation_catches_sample_mismatch() {
+        let mut sample = make_gpu_memory_pattern_bytes(64, GPU_MEMORY_PATTERN_A_SEED).unwrap();
+        assert!(validate_gpu_memory_pattern_sample(&sample, GPU_MEMORY_PATTERN_A_SEED)
+            .starts_with("Passed"));
+
+        sample[4] ^= 0xFF;
+        assert!(validate_gpu_memory_pattern_sample(&sample, GPU_MEMORY_PATTERN_A_SEED)
+            .starts_with("Failed"));
+    }
+
+    #[test]
+    fn main_menu_categories_cover_all_tools() {
+        let tools = main_menu_tool_items();
+
+        assert_eq!(main_menu_category_items().len(), MenuCategory::ALL.len());
+        for tool in tools {
+            assert!(
+                !tool.categories.is_empty(),
+                "{} should appear in at least one category",
+                tool.title
+            );
+        }
+        for category in MenuCategory::ALL {
+            assert!(
+                !main_menu_items_for_category(category).is_empty(),
+                "{category:?} should expose at least one tool"
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_tools_are_shared_between_cpu_and_gpu_menus() {
+        for category in [MenuCategory::Cpu, MenuCategory::Gpu] {
+            let items = main_menu_items_for_category(category);
+
+            assert!(
+                items
+                    .iter()
+                    .any(|item| item.view == AppView::MatrixBenchmark)
+            );
+            assert!(
+                items
+                    .iter()
+                    .any(|item| item.view == AppView::MatrixStressTest)
+            );
+        }
+    }
+
+    #[test]
+    fn main_menu_category_membership_matches_current_tools() {
+        assert_eq!(
+            main_menu_views_for_category(MenuCategory::Cpu),
+            vec![
+                AppView::MatrixBenchmark,
+                AppView::MatrixStressTest,
+                AppView::DeviceInfo,
+            ]
+        );
+        assert_eq!(
+            main_menu_views_for_category(MenuCategory::Gpu),
+            vec![
+                AppView::MatrixBenchmark,
+                AppView::MatrixStressTest,
+                AppView::GpuMemoryBenchmark,
+                AppView::AiTrainingBenchmark,
+                AppView::DeviceInfo,
+            ]
+        );
+        assert_eq!(
+            main_menu_views_for_category(MenuCategory::Ram),
+            vec![AppView::RamTester, AppView::DeviceInfo]
+        );
+        assert_eq!(
+            main_menu_views_for_category(MenuCategory::Storage),
+            vec![
+                AppView::DriveBenchmark,
+                AppView::StorageHealth,
+                AppView::DeviceInfo,
+            ]
+        );
+        assert_eq!(
+            main_menu_views_for_category(MenuCategory::Drivers),
+            vec![AppView::NetworkDiagnostic, AppView::DeviceInfo]
+        );
+        assert_eq!(
+            main_menu_views_for_category(MenuCategory::Io),
+            vec![
+                AppView::DriveBenchmark,
+                AppView::StorageHealth,
+                AppView::NetworkDiagnostic,
+                AppView::DeviceInfo,
+            ]
+        );
+        assert_eq!(
+            main_menu_views_for_category(MenuCategory::Misc),
+            vec![AppView::BatteryHealthDiagnostic, AppView::DeviceInfo]
+        );
     }
 }

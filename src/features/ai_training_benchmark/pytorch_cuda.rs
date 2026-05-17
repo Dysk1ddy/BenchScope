@@ -1,0 +1,754 @@
+#[derive(Clone, Debug)]
+struct PyTorchCudaDevice {
+    index: usize,
+    name: String,
+    capability_major: u32,
+    capability_minor: u32,
+    total_memory_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PyTorchCudaEnvironment {
+    ok: bool,
+    python_executable: String,
+    python: String,
+    python_version: Option<String>,
+    torch_version: Option<String>,
+    torch_cuda_version: Option<String>,
+    cudnn_version: Option<String>,
+    cuda_available: bool,
+    device_count: usize,
+    devices: Vec<PyTorchCudaDevice>,
+    distributed_available: bool,
+    nccl_available: bool,
+    notes: Vec<String>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PyTorchCudaBenchmarkOutput {
+    environment: PyTorchCudaEnvironment,
+    device_index: Option<usize>,
+    gpu_name: Option<String>,
+    measured_steps: usize,
+    gpu_step_ms: Vec<f64>,
+    wall_step_ms: Vec<f64>,
+    peak_allocated_bytes: u64,
+    peak_reserved_bytes: u64,
+    validation: Option<String>,
+    time_limited: bool,
+}
+
+impl PyTorchCudaEnvironment {
+    fn summary_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        lines.push(format!("Probe OK: {}", yes_no(self.ok)));
+        lines.push(format!("Python executable: {}", self.python_executable));
+        if let Some(version) = &self.python_version {
+            lines.push(format!("Python version: {version}"));
+        }
+        if let Some(version) = &self.torch_version {
+            lines.push(format!("PyTorch version: {version}"));
+        }
+        if let Some(version) = &self.torch_cuda_version {
+            lines.push(format!("CUDA runtime: {version}"));
+        }
+        if let Some(version) = &self.cudnn_version {
+            lines.push(format!("cuDNN version: {version}"));
+        }
+        lines.push(format!(
+            "CUDA available: {}",
+            if self.cuda_available { "yes" } else { "no" }
+        ));
+        lines.push(format!(
+            "Distributed: {}; NCCL: {}",
+            if self.distributed_available { "yes" } else { "no" },
+            if self.nccl_available { "yes" } else { "no" }
+        ));
+        lines.push(format!("CUDA devices: {}", self.device_count));
+        for device in &self.devices {
+            lines.push(format!(
+                "CUDA device {}: {} sm_{}{} {}",
+                device.index,
+                device.name,
+                device.capability_major,
+                device.capability_minor,
+                format_bytes(device.total_memory_bytes)
+            ));
+        }
+        if let Some(error) = &self.error {
+            lines.push(format!("Probe note: {error}"));
+        }
+        for note in &self.notes {
+            lines.push(format!("Probe note: {note}"));
+        }
+        lines
+    }
+}
+
+fn default_pytorch_python_executable() -> String {
+    std::env::var("PYTHON").unwrap_or_else(|_| "python".to_owned())
+}
+
+fn probe_pytorch_cuda(python: &str) -> Result<PyTorchCudaEnvironment> {
+    let output = run_pytorch_cuda_probe_script(python, Duration::from_secs(15))?;
+    Ok(parse_pytorch_cuda_probe_output(&output, python))
+}
+
+fn run_pytorch_cuda_training_benchmark(
+    config: AiTrainingConfig,
+    cancel: Arc<AtomicBool>,
+    tx: Sender<AiTrainingWorkerEvent>,
+) -> Result<AiTrainingResult> {
+    if config.workload != AiTrainingWorkload::LinearLayer {
+        return Err(anyhow!(
+            "PyTorch CUDA currently supports only the linear layer training workload"
+        ));
+    }
+    if config.precision != AiTrainingPrecision::F32 {
+        return Err(anyhow!(
+            "PyTorch CUDA currently supports only f32 precision"
+        ));
+    }
+    validate_ai_linear_dimensions(
+        config.dimensions.batch_size,
+        config.dimensions.input_dim,
+        config.dimensions.output_dim,
+    )?;
+    check_canceled_with(Some(cancel.as_ref()), "PyTorch CUDA benchmark canceled")?;
+
+    let total_steps = config.warmup_steps.saturating_add(config.measured_steps);
+    let started = Instant::now();
+    emit_ai_training_progress(
+        &tx,
+        "Launching PyTorch CUDA worker",
+        0,
+        total_steps,
+        started,
+        Some(config.time_limit_s),
+        true,
+    );
+    let _ = tx.send(AiTrainingWorkerEvent::Log(format!(
+        "Launching PyTorch CUDA linear training via {} on CUDA device {}",
+        config.pytorch_python, config.pytorch_cuda_device
+    )));
+
+    let timeout = pytorch_cuda_benchmark_timeout(config.time_limit_s);
+    let output = run_pytorch_cuda_benchmark_script(&config, cancel.as_ref(), timeout)?;
+    let parsed = parse_pytorch_cuda_benchmark_output(&output, &config.pytorch_python);
+    if let Some(error) = &parsed.environment.error {
+        return Err(anyhow!("PyTorch CUDA benchmark failed: {error}"));
+    }
+
+    let measured_steps = parsed
+        .measured_steps
+        .min(parsed.gpu_step_ms.len())
+        .min(parsed.wall_step_ms.len());
+    let measured_steps = if measured_steps == 0 {
+        parsed.gpu_step_ms.len().min(parsed.wall_step_ms.len())
+    } else {
+        measured_steps
+    };
+    if measured_steps == 0 {
+        return Err(anyhow!(
+            "PyTorch CUDA benchmark did not return measured step timings"
+        ));
+    }
+
+    let gpu_step_ms = &parsed.gpu_step_ms[..measured_steps];
+    let wall_step_ms = &parsed.wall_step_ms[..measured_steps];
+    let gpu_elapsed_ms = gpu_step_ms.iter().sum::<f64>();
+    let wall_elapsed_ms = wall_step_ms.iter().sum::<f64>();
+    let gpu_elapsed_s = gpu_elapsed_ms / 1000.0;
+    let wall_elapsed_s = (wall_elapsed_ms / 1000.0).max(f64::MIN_POSITIVE);
+    let flops_per_step = config_flops_per_step(&config);
+    let total_flops = flops_per_step * measured_steps as f64;
+    let compute_tflops =
+        (gpu_elapsed_s > 0.0).then_some(total_flops / gpu_elapsed_s / 1.0e12);
+    let end_to_end_tflops = total_flops / wall_elapsed_s / 1.0e12;
+    let throughput_value = ai_training_throughput(&config, measured_steps, wall_elapsed_s);
+    let avg_step_ms = wall_elapsed_ms / measured_steps as f64;
+    let p95_step_ms = percentile_sorted_copy(wall_step_ms, 0.95);
+    let memory_bytes = parsed
+        .peak_reserved_bytes
+        .max(parsed.peak_allocated_bytes)
+        .max(config_memory_bytes(&config));
+
+    let gpu_name = parsed.gpu_name.unwrap_or_else(|| {
+        parsed
+            .environment
+            .devices
+            .first()
+            .map(|device| device.name.clone())
+            .unwrap_or_else(|| format!("CUDA device {}", config.pytorch_cuda_device))
+    });
+    let validation = if config.validation_enabled {
+        parsed
+            .validation
+            .unwrap_or_else(|| "Passed: PyTorch completed measured training steps".to_owned())
+    } else {
+        "Skipped: validation disabled".to_owned()
+    };
+    let mut notes = parsed.environment.notes.clone();
+    if let Some(version) = &parsed.environment.torch_version {
+        notes.push(format!("PyTorch {version}."));
+    }
+    if let Some(version) = &parsed.environment.torch_cuda_version {
+        notes.push(format!("CUDA runtime {version}."));
+    }
+    if let Some(device_index) = parsed.device_index {
+        notes.push(format!("CUDA device {device_index} was benchmarked."));
+    } else {
+        notes.push(format!(
+            "Requested CUDA device {}.",
+            config.pytorch_cuda_device
+        ));
+    }
+    notes.push(format!(
+        "Peak CUDA allocated {}; reserved {}.",
+        format_bytes(parsed.peak_allocated_bytes),
+        format_bytes(parsed.peak_reserved_bytes)
+    ));
+    notes.push(
+        "Compute timing uses torch.cuda.Event; end-to-end timing uses Python wall-clock step latency."
+            .to_owned(),
+    );
+    notes.push(
+        "Single-process PyTorch CUDA path only; no distributed or cross-GPU communication is measured."
+            .to_owned(),
+    );
+    if parsed.time_limited {
+        notes.push(format!(
+            "Stopped after {} measured step(s) at the {} time limit.",
+            measured_steps,
+            format_elapsed(config.time_limit_s)
+        ));
+    }
+    if config.smoke_test {
+        notes.push("Smoke test run.".to_owned());
+    }
+
+    emit_ai_training_progress(
+        &tx,
+        "PyTorch CUDA benchmark complete",
+        total_steps,
+        total_steps,
+        started,
+        Some(config.time_limit_s),
+        true,
+    );
+    let _ = tx.send(AiTrainingWorkerEvent::Log(format!(
+        "Completed {} PyTorch CUDA measured step(s): {:.2} end-to-end TFLOP/s, {:.1} {}, avg step {} ms",
+        measured_steps,
+        end_to_end_tflops,
+        throughput_value,
+        config.workload.throughput_label(),
+        format_ms(Some(avg_step_ms))
+    )));
+
+    Ok(AiTrainingResult {
+        backend: config.backend,
+        workload: config.workload,
+        preset: config.preset,
+        precision: config.precision,
+        gpu_names: vec![gpu_name],
+        shape: linear_shape_label(&config.dimensions),
+        flops_per_step,
+        measured_steps,
+        compute_tflops,
+        end_to_end_tflops: Some(end_to_end_tflops),
+        throughput_value: Some(throughput_value),
+        throughput_label: config.workload.throughput_label(),
+        avg_step_ms: Some(avg_step_ms),
+        p95_step_ms: Some(p95_step_ms),
+        memory_bytes,
+        validation,
+        notes: notes.join(" "),
+    })
+}
+
+fn parse_pytorch_cuda_probe_output(output: &str, python: &str) -> PyTorchCudaEnvironment {
+    let mut environment = PyTorchCudaEnvironment {
+        ok: true,
+        python_executable: python.to_owned(),
+        python: python.to_owned(),
+        python_version: None,
+        torch_version: None,
+        torch_cuda_version: None,
+        cudnn_version: None,
+        cuda_available: false,
+        device_count: 0,
+        devices: Vec::new(),
+        distributed_available: false,
+        nccl_available: false,
+        notes: Vec::new(),
+        error: None,
+    };
+
+    for line in output.lines() {
+        let mut parts = line.splitn(2, '\t');
+        let key = parts.next().unwrap_or_default();
+        let value = parts.next().unwrap_or_default().trim();
+        match key {
+            "PYTHON" => environment.python_version = nonempty_probe_value(value),
+            "TORCH" => environment.torch_version = nonempty_probe_value(value),
+            "CUDA" => environment.torch_cuda_version = nonempty_probe_value(value),
+            "CUDNN" => environment.cudnn_version = nonempty_probe_value(value),
+            "CUDA_AVAILABLE" => {
+                environment.cuda_available = parse_probe_bool(value);
+            }
+            "DISTRIBUTED_AVAILABLE" => {
+                environment.distributed_available = parse_probe_bool(value);
+            }
+            "NCCL_AVAILABLE" => {
+                environment.nccl_available = parse_probe_bool(value);
+            }
+            "DEVICE_COUNT" => {
+                environment.device_count = value.parse::<usize>().unwrap_or(0);
+            }
+            "DEVICE" => {
+                if let Some(device) = parse_pytorch_cuda_device(value) {
+                    environment.devices.push(device);
+                }
+            }
+            "ERROR" if !value.is_empty() => environment.error = Some(value.to_owned()),
+            "NOTE" if !value.is_empty() => environment.notes.push(value.to_owned()),
+            _ => {}
+        }
+    }
+
+    if environment.device_count == 0 {
+        environment.device_count = environment.devices.len();
+    }
+    environment.ok = environment.error.is_none();
+    environment
+}
+
+fn parse_pytorch_cuda_benchmark_output(output: &str, python: &str) -> PyTorchCudaBenchmarkOutput {
+    let environment = parse_pytorch_cuda_probe_output(output, python);
+    let mut benchmark = PyTorchCudaBenchmarkOutput {
+        environment,
+        device_index: None,
+        gpu_name: None,
+        measured_steps: 0,
+        gpu_step_ms: Vec::new(),
+        wall_step_ms: Vec::new(),
+        peak_allocated_bytes: 0,
+        peak_reserved_bytes: 0,
+        validation: None,
+        time_limited: false,
+    };
+
+    for line in output.lines() {
+        let mut parts = line.splitn(2, '\t');
+        let key = parts.next().unwrap_or_default();
+        let value = parts.next().unwrap_or_default().trim();
+        match key {
+            "RESULT_DEVICE_INDEX" => benchmark.device_index = value.parse().ok(),
+            "RESULT_GPU_NAME" => benchmark.gpu_name = nonempty_probe_value(value),
+            "RESULT_MEASURED_STEPS" => {
+                benchmark.measured_steps = value.parse::<usize>().unwrap_or(0);
+            }
+            "RESULT_GPU_STEP_MS" => {
+                benchmark.gpu_step_ms = parse_tabbed_f64_values(value);
+            }
+            "RESULT_WALL_STEP_MS" => {
+                benchmark.wall_step_ms = parse_tabbed_f64_values(value);
+            }
+            "RESULT_PEAK_ALLOCATED_BYTES" => {
+                benchmark.peak_allocated_bytes = value.parse::<u64>().unwrap_or(0);
+            }
+            "RESULT_PEAK_RESERVED_BYTES" => {
+                benchmark.peak_reserved_bytes = value.parse::<u64>().unwrap_or(0);
+            }
+            "RESULT_VALIDATION" => benchmark.validation = nonempty_probe_value(value),
+            "RESULT_TIME_LIMITED" => benchmark.time_limited = parse_probe_bool(value),
+            _ => {}
+        }
+    }
+
+    benchmark
+}
+
+fn parse_pytorch_cuda_device(value: &str) -> Option<PyTorchCudaDevice> {
+    let columns = value.split('\t').collect::<Vec<_>>();
+    Some(PyTorchCudaDevice {
+        index: columns.first()?.parse().ok()?,
+        name: columns.get(1)?.to_string(),
+        capability_major: columns.get(2)?.parse().ok()?,
+        capability_minor: columns.get(3)?.parse().ok()?,
+        total_memory_bytes: columns.get(4)?.parse().ok()?,
+    })
+}
+
+fn pytorch_cuda_environment_has_device(
+    environment: &PyTorchCudaEnvironment,
+    device_index: usize,
+) -> bool {
+    environment
+        .devices
+        .iter()
+        .any(|device| device.index == device_index)
+        || (environment.devices.is_empty() && device_index < environment.device_count)
+}
+
+fn nonempty_probe_value(value: &str) -> Option<String> {
+    (!value.is_empty() && value != "None").then(|| value.to_owned())
+}
+
+fn parse_probe_bool(value: &str) -> bool {
+    value.eq_ignore_ascii_case("true")
+        || value == "1"
+        || value.eq_ignore_ascii_case("yes")
+}
+
+fn parse_tabbed_f64_values(value: &str) -> Vec<f64> {
+    value
+        .split('\t')
+        .filter_map(|part| part.trim().parse::<f64>().ok())
+        .collect()
+}
+
+fn pytorch_cuda_benchmark_timeout(time_limit_s: f64) -> Duration {
+    let benchmark_limit = if time_limit_s.is_finite() && time_limit_s > 0.0 {
+        time_limit_s.ceil() as u64
+    } else {
+        10
+    };
+    Duration::from_secs(benchmark_limit.saturating_add(180).max(180))
+}
+
+fn run_pytorch_cuda_probe_script(python: &str, timeout: Duration) -> Result<String> {
+    let script = r#"
+import sys
+print("PYTHON\t" + sys.version.split()[0])
+try:
+    import torch
+    print("TORCH\t" + str(torch.__version__))
+    print("CUDA\t" + str(torch.version.cuda or ""))
+    try:
+        cudnn_version = torch.backends.cudnn.version()
+        print("CUDNN\t" + str(cudnn_version or ""))
+    except Exception as exc:
+        print("CUDNN\t")
+        print("ERROR\tCould not read cuDNN version: " + str(exc))
+    try:
+        distributed = bool(hasattr(torch, "distributed") and torch.distributed.is_available())
+        print("DISTRIBUTED_AVAILABLE\t" + str(distributed))
+        if distributed and hasattr(torch.distributed, "is_nccl_available"):
+            print("NCCL_AVAILABLE\t" + str(bool(torch.distributed.is_nccl_available())))
+        else:
+            print("NCCL_AVAILABLE\tFalse")
+    except Exception as exc:
+        print("DISTRIBUTED_AVAILABLE\tFalse")
+        print("NCCL_AVAILABLE\tFalse")
+        print("ERROR\tCould not read distributed backend availability: " + str(exc))
+    available = bool(torch.cuda.is_available())
+    print("CUDA_AVAILABLE\t" + str(available))
+    count = int(torch.cuda.device_count()) if available else 0
+    print("DEVICE_COUNT\t" + str(count))
+    for index in range(count):
+        props = torch.cuda.get_device_properties(index)
+        major, minor = torch.cuda.get_device_capability(index)
+        print("DEVICE\t{}\t{}\t{}\t{}\t{}".format(
+            index,
+            props.name,
+            major,
+            minor,
+            int(props.total_memory),
+        ))
+except Exception as exc:
+    print("ERROR\t" + type(exc).__name__ + ": " + str(exc))
+"#;
+
+    let mut command = Command::new(python);
+    command
+        .arg("-c")
+        .arg(script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW_RAW);
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to start Python executable {python}"))?;
+    let started = Instant::now();
+    loop {
+        if child
+            .try_wait()
+            .with_context(|| format!("failed to query Python probe status for {python}"))?
+            .is_some()
+        {
+            break;
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!(
+                "PyTorch CUDA probe timed out after {} seconds",
+                timeout.as_secs()
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed to collect Python probe output from {python}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if output.status.success() {
+        return Ok(stdout);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    Err(anyhow!(
+        "PyTorch CUDA probe failed{}",
+        if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(": {stderr}")
+        }
+    ))
+}
+
+fn run_pytorch_cuda_benchmark_script(
+    config: &AiTrainingConfig,
+    cancel: &AtomicBool,
+    timeout: Duration,
+) -> Result<String> {
+    let python = config.pytorch_python.trim();
+    if python.is_empty() {
+        return Err(anyhow!("Python executable is required for PyTorch CUDA benchmarking"));
+    }
+    let time_limit = if config.time_limit_s.is_finite() && config.time_limit_s > 0.0 {
+        config.time_limit_s
+    } else {
+        10.0
+    };
+    let script = r#"
+import argparse
+import math
+import sys
+import time
+import traceback
+
+def clean(value):
+    return str(value).replace("\t", " ").replace("\n", " ")
+
+def emit(key, *values):
+    if values:
+        print(key + "\t" + "\t".join(clean(value) for value in values), flush=True)
+    else:
+        print(key, flush=True)
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--device", type=int, default=0)
+parser.add_argument("--batch", type=int, required=True)
+parser.add_argument("--input", type=int, required=True)
+parser.add_argument("--output", type=int, required=True)
+parser.add_argument("--warmup", type=int, required=True)
+parser.add_argument("--measured", type=int, required=True)
+parser.add_argument("--time-limit", type=float, required=True)
+parser.add_argument("--learning-rate", type=float, default=1.0e-4)
+args = parser.parse_args()
+
+emit("PYTHON", sys.version.split()[0])
+try:
+    import torch
+    import torch.nn.functional as F
+
+    emit("TORCH", getattr(torch, "__version__", ""))
+    emit("CUDA", getattr(torch.version, "cuda", "") or "")
+    try:
+        emit("CUDNN", torch.backends.cudnn.version() or "")
+    except Exception as exc:
+        emit("CUDNN", "")
+        emit("NOTE", "Could not read cuDNN version: " + str(exc))
+    try:
+        distributed = bool(hasattr(torch, "distributed") and torch.distributed.is_available())
+        emit("DISTRIBUTED_AVAILABLE", distributed)
+        if distributed and hasattr(torch.distributed, "is_nccl_available"):
+            emit("NCCL_AVAILABLE", bool(torch.distributed.is_nccl_available()))
+        else:
+            emit("NCCL_AVAILABLE", False)
+    except Exception as exc:
+        emit("DISTRIBUTED_AVAILABLE", False)
+        emit("NCCL_AVAILABLE", False)
+        emit("NOTE", "Could not read distributed backend availability: " + str(exc))
+
+    available = bool(torch.cuda.is_available())
+    emit("CUDA_AVAILABLE", available)
+    count = int(torch.cuda.device_count()) if available else 0
+    emit("DEVICE_COUNT", count)
+    for index in range(count):
+        props = torch.cuda.get_device_properties(index)
+        major, minor = torch.cuda.get_device_capability(index)
+        emit("DEVICE", index, props.name, major, minor, int(props.total_memory))
+
+    if not available:
+        emit("ERROR", "torch.cuda.is_available() is false")
+        sys.exit(0)
+    if args.device < 0 or args.device >= count:
+        emit("ERROR", "CUDA device {} is not available".format(args.device))
+        sys.exit(0)
+    if args.batch <= 0 or args.input <= 0 or args.output <= 0 or args.measured <= 0:
+        emit("ERROR", "batch, input, output, and measured steps must be positive")
+        sys.exit(0)
+
+    torch.cuda.set_device(args.device)
+    device = torch.device("cuda:{}".format(args.device))
+    props = torch.cuda.get_device_properties(args.device)
+    torch.manual_seed(1234)
+    torch.cuda.manual_seed_all(1234)
+
+    model = torch.nn.Linear(args.input, args.output, bias=False).to(device=device, dtype=torch.float32)
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate)
+    x = torch.randn(args.batch, args.input, device=device, dtype=torch.float32)
+    target = torch.randn(args.batch, args.output, device=device, dtype=torch.float32)
+
+    def train_step():
+        optimizer.zero_grad(set_to_none=True)
+        y = model(x)
+        loss = F.mse_loss(y, target)
+        loss.backward()
+        optimizer.step()
+        return loss
+
+    torch.cuda.synchronize()
+    for _ in range(max(args.warmup, 0)):
+        loss = train_step()
+    torch.cuda.synchronize()
+    try:
+        torch.cuda.reset_peak_memory_stats(device)
+    except Exception as exc:
+        emit("NOTE", "Could not reset peak CUDA memory stats: " + str(exc))
+
+    gpu_step_ms = []
+    wall_step_ms = []
+    measured_started = time.perf_counter()
+    time_limited = False
+    loss = None
+    for step in range(args.measured):
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        wall_started = time.perf_counter()
+        start_event.record()
+        loss = train_step()
+        end_event.record()
+        torch.cuda.synchronize()
+        wall_ms = (time.perf_counter() - wall_started) * 1000.0
+        gpu_ms = float(start_event.elapsed_time(end_event))
+        wall_step_ms.append(wall_ms)
+        gpu_step_ms.append(gpu_ms)
+        if step + 1 < args.measured and (time.perf_counter() - measured_started) >= args.time_limit:
+            time_limited = True
+            break
+
+    final_loss = float(loss.detach().cpu()) if loss is not None else float("nan")
+    if not math.isfinite(final_loss):
+        emit("ERROR", "final loss is not finite")
+        sys.exit(0)
+
+    try:
+        peak_allocated = int(torch.cuda.max_memory_allocated(device))
+        peak_reserved = int(torch.cuda.max_memory_reserved(device))
+    except Exception as exc:
+        peak_allocated = 0
+        peak_reserved = 0
+        emit("NOTE", "Could not read peak CUDA memory stats: " + str(exc))
+
+    emit("RESULT_DEVICE_INDEX", args.device)
+    emit("RESULT_GPU_NAME", props.name)
+    emit("RESULT_MEASURED_STEPS", len(gpu_step_ms))
+    emit("RESULT_GPU_STEP_MS", *["{:.6f}".format(value) for value in gpu_step_ms])
+    emit("RESULT_WALL_STEP_MS", *["{:.6f}".format(value) for value in wall_step_ms])
+    emit("RESULT_PEAK_ALLOCATED_BYTES", peak_allocated)
+    emit("RESULT_PEAK_RESERVED_BYTES", peak_reserved)
+    emit("RESULT_VALIDATION", "Passed: finite loss {:.6g}".format(final_loss))
+    emit("RESULT_TIME_LIMITED", time_limited)
+    emit("NOTE", "PyTorch CUDA linear benchmark uses torch.nn.Linear, MSE loss, backward, and SGD on one CUDA device.")
+except Exception as exc:
+    emit("ERROR", type(exc).__name__ + ": " + str(exc))
+    emit("NOTE", traceback.format_exc(limit=6))
+"#;
+
+    let mut command = Command::new(python);
+    command
+        .arg("-c")
+        .arg(script)
+        .arg("--device")
+        .arg(config.pytorch_cuda_device.to_string())
+        .arg("--batch")
+        .arg(config.dimensions.batch_size.to_string())
+        .arg("--input")
+        .arg(config.dimensions.input_dim.to_string())
+        .arg("--output")
+        .arg(config.dimensions.output_dim.to_string())
+        .arg("--warmup")
+        .arg(config.warmup_steps.to_string())
+        .arg("--measured")
+        .arg(config.measured_steps.to_string())
+        .arg("--time-limit")
+        .arg(format!("{time_limit:.3}"))
+        .arg("--learning-rate")
+        .arg("0.0001")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW_RAW);
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to start Python executable {python}"))?;
+    let started = Instant::now();
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!("PyTorch CUDA benchmark canceled"));
+        }
+        if child
+            .try_wait()
+            .with_context(|| format!("failed to query Python benchmark status for {python}"))?
+            .is_some()
+        {
+            break;
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!(
+                "PyTorch CUDA benchmark timed out after {} seconds",
+                timeout.as_secs()
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed to collect Python benchmark output from {python}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if output.status.success() {
+        return Ok(stdout);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    Err(anyhow!(
+        "PyTorch CUDA benchmark process failed{}",
+        if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(": {stderr}")
+        }
+    ))
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}

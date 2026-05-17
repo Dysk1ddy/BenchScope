@@ -14,6 +14,9 @@ $project = Join-Path $repoRoot "sensor-driver\BenchScopeSensorDriver.vcxproj"
 
 $candidateRoots = @(
     "${env:ProgramFiles}\Microsoft Visual Studio\2022\Community",
+    "${env:ProgramFiles}\Microsoft Visual Studio\2022\Professional",
+    "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise",
+    "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools",
     "${env:ProgramFiles(x86)}\Microsoft Visual Studio\18\BuildTools"
 ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
 

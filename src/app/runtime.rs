@@ -5,13 +5,17 @@ impl BenchScopeApp {
         self.sync_sensor_state();
         let drive_was_running = self.drive.running;
         let drive_result_count_before = self.drive.results.len();
+        let gpu_memory_was_running = self.gpu_memory.running;
+        let gpu_memory_result_count_before = self.gpu_memory.results.len();
         self.poll_worker_events();
+        self.gpu_memory.poll_worker_events();
         self.drive.poll_worker_events();
         self.storage_health.poll_worker_events();
         self.ram.poll_worker_events();
         self.battery.poll_worker_events();
         self.network.poll_worker_events();
         self.device_info.poll_worker_events();
+        self.ai_training.poll_worker_events();
         self.observe_temperature_run();
         if drive_was_running && !self.drive.running {
             if let Some(report) = self.finish_and_log_temperature_run() {
@@ -25,8 +29,21 @@ impl BenchScopeApp {
                 }
             }
         }
+        if gpu_memory_was_running && !self.gpu_memory.running {
+            if let Some(report) = self.finish_and_log_temperature_run() {
+                for result in self
+                    .gpu_memory
+                    .results
+                    .iter_mut()
+                    .skip(gpu_memory_result_count_before)
+                {
+                    result.gpu_temperature = report.gpu;
+                }
+            }
+        }
         self.sync_sensor_state();
         if self.running
+            || self.gpu_memory.running
             || self.drive.running
             || self.storage_health.running
             || self.ram.running
@@ -35,6 +52,7 @@ impl BenchScopeApp {
             || self.network.running
             || self.network.monitoring
             || self.device_info.running
+            || self.ai_training.running
         {
             ctx.request_repaint_after(Duration::from_millis(100));
         } else if self.view != AppView::MainMenu {
@@ -48,6 +66,8 @@ impl BenchScopeApp {
             AppView::BatteryHealthDiagnostic => self.ui_battery_health_diagnostic(ui),
             AppView::NetworkDiagnostic => self.ui_network_diagnostic(ui),
             AppView::DeviceInfo => self.ui_device_info(ui),
+            AppView::AiTrainingBenchmark => self.ui_ai_training_benchmark(ui),
+            AppView::GpuMemoryBenchmark => self.ui_gpu_memory_benchmark(ui),
             AppView::MatrixStressTest => self.ui_matrix_stress_test(ui),
             AppView::MatrixBenchmark => self.ui_matrix_benchmark(ui, &ctx),
         }
