@@ -11,6 +11,7 @@ impl BenchScopeApp {
         self.ram.poll_worker_events();
         self.battery.poll_worker_events();
         self.network.poll_worker_events();
+        self.device_info.poll_worker_events();
         self.observe_temperature_run();
         if drive_was_running && !self.drive.running {
             if let Some(report) = self.finish_and_log_temperature_run() {
@@ -33,6 +34,7 @@ impl BenchScopeApp {
             || self.battery.live_running
             || self.network.running
             || self.network.monitoring
+            || self.device_info.running
         {
             ctx.request_repaint_after(Duration::from_millis(100));
         } else if self.view != AppView::MainMenu {
@@ -45,6 +47,7 @@ impl BenchScopeApp {
             AppView::RamTester => self.ui_ram_tester(ui),
             AppView::BatteryHealthDiagnostic => self.ui_battery_health_diagnostic(ui),
             AppView::NetworkDiagnostic => self.ui_network_diagnostic(ui),
+            AppView::DeviceInfo => self.ui_device_info(ui),
             AppView::MatrixStressTest => self.ui_matrix_stress_test(ui),
             AppView::MatrixBenchmark => self.ui_matrix_benchmark(ui, &ctx),
         }

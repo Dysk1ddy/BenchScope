@@ -190,24 +190,37 @@ fn prefer_sensor_reading(
 }
 
 fn merge_sensor_reading(mut primary: SensorReading, fallback: SensorReading) -> SensorReading {
+    let fallback_status = fallback.status.clone();
+    let fallback_provider = fallback.provider.clone();
+    let fallback_has_data = fallback.has_any_value();
+    let mut filled_temperature = false;
+    let mut filled_utilization = false;
     if primary.temperature_c.is_none() && fallback.temperature_c.is_some() {
         primary.temperature_c = fallback.temperature_c;
         if primary.label.is_empty() || !primary.has_utilization() {
             primary.label = fallback.label.clone();
         }
+        filled_temperature = true;
     }
     if primary.utilization_percent.is_none() && fallback.utilization_percent.is_some() {
         primary.utilization_percent = fallback.utilization_percent;
+        filled_utilization = true;
     }
-    if !primary.is_ok()
-        && (primary.temperature_c.is_some() || primary.utilization_percent.is_some())
+    for metric in fallback.metrics {
+        primary.upsert_metric(metric);
+    }
+    primary.sync_legacy_metrics();
+    if filled_temperature || primary.temperature_c.is_some() {
+        primary.status = SensorStatus::Ok;
+    } else if filled_utilization && matches!(&fallback_status, SensorStatus::Partial(_)) {
+        primary.status = fallback_status;
+    } else if !primary.is_ok()
+        && primary.has_any_value()
     {
         primary.status = SensorStatus::Ok;
     }
-    if primary.provider != fallback.provider
-        && (fallback.temperature_c.is_some() || fallback.utilization_percent.is_some())
-    {
-        primary.provider = format!("{} + {}", primary.provider, fallback.provider);
+    if primary.provider != fallback_provider && fallback_has_data {
+        primary.provider = format!("{} + {}", primary.provider, fallback_provider);
     }
     primary
 }
@@ -241,15 +254,18 @@ fn apply_integrated_gpu_temperature_fallback(
         .gpu
         .as_ref()
         .and_then(|reading| reading.utilization_percent);
-    snapshot.gpu = Some(SensorReading {
+    let mut gpu = SensorReading {
         kind: SensorKind::Gpu,
         label: "iGPU shared CPU package".to_owned(),
         temperature_c: Some(cpu_temperature),
         utilization_percent,
+        metrics: Vec::new(),
         provider: format!("Shared CPU package ({})", cpu.provider),
         updated_at: Instant::now(),
         status: SensorStatus::Ok,
-    });
+    };
+    gpu.sync_legacy_metrics();
+    snapshot.gpu = Some(gpu);
     snapshot
 }
 
@@ -270,39 +286,44 @@ fn cpu_temperature_is_package_like(reading: &SensorReading) -> bool {
 }
 
 fn sensor_helper_path() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(dir) = exe_path.parent() {
-            candidates.push(dir.join("BenchScope.SensorHelper.exe"));
-        }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("target/release/BenchScope.SensorHelper.exe"));
-        candidates.push(cwd.join("target/debug/BenchScope.SensorHelper.exe"));
-        candidates.push(
-            cwd.join("sensor-helper/bin/Release/net10.0-windows/BenchScope.SensorHelper.exe"),
-        );
-        candidates
-            .push(cwd.join("sensor-helper/bin/Debug/net10.0-windows/BenchScope.SensorHelper.exe"));
-    }
-    candidates.into_iter().find(|path| path.is_file())
+    find_existing_tool_path(&[
+        "BenchScope.SensorHelper.exe",
+        "target/release/BenchScope.SensorHelper.exe",
+        "target/debug/BenchScope.SensorHelper.exe",
+        "sensor-helper/bin/Release/net10.0-windows/BenchScope.SensorHelper.exe",
+        "sensor-helper/bin/Debug/net10.0-windows/BenchScope.SensorHelper.exe",
+    ])
 }
 
 fn sensor_service_path() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
+    find_existing_tool_path(&[
+        "benchscope_sensor_service.exe",
+        "benchscope_sensor_service",
+        "target/debug/benchscope_sensor_service.exe",
+        "target/release/benchscope_sensor_service.exe",
+        "target/debug/benchscope_sensor_service",
+        "target/release/benchscope_sensor_service",
+    ])
+}
+
+fn find_existing_tool_path(relative_paths: &[&str]) -> Option<PathBuf> {
+    tool_search_roots()
+        .into_iter()
+        .flat_map(|root| relative_paths.iter().map(move |relative| root.join(relative)))
+        .find(|path| path.is_file())
+}
+
+fn tool_search_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(dir) = exe_path.parent() {
-            candidates.push(dir.join("benchscope_sensor_service.exe"));
-            candidates.push(dir.join("benchscope_sensor_service"));
+            roots.extend(dir.ancestors().map(PathBuf::from));
         }
     }
     if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("target/debug/benchscope_sensor_service.exe"));
-        candidates.push(cwd.join("target/release/benchscope_sensor_service.exe"));
-        candidates.push(cwd.join("target/debug/benchscope_sensor_service"));
-        candidates.push(cwd.join("target/release/benchscope_sensor_service"));
+        roots.extend(cwd.ancestors().map(PathBuf::from));
     }
-    candidates.into_iter().find(|path| path.is_file())
+    roots
 }
 
 fn parse_helper_snapshot(line: &str) -> Option<SensorSnapshot> {
@@ -332,19 +353,69 @@ fn parse_helper_reading(
     let status_text =
         json_string_for_key(object, "status").unwrap_or_else(|| "unsupported".to_owned());
     let message = json_string_for_key(object, "message");
-    let temperature_c = json_number_for_key(object, "temperatureC");
-    let utilization_percent = json_number_for_key(object, "utilizationPercent").map(clamp_percent);
+    let metrics = parse_helper_metrics(object);
+    let temperature_c = json_number_for_key(object, "temperatureC")
+        .or_else(|| first_metric_value(&metrics, SensorMetricKind::Temperature));
+    let utilization_percent = json_number_for_key(object, "utilizationPercent")
+        .or_else(|| first_metric_value(&metrics, SensorMetricKind::Utilization))
+        .map(clamp_percent);
     let status = helper_sensor_status(&status_text, message);
 
-    Some(SensorReading {
+    let mut reading = SensorReading {
         kind,
         label,
         temperature_c,
         utilization_percent,
+        metrics,
         provider,
         updated_at: Instant::now(),
         status,
-    })
+    };
+    reading.sync_legacy_metrics();
+    Some(reading)
+}
+
+fn first_metric_value(metrics: &[SensorMetric], kind: SensorMetricKind) -> Option<f32> {
+    metrics
+        .iter()
+        .find(|metric| metric.kind == kind)
+        .and_then(|metric| metric.value)
+}
+
+fn parse_helper_metrics(object: &str) -> Vec<SensorMetric> {
+    let Some(array) = json_array_for_key(object, "metrics") else {
+        return Vec::new();
+    };
+    json_objects_in_array(array)
+        .into_iter()
+        .filter_map(parse_helper_metric)
+        .collect()
+}
+
+fn parse_helper_metric(object: &str) -> Option<SensorMetric> {
+    let kind_text = json_string_for_key(object, "kind")
+        .or_else(|| json_string_for_key(object, "category"))?;
+    let kind = sensor_metric_kind_from_json(&kind_text)?;
+    let label = json_string_for_key(object, "label")
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or_else(|| kind.default_label().to_owned());
+    let value = json_number_for_key(object, "value");
+    let min = json_number_for_key(object, "min");
+    let max = json_number_for_key(object, "max");
+    Some(SensorMetric::new(kind, label, value).with_range(min, max))
+}
+
+fn sensor_metric_kind_from_json(value: &str) -> Option<SensorMetricKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "temperature" | "temperatures" | "temp" => Some(SensorMetricKind::Temperature),
+        "utilization" | "utilisation" | "load" | "loads" | "usage" => {
+            Some(SensorMetricKind::Utilization)
+        }
+        "voltage" | "voltages" | "volt" | "volts" => Some(SensorMetricKind::Voltage),
+        "power" | "powers" | "watt" | "watts" => Some(SensorMetricKind::Power),
+        "clock" | "clocks" | "frequency" | "frequencies" => Some(SensorMetricKind::Clock),
+        _ => None,
+    }
 }
 
 fn helper_sensor_status(status: &str, message: Option<String>) -> SensorStatus {
@@ -408,6 +479,92 @@ fn json_object_for_key<'a>(line: &'a str, key: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+fn json_array_for_key<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let pattern = format!("\"{key}\":");
+    let start = line.find(&pattern)? + pattern.len();
+    let bytes = line.as_bytes();
+    let mut index = start;
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    if bytes.get(index).copied()? != b'[' {
+        return None;
+    }
+
+    let array_start = index;
+    let mut depth = 0_i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in line[array_start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    let end = array_start + offset + ch.len_utf8();
+                    return Some(&line[array_start..end]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn json_objects_in_array(array: &str) -> Vec<&str> {
+    let mut objects = Vec::new();
+    let mut object_start = None;
+    let mut depth = 0_i32;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (index, ch) in array.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    object_start = Some(index);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(start) = object_start.take() {
+                        objects.push(&array[start..index + ch.len_utf8()]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    objects
 }
 
 fn json_string_for_key(object: &str, key: &str) -> Option<String> {
@@ -583,6 +740,11 @@ fn attach_utilization(
         return;
     };
     reading.utilization_percent = Some(utilization_percent);
+    reading.upsert_metric(SensorMetric::new(
+        SensorMetricKind::Utilization,
+        SensorMetricKind::Utilization.default_label(),
+        Some(utilization_percent),
+    ));
     if reading.provider != utilization_provider {
         reading.provider = if reading.provider.is_empty() {
             utilization_provider.to_owned()
@@ -826,15 +988,20 @@ if ($partition) {{
 
 fn query_memory_sensor() -> SensorReading {
     match detect_ram_memory_info() {
-        Ok(info) => SensorReading {
+        Ok(info) => {
+            let mut reading = SensorReading {
             kind: SensorKind::Memory,
             label: "System RAM".to_owned(),
             temperature_c: None,
             utilization_percent: Some(clamp_percent(info.memory_load_percent as f32)),
+            metrics: Vec::new(),
             provider: "Windows memory status".to_owned(),
             updated_at: Instant::now(),
             status: SensorStatus::Ok,
-        },
+            };
+            reading.sync_legacy_metrics();
+            reading
+        }
         Err(err) => SensorReading::unavailable(
             SensorKind::Memory,
             "System RAM",

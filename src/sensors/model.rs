@@ -49,12 +49,75 @@ impl SensorStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SensorMetricKind {
+    Temperature,
+    Utilization,
+    Voltage,
+    Power,
+    Clock,
+}
+
+impl SensorMetricKind {
+    fn group_label(self) -> &'static str {
+        match self {
+            SensorMetricKind::Temperature => "Temperatures",
+            SensorMetricKind::Utilization => "Utilization",
+            SensorMetricKind::Voltage => "Voltages",
+            SensorMetricKind::Power => "Powers",
+            SensorMetricKind::Clock => "Clocks",
+        }
+    }
+
+    fn default_label(self) -> &'static str {
+        match self {
+            SensorMetricKind::Temperature => "Temperature",
+            SensorMetricKind::Utilization => "Utilization",
+            SensorMetricKind::Voltage => "Voltage",
+            SensorMetricKind::Power => "Power",
+            SensorMetricKind::Clock => "Clock",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SensorMetric {
+    kind: SensorMetricKind,
+    label: String,
+    value: Option<f32>,
+    min: Option<f32>,
+    max: Option<f32>,
+}
+
+impl SensorMetric {
+    fn new(kind: SensorMetricKind, label: impl Into<String>, value: Option<f32>) -> Self {
+        Self {
+            kind,
+            label: label.into(),
+            value,
+            min: None,
+            max: None,
+        }
+    }
+
+    fn with_range(mut self, min: Option<f32>, max: Option<f32>) -> Self {
+        self.min = min;
+        self.max = max;
+        self
+    }
+
+    fn has_value(&self) -> bool {
+        self.value.is_some()
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SensorReading {
     kind: SensorKind,
     label: String,
     temperature_c: Option<f32>,
     utilization_percent: Option<f32>,
+    metrics: Vec<SensorMetric>,
     provider: String,
     updated_at: Instant,
     status: SensorStatus,
@@ -62,15 +125,18 @@ struct SensorReading {
 
 impl SensorReading {
     fn ok(kind: SensorKind, label: impl Into<String>, temperature_c: f32, provider: &str) -> Self {
-        Self {
+        let mut reading = Self {
             kind,
             label: label.into(),
             temperature_c: Some(temperature_c),
             utilization_percent: None,
+            metrics: Vec::new(),
             provider: provider.to_owned(),
             updated_at: Instant::now(),
             status: SensorStatus::Ok,
-        }
+        };
+        reading.sync_legacy_metrics();
+        reading
     }
 
     fn unavailable(
@@ -79,19 +145,22 @@ impl SensorReading {
         provider: &str,
         status: SensorStatus,
     ) -> Self {
-        Self {
+        let mut reading = Self {
             kind,
             label: label.into(),
             temperature_c: None,
             utilization_percent: None,
+            metrics: Vec::new(),
             provider: provider.to_owned(),
             updated_at: Instant::now(),
             status,
-        }
+        };
+        reading.sync_legacy_metrics();
+        reading
     }
 
     fn mark_stale(mut self) -> Self {
-        if self.temperature_c.is_some() || self.utilization_percent.is_some() {
+        if self.has_any_value() {
             self.status = SensorStatus::Stale;
         }
         self
@@ -99,7 +168,7 @@ impl SensorReading {
 
     fn is_ok(&self) -> bool {
         matches!(self.status, SensorStatus::Ok | SensorStatus::Partial(_))
-            && (self.temperature_c.is_some() || self.utilization_percent.is_some())
+            && self.has_any_value()
     }
 
     fn has_temperature(&self) -> bool {
@@ -111,6 +180,102 @@ impl SensorReading {
         matches!(self.status, SensorStatus::Ok | SensorStatus::Partial(_))
             && self.utilization_percent.is_some()
     }
+
+    fn has_any_value(&self) -> bool {
+        self.temperature_c.is_some()
+            || self.utilization_percent.is_some()
+            || self.metrics.iter().any(SensorMetric::has_value)
+    }
+
+    fn metrics_for(&self, kind: SensorMetricKind) -> impl Iterator<Item = &SensorMetric> {
+        self.metrics
+            .iter()
+            .filter(move |metric| metric.kind == kind && metric.has_value())
+    }
+
+    fn sync_legacy_metrics(&mut self) {
+        if let Some(value) = self.temperature_c {
+            let label = if self.label.trim().is_empty() {
+                SensorMetricKind::Temperature.default_label().to_owned()
+            } else {
+                self.label.clone()
+            };
+            self.upsert_metric(SensorMetric::new(
+                SensorMetricKind::Temperature,
+                label,
+                Some(value),
+            ));
+        }
+        if let Some(value) = self.utilization_percent {
+            self.upsert_metric(SensorMetric::new(
+                SensorMetricKind::Utilization,
+                SensorMetricKind::Utilization.default_label(),
+                Some(value),
+            ));
+        }
+    }
+
+    fn upsert_metric(&mut self, metric: SensorMetric) {
+        if !metric.has_value() {
+            return;
+        }
+        if let Some(existing) = self
+            .metrics
+            .iter_mut()
+            .find(|existing| sensor_metric_slots_match(existing, &metric))
+        {
+            if existing.value.is_none() {
+                existing.value = metric.value;
+            }
+            if existing.min.is_none() {
+                existing.min = metric.min;
+            }
+            if existing.max.is_none() {
+                existing.max = metric.max;
+            }
+            if sensor_metric_label_is_generic(&existing.label)
+                && !sensor_metric_label_is_generic(&metric.label)
+            {
+                existing.label = metric.label;
+            }
+        } else {
+            self.metrics.push(metric);
+        }
+    }
+}
+
+fn sensor_metric_slots_match(left: &SensorMetric, right: &SensorMetric) -> bool {
+    if left.kind != right.kind {
+        return false;
+    }
+    left.label.eq_ignore_ascii_case(&right.label)
+        || (matches!(
+            left.kind,
+            SensorMetricKind::Temperature | SensorMetricKind::Utilization
+        ) && (sensor_metric_label_is_generic(&left.label)
+            || sensor_metric_label_is_generic(&right.label)))
+}
+
+fn sensor_metric_label_is_generic(label: &str) -> bool {
+    let label = label.trim().to_ascii_lowercase();
+    matches!(
+        label.as_str(),
+        "" | "cpu"
+            | "gpu"
+            | "ssd"
+            | "ram"
+            | "temperature"
+            | "temperatures"
+            | "utilization"
+            | "load"
+            | "loads"
+            | "voltage"
+            | "voltages"
+            | "power"
+            | "powers"
+            | "clock"
+            | "clocks"
+    )
 }
 
 #[derive(Clone, Debug, Default)]
@@ -132,6 +297,52 @@ impl SensorSnapshot {
             memory: stale_checked_reading(self.memory.clone(), now, stale_after),
             helper_elevated: self.helper_elevated,
         }
+    }
+
+    fn with_tracked_metric_ranges(mut self, previous: Option<&SensorSnapshot>) -> Self {
+        track_reading_metric_ranges(&mut self.cpu, previous.and_then(|snapshot| snapshot.cpu.as_ref()));
+        track_reading_metric_ranges(&mut self.gpu, previous.and_then(|snapshot| snapshot.gpu.as_ref()));
+        track_reading_metric_ranges(
+            &mut self.drive,
+            previous.and_then(|snapshot| snapshot.drive.as_ref()),
+        );
+        track_reading_metric_ranges(
+            &mut self.memory,
+            previous.and_then(|snapshot| snapshot.memory.as_ref()),
+        );
+        self
+    }
+}
+
+fn track_reading_metric_ranges(
+    reading: &mut Option<SensorReading>,
+    previous: Option<&SensorReading>,
+) {
+    let Some(reading) = reading else {
+        return;
+    };
+    for metric in &mut reading.metrics {
+        let Some(value) = metric.value else {
+            continue;
+        };
+        let previous_metric = previous.and_then(|previous| {
+            previous
+                .metrics
+                .iter()
+                .find(|candidate| sensor_metric_slots_match(candidate, metric))
+        });
+        metric.min = Some(
+            metric
+                .min
+                .or_else(|| previous_metric.and_then(|metric| metric.min))
+                .map_or(value, |current| current.min(value)),
+        );
+        metric.max = Some(
+            metric
+                .max
+                .or_else(|| previous_metric.and_then(|metric| metric.max))
+                .map_or(value, |current| current.max(value)),
+        );
     }
 }
 
@@ -275,7 +486,7 @@ impl SensorManager {
                     }
 
                     let primary_snapshot =
-                        service_snapshot.clone().or_else(|| helper_snapshot.clone());
+                        merge_sensor_snapshots(service_snapshot.clone(), helper_snapshot.clone());
                     let fallback_snapshot = primary_snapshot.as_ref().and_then(|snapshot| {
                         helper_snapshot_has_gaps(snapshot)
                             .then(|| collect_sensor_snapshot(drive_letter))
@@ -287,7 +498,7 @@ impl SensorManager {
                         use_shared_gpu_temperature,
                     );
                     if let Ok(mut latest) = thread_latest.write() {
-                        *latest = snapshot;
+                        *latest = snapshot.with_tracked_metric_ranges(Some(&*latest));
                     }
 
                     let sleep_for = Duration::from_millis(SENSOR_POLL_MS);

@@ -1,6 +1,6 @@
 # BenchScope
 
-Native desktop tool for comparing CPU matrix multiplication against GPU compute, with storage, memory, battery, and network diagnostic tools built into the same app.
+Native desktop tool for comparing CPU matrix multiplication against GPU compute, with storage, memory, battery, network, and device-information diagnostic tools built into the same app.
 
 The primary implementation is now Rust + `wgpu` + `egui`. The earlier Python Direct3D prototype remains archived in `archive/benchscope.py` as a fallback/reference implementation.
 
@@ -71,7 +71,9 @@ Choose the GPU submission intensity used by self-test:
 
 ## Current Features
 
-- Main menu with separate tool views for the matrix benchmark, matrix stress test, drive benchmark, storage health checker, RAM tester, battery health diagnostic, and network hardware diagnostic.
+- Main menu with separate tool views for the matrix benchmark, matrix stress test, drive benchmark, storage health checker, RAM tester, battery health diagnostic, network hardware diagnostic, and device information viewer.
+- Device Information Viewer with HWiNFO-style system inventory for OS/system, BIOS version and date, baseboard, CPU details, RAM modules, disks/volumes, GPUs, monitors, network adapters, and signed-driver records with provider, version, date, signer, and INF metadata.
+- Device Information Viewer includes a provider coverage plan showing which details are available through current Windows/CIM, DXGI/wgpu, Storage Health, Network Diagnostic, and BenchScope sensor-service paths, plus which HWiNFO-class gaps would need future signed driver/vendor-provider work.
 - SSD / HDD Health Checker tool with SMART/NVMe health snapshots, temperature, life estimates, bad-sector warning counters, read-only sampled scans, quick benchmark hook, and Markdown report export.
 - RAM tester tool with Memtest-style moving inversions, walking-bit samples, address-sensitive patterns, pseudo-random verification, modulo-stride checks, and block-move stress.
 - RAM tester runtime is capped to 2 minutes per installed 8 GiB of system memory and reports tested bytes separately from installed RAM.
@@ -138,6 +140,6 @@ On Windows, a large compute dispatch that keeps the GPU busy for too long can tr
 
 The drive benchmark prefers direct/no-buffering I/O on Windows. If the selected path or filesystem rejects direct mode, the app falls back to cached I/O and labels the result. Cached mode is useful for quick comparisons, but it can include operating-system RAM cache effects, especially on repeated reads.
 
-Temperature and utilization readings are supplemental telemetry and are sampled continuously at 1 Hz, even when no benchmark is running. BenchScope uses command-based Windows/NVIDIA probes by default: `nvidia-smi`/NVML for GPU temperature when available, already-running OpenHardwareMonitor/LibreHardwareMonitor WMI namespaces for external CPU/GPU temperatures when present, Windows performance counters for utilization, and Windows storage reliability counters for the selected drive letter. BenchScope does not treat Windows ACPI thermal-zone values as CPU package/core temperatures because those readings are often static firmware zones. Unsupported or permission-blocked sensors show `N/A` and never prevent benchmarks from running. On Windows, BenchScope automatically relaunches the GUI as administrator before opening the main window.
+Temperature and utilization readings are supplemental telemetry and are sampled continuously at 1 Hz, even when no benchmark is running. BenchScope merges the BenchScope sensor service/driver and command-based Windows/NVIDIA probes. The safe provider layer uses `nvidia-smi`/NVML for GPU temperature when available, already-running OpenHardwareMonitor/LibreHardwareMonitor WMI namespaces for external CPU/GPU temperatures when present, Windows performance counters for utilization, and Windows storage reliability counters for the selected drive letter. BenchScope does not treat Windows ACPI thermal-zone values as CPU package/core temperatures because those readings are often static firmware zones. Unsupported or permission-blocked sensors show `N/A` and never prevent benchmarks from running. On Windows, BenchScope automatically relaunches the GUI as administrator before opening the main window.
 
-The optional `sensor-helper/` project remains in the repository for reference, but the Rust app does not launch it. LibreHardwareMonitor can create or load a WinRing driver on Windows, and Microsoft Defender may identify that driver as `VulnerableDriver:WinNT/Winring0`; BenchScope avoids that path and uses the safe Windows/NVIDIA probes instead.
+The optional `sensor-helper/` project remains in the repository for reference, but the Rust app does not launch it. LibreHardwareMonitor can create or load a WinRing driver on Windows, and Microsoft Defender may identify that driver as `VulnerableDriver:WinNT/Winring0`; BenchScope avoids that path and uses the native BenchScope sensor driver plus safe Windows/NVIDIA probes instead.

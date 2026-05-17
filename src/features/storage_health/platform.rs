@@ -9,7 +9,10 @@ fn query_storage_health_snapshot(drive: &DriveInfo) -> Result<StorageHealthSnaps
         };
         let script = windows_storage_health_script(letter);
         match run_powershell_sensor_script(&script) {
-            Ok(output) => Ok(parse_windows_storage_health_output(drive, &output)),
+            Ok(output) => {
+                let snapshot = parse_windows_storage_health_output(drive, &output);
+                Ok(merge_direct_nvme_health_log(drive, snapshot, &output))
+            }
             Err(err) => {
                 let mut snapshot = StorageHealthSnapshot::unknown(
                     drive,
@@ -98,6 +101,11 @@ if ($disk) {
             Where-Object { $_.Index -eq $disk.Number } |
             Select-Object -First 1
     }
+}
+
+$physicalDriveNumber = First-Value @((Value $disk 'Number'), (Value $drive 'Index'))
+if ($physicalDriveNumber) {
+    Emit @('DISK', $physicalDriveNumber)
 }
 
 $model = First-Value @((Value $physical 'FriendlyName'), (Value $disk 'FriendlyName'), (Value $drive 'Model'))
@@ -219,6 +227,28 @@ struct RawSmartAttribute {
     worst: Option<u64>,
     threshold: Option<u64>,
     raw: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct NvmeHealthLog {
+    critical_warning_flags: u64,
+    temperature_c: Option<f32>,
+    available_spare_percent: u64,
+    available_spare_threshold_percent: u64,
+    percentage_used: u64,
+    data_read_bytes: u64,
+    data_written_bytes: u64,
+    host_read_commands: u64,
+    host_write_commands: u64,
+    controller_busy_time_minutes: u64,
+    power_cycle_count: u64,
+    power_on_hours: u64,
+    unsafe_shutdowns: u64,
+    media_errors: u64,
+    error_info_log_entries: u64,
+    warning_temperature_time_minutes: u64,
+    critical_temperature_time_minutes: u64,
+    temperature_sensors_c: [Option<f32>; 8],
 }
 
 #[cfg(windows)]
@@ -428,6 +458,207 @@ fn parse_windows_storage_health_output(drive: &DriveInfo, output: &str) -> Stora
         .unwrap_or_else(|err| StorageHealthSnapshot::unknown(drive, format!("{err:#}")))
 }
 
+#[cfg(windows)]
+fn merge_direct_nvme_health_log(
+    drive: &DriveInfo,
+    mut snapshot: StorageHealthSnapshot,
+    provider_output: &str,
+) -> StorageHealthSnapshot {
+    if !is_nvme_storage_snapshot(&snapshot) {
+        return snapshot;
+    }
+
+    let Some(physical_drive_number) = parse_windows_physical_drive_number(provider_output) else {
+        snapshot.provider_notes.push(
+            "Direct NVMe SMART health log was skipped because Windows did not report the physical drive number"
+                .to_owned(),
+        );
+        return snapshot;
+    };
+
+    match query_direct_nvme_health_log(physical_drive_number) {
+        Ok(health_log) => {
+            apply_nvme_health_log_to_snapshot(&mut snapshot, &health_log);
+            snapshot.provider_notes.push(format!(
+                "Direct NVMe SMART health log read from PhysicalDrive{physical_drive_number}"
+            ));
+            finalize_storage_health_snapshot(snapshot)
+                .unwrap_or_else(|err| StorageHealthSnapshot::unknown(drive, format!("{err:#}")))
+        }
+        Err(err) => {
+            snapshot.provider_notes.push(format!(
+                "Direct NVMe SMART health log unavailable for PhysicalDrive{physical_drive_number}: {err:#}"
+            ));
+            snapshot
+        }
+    }
+}
+
+#[cfg(windows)]
+fn is_nvme_storage_snapshot(snapshot: &StorageHealthSnapshot) -> bool {
+    snapshot.bus_type.to_ascii_lowercase().contains("nvme")
+        || snapshot.model.to_ascii_lowercase().contains("nvme")
+}
+
+#[cfg(windows)]
+fn parse_windows_physical_drive_number(output: &str) -> Option<u32> {
+    output.lines().find_map(|line| {
+        let columns = line.split('\t').collect::<Vec<_>>();
+        (columns.first().copied() == Some("DISK"))
+            .then(|| parse_optional_u64(columns.get(1).copied()))
+            .flatten()
+            .and_then(|value| u32::try_from(value).ok())
+    })
+}
+
+#[cfg(windows)]
+struct StorageDeviceHandle(*mut std::ffi::c_void);
+
+#[cfg(windows)]
+impl StorageDeviceHandle {
+    fn open(path: &str) -> Result<Self> {
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        const OPEN_EXISTING: u32 = 3;
+        const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+
+        use std::os::windows::ffi::OsStrExt;
+
+        let path_wide = std::ffi::OsStr::new(path)
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let handle = unsafe {
+            storage_create_file_w(
+                path_wide.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+
+        if handle as isize == -1 {
+            return Err(anyhow!("opening {path}: {}", std::io::Error::last_os_error()));
+        }
+
+        Ok(Self(handle))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for StorageDeviceHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = storage_close_handle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    #[link_name = "CreateFileW"]
+    fn storage_create_file_w(
+        lp_file_name: *const u16,
+        dw_desired_access: u32,
+        dw_share_mode: u32,
+        lp_security_attributes: *mut std::ffi::c_void,
+        dw_creation_disposition: u32,
+        dw_flags_and_attributes: u32,
+        h_template_file: *mut std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
+
+    #[link_name = "DeviceIoControl"]
+    fn storage_device_io_control(
+        h_device: *mut std::ffi::c_void,
+        dw_io_control_code: u32,
+        lp_in_buffer: *mut std::ffi::c_void,
+        n_in_buffer_size: u32,
+        lp_out_buffer: *mut std::ffi::c_void,
+        n_out_buffer_size: u32,
+        lp_bytes_returned: *mut u32,
+        lp_overlapped: *mut std::ffi::c_void,
+    ) -> i32;
+
+    #[link_name = "CloseHandle"]
+    fn storage_close_handle(h_object: *mut std::ffi::c_void) -> i32;
+}
+
+#[cfg(windows)]
+fn query_direct_nvme_health_log(physical_drive_number: u32) -> Result<NvmeHealthLog> {
+    const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D_1400;
+    const STORAGE_DEVICE_PROTOCOL_SPECIFIC_PROPERTY: u32 = 50;
+    const PROPERTY_STANDARD_QUERY: u32 = 0;
+    const PROTOCOL_TYPE_NVME: u32 = 3;
+    const NVME_DATA_TYPE_LOG_PAGE: u32 = 2;
+    const NVME_LOG_PAGE_HEALTH_INFO: u32 = 0x02;
+    const STORAGE_PROPERTY_QUERY_SIZE: usize = 8;
+    const STORAGE_PROTOCOL_SPECIFIC_DATA_SIZE: usize = 40;
+    const STORAGE_PROTOCOL_DATA_DESCRIPTOR_HEADER_SIZE: usize = 8;
+    const NVME_HEALTH_INFO_LOG_SIZE: usize = 512;
+
+    let device_path = format!(r"\\.\PhysicalDrive{physical_drive_number}");
+    let handle = StorageDeviceHandle::open(&device_path)?;
+    let mut buffer = vec![
+        0_u8;
+        STORAGE_PROTOCOL_DATA_DESCRIPTOR_HEADER_SIZE
+            + STORAGE_PROTOCOL_SPECIFIC_DATA_SIZE
+            + NVME_HEALTH_INFO_LOG_SIZE
+    ];
+
+    write_u32_le(&mut buffer, 0, STORAGE_DEVICE_PROTOCOL_SPECIFIC_PROPERTY);
+    write_u32_le(&mut buffer, 4, PROPERTY_STANDARD_QUERY);
+    let protocol = STORAGE_PROPERTY_QUERY_SIZE;
+    write_u32_le(&mut buffer, protocol, PROTOCOL_TYPE_NVME);
+    write_u32_le(&mut buffer, protocol + 4, NVME_DATA_TYPE_LOG_PAGE);
+    write_u32_le(&mut buffer, protocol + 8, NVME_LOG_PAGE_HEALTH_INFO);
+    write_u32_le(
+        &mut buffer,
+        protocol + 16,
+        STORAGE_PROTOCOL_SPECIFIC_DATA_SIZE as u32,
+    );
+    write_u32_le(&mut buffer, protocol + 20, NVME_HEALTH_INFO_LOG_SIZE as u32);
+
+    let mut returned = 0_u32;
+    let ok = unsafe {
+        storage_device_io_control(
+            handle.0,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            buffer.as_mut_ptr().cast::<std::ffi::c_void>(),
+            buffer.len() as u32,
+            buffer.as_mut_ptr().cast::<std::ffi::c_void>(),
+            buffer.len() as u32,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(anyhow!(
+            "DeviceIoControl(IOCTL_STORAGE_QUERY_PROPERTY) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let returned_protocol = STORAGE_PROTOCOL_DATA_DESCRIPTOR_HEADER_SIZE;
+    let data_offset = read_u32_le(&buffer, returned_protocol + 16)
+        .map(|offset| returned_protocol + offset as usize)
+        .unwrap_or(returned_protocol + STORAGE_PROTOCOL_SPECIFIC_DATA_SIZE);
+    let data_length = read_u32_le(&buffer, returned_protocol + 20)
+        .map(|length| length as usize)
+        .unwrap_or(NVME_HEALTH_INFO_LOG_SIZE);
+    if data_offset >= buffer.len() || data_length == 0 {
+        return Err(anyhow!("NVMe health log returned an empty protocol data buffer"));
+    }
+    let data_end = data_offset.saturating_add(data_length).min(buffer.len());
+    parse_nvme_health_log_bytes(&buffer[data_offset..data_end])
+        .ok_or_else(|| anyhow!("NVMe health log was shorter than expected"))
+}
+
 fn finalize_storage_health_snapshot(
     mut snapshot: StorageHealthSnapshot,
 ) -> Result<StorageHealthSnapshot> {
@@ -599,6 +830,7 @@ fn finalize_storage_health_snapshot(
         || snapshot.pending_sectors.is_some()
         || snapshot.uncorrectable_sectors.is_some()
         || snapshot.media_errors.is_some()
+        || snapshot.nvme_error_info_log_entries.is_some()
         || snapshot.read_errors_total.is_some()
         || snapshot.write_errors_total.is_some()
         || snapshot.available_spare_percent.is_some()
@@ -631,7 +863,42 @@ fn finalize_storage_health_snapshot(
     Ok(snapshot)
 }
 
+fn apply_nvme_health_log_to_snapshot(snapshot: &mut StorageHealthSnapshot, health: &NvmeHealthLog) {
+    snapshot.temperature_c = health.temperature_c.or(snapshot.temperature_c);
+    snapshot.available_spare_percent = Some(health.available_spare_percent);
+    snapshot.available_spare_threshold_percent = Some(health.available_spare_threshold_percent);
+    snapshot.critical_warning_flags = Some(health.critical_warning_flags);
+    snapshot.unsafe_shutdowns = Some(health.unsafe_shutdowns);
+    snapshot.controller_busy_time_minutes = Some(health.controller_busy_time_minutes);
+    snapshot.host_read_commands = Some(health.host_read_commands);
+    snapshot.host_write_commands = Some(health.host_write_commands);
+    snapshot.warning_temperature_time_minutes = Some(health.warning_temperature_time_minutes);
+    snapshot.critical_temperature_time_minutes = Some(health.critical_temperature_time_minutes);
+    snapshot.power_cycle_count = Some(health.power_cycle_count);
+    snapshot.power_on_hours = Some(health.power_on_hours);
+    snapshot.media_errors = Some(health.media_errors);
+    snapshot.nvme_error_info_log_entries = Some(health.error_info_log_entries);
+    snapshot.data_read_bytes = Some(health.data_read_bytes);
+    snapshot.data_written_bytes = Some(health.data_written_bytes);
+    snapshot.remaining_life_percent =
+        Some((100.0 - health.percentage_used as f32).clamp(0.0, 100.0));
+    snapshot.nvme_temperature_sensors_c = health.temperature_sensors_c;
+
+    snapshot
+        .attributes
+        .retain(|attribute| attribute.name != "Wear / percentage used");
+    snapshot.attributes.push(storage_counter_attribute(
+        "Wear / percentage used",
+        Some(health.percentage_used),
+        "%",
+        wear_severity(health.percentage_used),
+    ));
+    push_nvme_health_attributes(snapshot);
+}
+
 fn push_nvme_health_attributes(snapshot: &mut StorageHealthSnapshot) {
+    remove_nvme_health_attributes(snapshot);
+
     let spare_severity = nvme_spare_severity(
         snapshot.available_spare_percent,
         snapshot.available_spare_threshold_percent,
@@ -684,6 +951,34 @@ fn push_nvme_health_attributes(snapshot: &mut StorageHealthSnapshot) {
         snapshot.host_write_commands,
         "",
         HealthSeverity::Info,
+    );
+    push_optional_counter_attribute(
+        &mut snapshot.attributes,
+        "NVMe data read",
+        snapshot.data_read_bytes,
+        " bytes",
+        HealthSeverity::Info,
+    );
+    push_optional_counter_attribute(
+        &mut snapshot.attributes,
+        "NVMe data written",
+        snapshot.data_written_bytes,
+        " bytes",
+        HealthSeverity::Info,
+    );
+    push_optional_counter_attribute(
+        &mut snapshot.attributes,
+        "NVMe media/data integrity errors",
+        snapshot.media_errors,
+        "",
+        error_count_severity(snapshot.media_errors),
+    );
+    push_optional_counter_attribute(
+        &mut snapshot.attributes,
+        "NVMe error information log entries",
+        snapshot.nvme_error_info_log_entries,
+        "",
+        error_count_severity(snapshot.nvme_error_info_log_entries),
     );
     push_optional_counter_attribute(
         &mut snapshot.attributes,
@@ -740,6 +1035,12 @@ fn push_nvme_health_attributes(snapshot: &mut StorageHealthSnapshot) {
             });
         }
     }
+}
+
+fn remove_nvme_health_attributes(snapshot: &mut StorageHealthSnapshot) {
+    snapshot
+        .attributes
+        .retain(|attribute| !attribute.name.starts_with("NVMe "));
 }
 
 fn nvme_spare_severity(spare: Option<u64>, threshold: Option<u64>) -> HealthSeverity {
@@ -1091,6 +1392,77 @@ fn push_optional_counter_attribute(
     if value.is_some() {
         attributes.push(storage_counter_attribute(name, value, suffix, severity));
     }
+}
+
+fn parse_nvme_health_log_bytes(bytes: &[u8]) -> Option<NvmeHealthLog> {
+    if bytes.len() < 216 {
+        return None;
+    }
+
+    let mut temperature_sensors_c = [None; 8];
+    for (index, sensor) in temperature_sensors_c.iter_mut().enumerate() {
+        *sensor = read_u16_le(bytes, 200 + index * 2).and_then(nvme_kelvin_to_celsius);
+    }
+
+    Some(NvmeHealthLog {
+        critical_warning_flags: bytes.first().copied().unwrap_or(0) as u64,
+        temperature_c: read_u16_le(bytes, 1).and_then(nvme_kelvin_to_celsius),
+        available_spare_percent: bytes.get(3).copied().unwrap_or(0) as u64,
+        available_spare_threshold_percent: bytes.get(4).copied().unwrap_or(0) as u64,
+        percentage_used: bytes.get(5).copied().unwrap_or(0) as u64,
+        data_read_bytes: nvme_data_units_to_bytes(read_u128_le(bytes, 32)?),
+        data_written_bytes: nvme_data_units_to_bytes(read_u128_le(bytes, 48)?),
+        host_read_commands: u128_to_u64_saturating(read_u128_le(bytes, 64)?),
+        host_write_commands: u128_to_u64_saturating(read_u128_le(bytes, 80)?),
+        controller_busy_time_minutes: u128_to_u64_saturating(read_u128_le(bytes, 96)?),
+        power_cycle_count: u128_to_u64_saturating(read_u128_le(bytes, 112)?),
+        power_on_hours: u128_to_u64_saturating(read_u128_le(bytes, 128)?),
+        unsafe_shutdowns: u128_to_u64_saturating(read_u128_le(bytes, 144)?),
+        media_errors: u128_to_u64_saturating(read_u128_le(bytes, 160)?),
+        error_info_log_entries: u128_to_u64_saturating(read_u128_le(bytes, 176)?),
+        warning_temperature_time_minutes: read_u32_le(bytes, 192)? as u64,
+        critical_temperature_time_minutes: read_u32_le(bytes, 196)? as u64,
+        temperature_sensors_c,
+    })
+}
+
+fn read_u16_le(bytes: &[u8], offset: usize) -> Option<u16> {
+    let value = bytes.get(offset..offset + 2)?;
+    Some(u16::from_le_bytes([value[0], value[1]]))
+}
+
+fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
+    let value = bytes.get(offset..offset + 4)?;
+    Some(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn read_u128_le(bytes: &[u8], offset: usize) -> Option<u128> {
+    let value = bytes.get(offset..offset + 16)?;
+    let mut wide = [0_u8; 16];
+    wide.copy_from_slice(value);
+    Some(u128::from_le_bytes(wide))
+}
+
+fn write_u32_le(bytes: &mut [u8], offset: usize, value: u32) {
+    if let Some(target) = bytes.get_mut(offset..offset + 4) {
+        target.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn nvme_kelvin_to_celsius(kelvin: u16) -> Option<f32> {
+    if kelvin == 0 {
+        return None;
+    }
+    let celsius = kelvin as f32 - 273.15;
+    (-60.0..=150.0).contains(&celsius).then_some(celsius)
+}
+
+fn nvme_data_units_to_bytes(units: u128) -> u64 {
+    u128_to_u64_saturating(units.saturating_mul(512_000))
+}
+
+fn u128_to_u64_saturating(value: u128) -> u64 {
+    value.min(u64::MAX as u128) as u64
 }
 
 fn parse_storage_data_units(value: Option<&str>) -> Option<u64> {

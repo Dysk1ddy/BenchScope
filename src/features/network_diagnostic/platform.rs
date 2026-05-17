@@ -468,6 +468,222 @@ fn run_network_quick_diagnosis(
     })
 }
 
+fn run_network_speed_test(
+    cancel: Arc<AtomicBool>,
+    tx: Sender<NetworkWorkerEvent>,
+) -> Result<NetworkSpeedTestResult> {
+    let start = Instant::now();
+    let total_samples = NETWORK_SPEED_DOWNLOAD_BYTES
+        .len()
+        .saturating_add(NETWORK_SPEED_UPLOAD_BYTES.len())
+        .max(1);
+    let mut completed_samples = 0usize;
+    let mut samples = Vec::new();
+    let mut notes = vec![
+        "Single-stream payload test against Cloudflare Speed Test endpoints; results are useful for diagnostics but may differ from a saturation-grade ISP benchmark."
+            .to_owned(),
+    ];
+
+    let _ = tx.send(NetworkWorkerEvent::Log(
+        "Running internet speed test against Cloudflare Speed Test endpoints".to_owned(),
+    ));
+
+    for (direction, byte_sizes) in [
+        (
+            NetworkSpeedDirection::Download,
+            NETWORK_SPEED_DOWNLOAD_BYTES,
+        ),
+        (NetworkSpeedDirection::Upload, NETWORK_SPEED_UPLOAD_BYTES),
+    ] {
+        for bytes in byte_sizes {
+            check_canceled_with(Some(&cancel), "Internet speed test canceled")?;
+            let _ = tx.send(NetworkWorkerEvent::Progress(NetworkProgress {
+                step: format!(
+                    "Testing {} {}",
+                    direction.label().to_ascii_lowercase(),
+                    format_network_payload_size(*bytes)
+                ),
+                progress: completed_samples as f32 / total_samples as f32,
+                elapsed_s: start.elapsed().as_secs_f64(),
+            }));
+
+            match run_network_speed_http_sample(direction, *bytes) {
+                Ok(sample) => {
+                    completed_samples += 1;
+                    let _ = tx.send(NetworkWorkerEvent::SpeedSampleCompleted(sample.clone()));
+                    samples.push(sample);
+                }
+                Err(err) => {
+                    completed_samples += 1;
+                    let note = format!(
+                        "{} sample {} failed: {err:#}",
+                        direction.label(),
+                        format_network_payload_size(*bytes)
+                    );
+                    let _ = tx.send(NetworkWorkerEvent::Log(note.clone()));
+                    notes.push(note);
+                }
+            }
+        }
+    }
+
+    check_canceled_with(Some(&cancel), "Internet speed test canceled")?;
+    if samples.is_empty() {
+        return Err(anyhow!(
+            "internet speed test failed; no download or upload samples completed"
+        ));
+    }
+
+    let download_mbps = summarize_network_speed(&samples, NetworkSpeedDirection::Download);
+    let upload_mbps = summarize_network_speed(&samples, NetworkSpeedDirection::Upload);
+    let _ = tx.send(NetworkWorkerEvent::Progress(NetworkProgress {
+        step: "Internet speed test complete".to_owned(),
+        progress: 1.0,
+        elapsed_s: start.elapsed().as_secs_f64(),
+    }));
+
+    Ok(NetworkSpeedTestResult {
+        download_mbps,
+        upload_mbps,
+        samples,
+        notes,
+        elapsed_s: start.elapsed().as_secs_f64(),
+    })
+}
+
+#[cfg(windows)]
+fn run_network_speed_http_sample(
+    direction: NetworkSpeedDirection,
+    bytes: u64,
+) -> Result<NetworkSpeedSample> {
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+Add-Type -AssemblyName System.Net.Http
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
+$direction = '__DIRECTION__'
+$bytes = [Int64]__BYTES__
+$timeoutMs = [Int32]__TIMEOUT_MS__
+$client = [System.Net.Http.HttpClient]::new()
+$client.Timeout = [TimeSpan]::FromMilliseconds($timeoutMs)
+$client.DefaultRequestHeaders.UserAgent.ParseAdd('Mozilla/5.0 (Windows NT 10.0; Win64; x64) BenchScope/0.1')
+$client.DefaultRequestHeaders.Accept.ParseAdd('*/*')
+$client.DefaultRequestHeaders.Referrer = [Uri]'https://speed.cloudflare.com/'
+$client.DefaultRequestHeaders.CacheControl = [System.Net.Http.Headers.CacheControlHeaderValue]::new()
+$client.DefaultRequestHeaders.CacheControl.NoCache = $true
+$client.DefaultRequestHeaders.Pragma.ParseAdd('no-cache')
+$client.DefaultRequestHeaders.TryAddWithoutValidation('Origin', 'https://speed.cloudflare.com') | Out-Null
+$response = $null
+$content = $null
+$stream = $null
+$actualBytes = [Int64]0
+
+try {
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    if ($direction -eq 'download') {
+        $cacheBust = [Guid]::NewGuid().ToString('N')
+        $uri = "https://speed.cloudflare.com/__down?bytes=$bytes&during=download&cacheBust=$cacheBust"
+        $response = $client.GetAsync($uri, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+        $response.EnsureSuccessStatusCode() | Out-Null
+        $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+        $buffer = [byte[]]::new(65536)
+        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $actualBytes += $read
+        }
+    } else {
+        $payload = [byte[]]::new($bytes)
+        $content = [System.Net.Http.ByteArrayContent]::new($payload)
+        $content.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse('application/octet-stream')
+        $cacheBust = [Guid]::NewGuid().ToString('N')
+        $response = $client.PostAsync("https://speed.cloudflare.com/__up?during=upload&cacheBust=$cacheBust", $content).GetAwaiter().GetResult()
+        $response.EnsureSuccessStatusCode() | Out-Null
+        $actualBytes = $bytes
+    }
+    $sw.Stop()
+    $elapsed = $sw.Elapsed.TotalMilliseconds.ToString('0.###', [System.Globalization.CultureInfo]::InvariantCulture)
+    "BENCHSCOPE_SPEED`t$direction`t$actualBytes`t$elapsed"
+} finally {
+    if ($stream -ne $null) { $stream.Dispose() }
+    if ($response -ne $null) { $response.Dispose() }
+    if ($content -ne $null) { $content.Dispose() }
+    $client.Dispose()
+}
+"#
+    .replace("__DIRECTION__", direction.script_value())
+    .replace("__BYTES__", &bytes.to_string())
+    .replace(
+        "__TIMEOUT_MS__",
+        &NETWORK_SPEED_REQUEST_TIMEOUT_MS.to_string(),
+    );
+    let output = run_powershell_sensor_script(&script)?;
+    parse_network_speed_sample_output(&output)
+}
+
+#[cfg(not(windows))]
+fn run_network_speed_http_sample(
+    direction: NetworkSpeedDirection,
+    bytes: u64,
+) -> Result<NetworkSpeedSample> {
+    let _ = (direction, bytes);
+    Err(anyhow!(
+        "internet speed test is currently implemented for Windows"
+    ))
+}
+
+fn parse_network_speed_sample_output(output: &str) -> Result<NetworkSpeedSample> {
+    for line in output.lines() {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.first().copied() != Some("BENCHSCOPE_SPEED") {
+            continue;
+        }
+        if fields.len() < 4 {
+            return Err(anyhow!("speed test output was incomplete"));
+        }
+        let direction = parse_network_speed_direction(fields[1])
+            .ok_or_else(|| anyhow!("unknown speed test direction '{}'", fields[1]))?;
+        let bytes = parse_u64_maybe(fields[2])
+            .ok_or_else(|| anyhow!("invalid speed test byte count '{}'", fields[2]))?;
+        let elapsed_ms = fields[3]
+            .trim()
+            .parse::<f64>()
+            .with_context(|| format!("invalid speed test elapsed time '{}'", fields[3]))?;
+        if elapsed_ms <= 0.0 {
+            return Err(anyhow!("speed test elapsed time was not positive"));
+        }
+        return Ok(NetworkSpeedSample {
+            direction,
+            bytes,
+            elapsed_ms,
+            mbps: network_speed_mbps(bytes, elapsed_ms),
+        });
+    }
+    Err(anyhow!("speed test did not return a result row"))
+}
+
+fn parse_network_speed_direction(value: &str) -> Option<NetworkSpeedDirection> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "download" => Some(NetworkSpeedDirection::Download),
+        "upload" => Some(NetworkSpeedDirection::Upload),
+        _ => None,
+    }
+}
+
+fn network_speed_mbps(bytes: u64, elapsed_ms: f64) -> f64 {
+    (bytes as f64 * 8.0) / (elapsed_ms / 1000.0) / 1_000_000.0
+}
+
+fn summarize_network_speed(
+    samples: &[NetworkSpeedSample],
+    direction: NetworkSpeedDirection,
+) -> Option<f64> {
+    samples
+        .iter()
+        .filter(|sample| sample.direction == direction)
+        .map(|sample| sample.mbps)
+        .reduce(f64::max)
+}
+
 fn run_network_monitor(
     adapter_id: String,
     cancel: Arc<AtomicBool>,
@@ -1189,6 +1405,33 @@ fn network_diagnostic_report_markdown(state: &NetworkDiagnosticState) -> String 
         }
     }
 
+    if let Some(speed) = &state.speed_result {
+        report.push_str("\n## Internet Speed Test\n\n");
+        report.push_str(&format!(
+            "- Download: {}\n",
+            format_network_speed_mbps(speed.download_mbps)
+        ));
+        report.push_str(&format!(
+            "- Upload: {}\n",
+            format_network_speed_mbps(speed.upload_mbps)
+        ));
+        report.push_str(&format!("- Elapsed: {}\n", format_elapsed(speed.elapsed_s)));
+        for note in &speed.notes {
+            report.push_str(&format!("- Note: {note}\n"));
+        }
+        report.push_str("\n| Direction | Payload | Elapsed | Throughput |\n");
+        report.push_str("| --- | ---: | ---: | ---: |\n");
+        for sample in &speed.samples {
+            report.push_str(&format!(
+                "| {} | {} | {} | {} |\n",
+                sample.direction.label(),
+                format_network_payload_size(sample.bytes),
+                format_elapsed(sample.elapsed_ms / 1000.0),
+                format_network_speed_mbps(Some(sample.mbps))
+            ));
+        }
+    }
+
     report.push_str("\n## Findings\n\n");
     for finding in &state.findings {
         report.push_str(&format!(
@@ -1271,6 +1514,26 @@ fn format_link_speed(value: Option<u64>) -> String {
         Some(value) if value >= 1_000_000 => format!("{:.0} Mbps", value as f64 / 1_000_000.0),
         Some(value) if value >= 1_000 => format!("{:.0} Kbps", value as f64 / 1_000.0),
         Some(value) => format!("{value} bps"),
+        None => "N/A".to_owned(),
+    }
+}
+
+fn format_network_payload_size(bytes: u64) -> String {
+    if bytes >= 1_000_000 {
+        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+    } else if bytes >= 1_000 {
+        format!("{:.0} KB", bytes as f64 / 1_000.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn format_network_speed_mbps(value: Option<f64>) -> String {
+    match value {
+        Some(value) if value >= 1000.0 => format!("{:.2} Gbps", value / 1000.0),
+        Some(value) if value >= 100.0 => format!("{value:.0} Mbps"),
+        Some(value) if value >= 10.0 => format!("{value:.1} Mbps"),
+        Some(value) => format!("{value:.2} Mbps"),
         None => "N/A".to_owned(),
     }
 }

@@ -8,5 +8,6 @@ enum AppView {
     RamTester,
     BatteryHealthDiagnostic,
     NetworkDiagnostic,
+    DeviceInfo,
 }
 

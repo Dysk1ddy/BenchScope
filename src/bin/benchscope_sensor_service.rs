@@ -41,16 +41,81 @@ const FAST_COMMAND_TIMEOUT: Duration = Duration::from_millis(1_800);
 const SLOW_COMMAND_TIMEOUT: Duration = Duration::from_millis(4_500);
 const ASYNC_PROVIDER_ABANDON_AFTER: Duration = Duration::from_secs(6);
 const CPU_INITIAL_SAMPLE_WINDOW: Duration = Duration::from_millis(120);
+const BENCHSCOPE_SENSOR_ADVANCED_HAS_POWER: u32 = 0x0000_0010;
+const BENCHSCOPE_SENSOR_ADVANCED_HAS_VOLTAGE: u32 = 0x0000_0040;
 #[cfg(windows)]
 const DRIVER_SERVICE_NAME: &str = "BenchScopeSensorDriver";
 #[cfg(windows)]
 const DRIVER_START_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BridgeMetricKind {
+    Temperature,
+    Utilization,
+    Voltage,
+    Power,
+    Clock,
+}
+
+impl BridgeMetricKind {
+    fn json_key(self) -> &'static str {
+        match self {
+            BridgeMetricKind::Temperature => "temperature",
+            BridgeMetricKind::Utilization => "utilization",
+            BridgeMetricKind::Voltage => "voltage",
+            BridgeMetricKind::Power => "power",
+            BridgeMetricKind::Clock => "clock",
+        }
+    }
+
+    fn default_label(self) -> &'static str {
+        match self {
+            BridgeMetricKind::Temperature => "Temperature",
+            BridgeMetricKind::Utilization => "Utilization",
+            BridgeMetricKind::Voltage => "Voltage",
+            BridgeMetricKind::Power => "Power",
+            BridgeMetricKind::Clock => "Clock",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BridgeMetric {
+    kind: BridgeMetricKind,
+    label: String,
+    value: Option<f32>,
+    min: Option<f32>,
+    max: Option<f32>,
+}
+
+impl BridgeMetric {
+    fn new(kind: BridgeMetricKind, label: &str, value: Option<f32>) -> Self {
+        Self {
+            kind,
+            label: label.to_owned(),
+            value,
+            min: None,
+            max: None,
+        }
+    }
+
+    fn with_range(mut self, min: Option<f32>, max: Option<f32>) -> Self {
+        self.min = min;
+        self.max = max;
+        self
+    }
+
+    fn has_value(&self) -> bool {
+        self.value.is_some()
+    }
+}
 
 #[derive(Clone, Debug)]
 struct BridgeReading {
     label: String,
     temperature_c: Option<f32>,
     utilization_percent: Option<f32>,
+    metrics: Vec<BridgeMetric>,
     provider: String,
     status: String,
     message: Option<String>,
@@ -62,6 +127,7 @@ impl BridgeReading {
             label: label.to_owned(),
             temperature_c: None,
             utilization_percent: None,
+            metrics: Vec::new(),
             provider: provider.to_owned(),
             status: status.to_owned(),
             message,
@@ -69,53 +135,110 @@ impl BridgeReading {
     }
 
     fn from_driver(reading: &BenchScopeSensorReading) -> Self {
-        Self {
-            label: wide_to_string(&reading.label),
-            temperature_c: (reading.flags & BENCHSCOPE_SENSOR_READING_HAS_TEMPERATURE != 0)
-                .then_some(reading.temperature_milli_c as f32 / 1000.0),
-            utilization_percent: (reading.flags & BENCHSCOPE_SENSOR_READING_HAS_UTILIZATION != 0)
-                .then_some(reading.utilization_milli_percent as f32 / 1000.0),
+        let temperature_c = (reading.flags & BENCHSCOPE_SENSOR_READING_HAS_TEMPERATURE != 0)
+            .then_some(reading.temperature_milli_c as f32 / 1000.0);
+        let utilization_percent = (reading.flags & BENCHSCOPE_SENSOR_READING_HAS_UTILIZATION != 0)
+            .then_some(reading.utilization_milli_percent as f32 / 1000.0);
+        let label = wide_to_string(&reading.label);
+        let mut bridge = Self {
+            label: label.clone(),
+            temperature_c,
+            utilization_percent,
+            metrics: Vec::new(),
             provider: wide_to_string(&reading.provider),
             status: status_json_value(status_from_driver(reading.status)).to_owned(),
+            message: None,
+        };
+        if let Some(value) = temperature_c {
+            bridge.upsert_metric(BridgeMetric::new(
+                BridgeMetricKind::Temperature,
+                &label,
+                Some(value),
+            ));
+        }
+        if let Some(value) = utilization_percent {
+            bridge.upsert_metric(BridgeMetric::new(
+                BridgeMetricKind::Utilization,
+                BridgeMetricKind::Utilization.default_label(),
+                Some(value),
+            ));
+        }
+        bridge
+    }
+
+    fn from_metrics(label: &str, provider: &str, mut metrics: Vec<BridgeMetric>) -> Self {
+        metrics.retain(BridgeMetric::has_value);
+        let temperature_c = first_bridge_metric_value(&metrics, BridgeMetricKind::Temperature);
+        let utilization_percent =
+            first_bridge_metric_value(&metrics, BridgeMetricKind::Utilization).map(clamp_percent);
+        Self {
+            label: label.to_owned(),
+            temperature_c,
+            utilization_percent,
+            metrics,
+            provider: provider.to_owned(),
+            status: "ok".to_owned(),
             message: None,
         }
     }
 
     fn from_temperature(label: &str, value: f32, provider: &str) -> Self {
-        Self {
+        let mut reading = Self {
             label: label.to_owned(),
             temperature_c: Some(round_tenth(value)),
             utilization_percent: None,
+            metrics: Vec::new(),
             provider: provider.to_owned(),
             status: "ok".to_owned(),
             message: None,
-        }
+        };
+        reading.upsert_metric(BridgeMetric::new(
+            BridgeMetricKind::Temperature,
+            label,
+            reading.temperature_c,
+        ));
+        reading
     }
 
     fn from_utilization(label: &str, value: f32, provider: &str, partial_message: &str) -> Self {
-        Self {
+        let mut reading = Self {
             label: label.to_owned(),
             temperature_c: None,
             utilization_percent: Some(clamp_percent(value)),
+            metrics: Vec::new(),
             provider: provider.to_owned(),
             status: "partial".to_owned(),
             message: Some(partial_message.to_owned()),
-        }
+        };
+        reading.upsert_metric(BridgeMetric::new(
+            BridgeMetricKind::Utilization,
+            BridgeMetricKind::Utilization.default_label(),
+            reading.utilization_percent,
+        ));
+        reading
     }
 
     fn from_memory_utilization(value: f32) -> Self {
-        Self {
+        let mut reading = Self {
             label: "System RAM".to_owned(),
             temperature_c: None,
             utilization_percent: Some(clamp_percent(value)),
+            metrics: Vec::new(),
             provider: "Windows memory status".to_owned(),
             status: "ok".to_owned(),
             message: None,
-        }
+        };
+        reading.upsert_metric(BridgeMetric::new(
+            BridgeMetricKind::Utilization,
+            "Memory",
+            reading.utilization_percent,
+        ));
+        reading
     }
 
     fn merge_safe_provider(&mut self, safe: BridgeReading) {
         let mut changed = false;
+        let safe_has_metrics = safe.metrics.iter().any(BridgeMetric::has_value);
         if self.temperature_c.is_none() && safe.temperature_c.is_some() {
             self.temperature_c = safe.temperature_c;
             if self.label.is_empty()
@@ -131,6 +254,10 @@ impl BridgeReading {
             self.utilization_percent = safe.utilization_percent;
             changed = true;
         }
+        for metric in &safe.metrics {
+            self.upsert_metric(metric.clone());
+        }
+        changed |= safe_has_metrics;
         if changed {
             self.merge_provider(&safe.provider);
             self.status = if safe.status == "ok" || self.temperature_c.is_some() {
@@ -156,6 +283,75 @@ impl BridgeReading {
             self.provider = format!("{} + {}", self.provider, provider);
         }
     }
+
+    fn upsert_metric(&mut self, metric: BridgeMetric) {
+        if !metric.has_value() {
+            return;
+        }
+        if let Some(existing) = self
+            .metrics
+            .iter_mut()
+            .find(|existing| bridge_metric_slots_match(existing, &metric))
+        {
+            if existing.value.is_none() {
+                existing.value = metric.value;
+            }
+            if existing.min.is_none() {
+                existing.min = metric.min;
+            }
+            if existing.max.is_none() {
+                existing.max = metric.max;
+            }
+            if bridge_metric_label_is_generic(&existing.label)
+                && !bridge_metric_label_is_generic(&metric.label)
+            {
+                existing.label = metric.label;
+            }
+        } else {
+            self.metrics.push(metric);
+        }
+    }
+}
+
+fn first_bridge_metric_value(metrics: &[BridgeMetric], kind: BridgeMetricKind) -> Option<f32> {
+    metrics
+        .iter()
+        .find(|metric| metric.kind == kind)
+        .and_then(|metric| metric.value)
+}
+
+fn bridge_metric_slots_match(left: &BridgeMetric, right: &BridgeMetric) -> bool {
+    if left.kind != right.kind {
+        return false;
+    }
+    left.label.eq_ignore_ascii_case(&right.label)
+        || (matches!(
+            left.kind,
+            BridgeMetricKind::Temperature | BridgeMetricKind::Utilization
+        ) && (bridge_metric_label_is_generic(&left.label)
+            || bridge_metric_label_is_generic(&right.label)))
+}
+
+fn bridge_metric_label_is_generic(label: &str) -> bool {
+    let label = label.trim().to_ascii_lowercase();
+    matches!(
+        label.as_str(),
+        "" | "cpu"
+            | "gpu"
+            | "ssd"
+            | "ram"
+            | "temperature"
+            | "temperatures"
+            | "utilization"
+            | "load"
+            | "loads"
+            | "voltage"
+            | "voltages"
+            | "power"
+            | "powers"
+            | "clock"
+            | "clocks"
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -378,11 +574,13 @@ struct BridgeState {
     capabilities: Option<sensor_driver_client::BenchScopeSensorCapabilities>,
     driver_start_attempted: bool,
     cpu_sampler: CpuUtilizationSampler,
+    cpu_temperature: AsyncCachedReading,
     cpu_utilization: CachedReading,
     gpu_temperature: AsyncCachedReading,
     gpu_utilization: AsyncCachedReading,
     drive_temperature: AsyncCachedReading,
     memory_utilization: CachedReading,
+    cpu_energy_sample: Option<(u64, Instant)>,
     motherboard_identification: Option<MotherboardIdentification>,
     motherboard_identification_attempted: bool,
 }
@@ -396,11 +594,13 @@ impl BridgeState {
             capabilities: None,
             driver_start_attempted: false,
             cpu_sampler: CpuUtilizationSampler::new(),
+            cpu_temperature: AsyncCachedReading::new(GPU_TEMP_TTL),
             cpu_utilization: CachedReading::new(FAST_PROVIDER_TTL),
             gpu_temperature: AsyncCachedReading::new(GPU_TEMP_TTL),
             gpu_utilization: AsyncCachedReading::new(FAST_PROVIDER_TTL),
             drive_temperature: AsyncCachedReading::new(DRIVE_TEMP_TTL),
             memory_utilization: CachedReading::new(FAST_PROVIDER_TTL),
+            cpu_energy_sample: None,
             motherboard_identification: None,
             motherboard_identification_attempted: false,
         }
@@ -413,22 +613,26 @@ impl BridgeState {
                 self.device = None;
                 self.version = None;
                 self.capabilities = None;
-                error_snapshot_json(&error)
+                self.safe_snapshot_json(&error)
             }
         }
     }
 
     fn warm_up_slow_providers(&mut self, max_wait: Duration) {
         let started = Instant::now();
-        let _ = self.driver_snapshot_json();
+        if let Err(error) = self.driver_snapshot_json() {
+            let _ = self.safe_snapshot_json(&error);
+        }
 
         while started.elapsed() < max_wait {
             let now = Instant::now();
+            self.cpu_temperature.collect_finished(now);
             self.gpu_temperature.collect_finished(now);
             self.gpu_utilization.collect_finished(now);
             self.drive_temperature.collect_finished(now);
 
-            if !self.gpu_temperature.is_pending()
+            if !self.cpu_temperature.is_pending()
+                && !self.gpu_temperature.is_pending()
                 && !self.gpu_utilization.is_pending()
                 && !self.drive_temperature.is_pending()
             {
@@ -461,10 +665,54 @@ impl BridgeState {
             self.motherboard_identification_attempted = true;
         }
         let mut readings = driver_readings_from_snapshot(&snapshot);
+        let cpu_power_w = self.derive_cpu_package_power_w(advanced.as_ref());
         if let Some(advanced) = &advanced {
-            apply_advanced_telemetry_to_readings(&mut readings, advanced);
+            apply_advanced_telemetry_to_readings(&mut readings, advanced, cpu_power_w);
         }
+        self.merge_user_mode_providers(&mut readings);
 
+        Ok(snapshot_json_from_parts(
+            version,
+            capabilities,
+            advanced.as_ref(),
+            self.motherboard_identification.as_ref(),
+            readings,
+        ))
+    }
+
+    fn safe_snapshot_json(&mut self, driver_error: &str) -> String {
+        let provider = "BenchScope sensor driver bridge";
+        let mut readings = BridgeReadings {
+            cpu: BridgeReading::unavailable(
+                "CPU",
+                provider,
+                "unavailable",
+                Some(driver_error.to_owned()),
+            ),
+            gpu: BridgeReading::unavailable(
+                "GPU",
+                provider,
+                "unavailable",
+                Some(driver_error.to_owned()),
+            ),
+            drive: BridgeReading::unavailable(
+                "SSD",
+                provider,
+                "unavailable",
+                Some(driver_error.to_owned()),
+            ),
+            memory: BridgeReading::unavailable(
+                "System RAM",
+                provider,
+                "unavailable",
+                Some(driver_error.to_owned()),
+            ),
+        };
+        self.merge_user_mode_providers(&mut readings);
+        fallback_snapshot_json(driver_error, readings)
+    }
+
+    fn merge_user_mode_providers(&mut self, readings: &mut BridgeReadings) {
         let now = Instant::now();
         let query_cpu_utilization_now = !self.cpu_utilization.is_fresh(now);
         let query_memory_utilization_now = !self.memory_utilization.is_fresh(now);
@@ -473,6 +721,9 @@ impl BridgeState {
             query_cpu_utilization_now.then(|| self.cpu_sampler.query_utilization());
         let next_memory_utilization = query_memory_utilization_now.then(query_memory_utilization);
 
+        let cpu_temperature = self
+            .cpu_temperature
+            .resolve_query(now, query_cpu_temperature);
         let cpu_utilization = self
             .cpu_utilization
             .resolve_query(now, next_cpu_utilization);
@@ -489,6 +740,9 @@ impl BridgeState {
             .memory_utilization
             .resolve_query(now, next_memory_utilization);
 
+        if let Some(reading) = cpu_temperature {
+            readings.cpu.merge_safe_provider(reading);
+        }
         if let Some(reading) = cpu_utilization {
             readings.cpu.merge_safe_provider(reading);
         }
@@ -504,14 +758,34 @@ impl BridgeState {
         if let Some(reading) = memory_utilization {
             readings.memory.merge_safe_provider(reading);
         }
+    }
 
-        Ok(snapshot_json_from_parts(
-            version,
-            capabilities,
-            advanced.as_ref(),
-            self.motherboard_identification.as_ref(),
-            readings,
-        ))
+    fn derive_cpu_package_power_w(
+        &mut self,
+        advanced: Option<&BenchScopeSensorAdvancedTelemetry>,
+    ) -> Option<f32> {
+        let advanced = advanced?;
+        let reading = advanced
+            .readings
+            .iter()
+            .take(advanced.reading_count.min(advanced.readings.len() as u32) as usize)
+            .find(|reading| {
+                kind_json_key(kind_from_driver(reading.kind)) == "cpu"
+                    && reading.flags & BENCHSCOPE_SENSOR_ADVANCED_HAS_ENERGY != 0
+            })?;
+        let now = Instant::now();
+        let energy_mj = reading.energy_milli_joules;
+        let previous = self.cpu_energy_sample.replace((energy_mj, now));
+        let (previous_energy_mj, previous_at) = previous?;
+        let elapsed_s = now.duration_since(previous_at).as_secs_f32();
+        if elapsed_s <= 0.0 || energy_mj < previous_energy_mj {
+            return None;
+        }
+        let delta_j = (energy_mj - previous_energy_mj) as f32 / 1000.0;
+        let watts = delta_j / elapsed_s;
+        (0.0..=1000.0)
+            .contains(&watts)
+            .then_some(round_tenth(watts))
     }
 
     fn open_driver_with_auto_start(&mut self) -> Result<DeviceHandle, String> {
@@ -747,6 +1021,7 @@ fn driver_readings_from_snapshot(
 fn apply_advanced_telemetry_to_readings(
     readings: &mut BridgeReadings,
     advanced: &BenchScopeSensorAdvancedTelemetry,
+    cpu_power_w: Option<f32>,
 ) {
     for reading in advanced
         .readings
@@ -763,6 +1038,25 @@ fn apply_advanced_telemetry_to_readings(
             readings.cpu.label = wide_to_string(&reading.label);
             readings.cpu.provider = wide_to_string(&reading.provider);
             readings.cpu.status = status_json_value(status_from_driver(reading.status)).to_owned();
+            readings.cpu.upsert_metric(BridgeMetric::new(
+                BridgeMetricKind::Temperature,
+                &readings.cpu.label.clone(),
+                readings.cpu.temperature_c,
+            ));
+        }
+        if reading.flags & BENCHSCOPE_SENSOR_ADVANCED_HAS_POWER != 0 {
+            readings.cpu.upsert_metric(BridgeMetric::new(
+                BridgeMetricKind::Power,
+                "CPU Package",
+                Some(reading.power_milli_watts as f32 / 1000.0),
+            ));
+        }
+        if reading.flags & BENCHSCOPE_SENSOR_ADVANCED_HAS_VOLTAGE != 0 {
+            readings.cpu.upsert_metric(BridgeMetric::new(
+                BridgeMetricKind::Voltage,
+                "CPU Voltage",
+                Some(reading.voltage_milli_v as f32 / 1000.0),
+            ));
         }
 
         let mut details = Vec::new();
@@ -788,6 +1082,13 @@ fn apply_advanced_telemetry_to_readings(
         if !details.is_empty() {
             readings.cpu.message = Some(details.join("; "));
         }
+    }
+    if let Some(cpu_power_w) = cpu_power_w {
+        readings.cpu.upsert_metric(BridgeMetric::new(
+            BridgeMetricKind::Power,
+            "CPU Package",
+            Some(cpu_power_w),
+        ));
     }
 }
 
@@ -933,10 +1234,33 @@ fn driver_open_error_can_auto_start(error: &str) -> bool {
 
 #[cfg(windows)]
 fn start_driver_service() -> Result<String, String> {
+    let driver_sys = sensor_driver_sys_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let driver_sys = powershell_single_quote(&driver_sys);
     let script = format!(
         r#"
 $ErrorActionPreference = 'Stop'
 $service = Get-Service -Name '{DRIVER_SERVICE_NAME}' -ErrorAction Stop
+$driverSys = {driver_sys}
+$serviceKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\{DRIVER_SERVICE_NAME}'
+$imagePath = ''
+try {{
+    $imagePath = [string](Get-ItemProperty -Path $serviceKey -Name ImagePath -ErrorAction Stop).ImagePath
+}} catch {{
+    $imagePath = ''
+}}
+$normalizedImagePath = [Environment]::ExpandEnvironmentVariables($imagePath)
+if ($normalizedImagePath.StartsWith('\??\')) {{
+    $normalizedImagePath = $normalizedImagePath.Substring(4)
+}}
+if ($driverSys -and (Test-Path -LiteralPath $driverSys) -and
+    ($normalizedImagePath -and -not (Test-Path -LiteralPath $normalizedImagePath))) {{
+    & sc.exe config '{DRIVER_SERVICE_NAME}' type= kernel start= demand binPath= $driverSys | Out-Null
+    if ($LASTEXITCODE -ne 0) {{
+        throw "sc.exe config failed while repairing stale driver path $imagePath"
+    }}
+}}
 if ($service.Status -ne 'Running') {{
     Start-Service -Name '{DRIVER_SERVICE_NAME}' -ErrorAction Stop
     $service.WaitForStatus('Running', [TimeSpan]::FromSeconds(5))
@@ -1067,9 +1391,15 @@ fn clean_identification_field(value: Option<&&str>) -> Option<String> {
 }
 
 #[cfg(windows)]
+fn query_cpu_temperature() -> Option<BridgeReading> {
+    query_external_hardware_metrics("CPU", external_cpu_metrics_script())
+        .or_else(|| query_external_hardware_temperature("CPU", external_cpu_temperature_script()))
+}
+
+#[cfg(windows)]
 fn query_gpu_temperature() -> Option<BridgeReading> {
     const NVIDIA_SMI_ARGS: &[&str] = &[
-        "--query-gpu=temperature.gpu,name",
+        "--query-gpu=temperature.gpu,name,utilization.gpu,power.draw,clocks.gr,clocks.mem",
         "--format=csv,noheader,nounits",
     ];
     run_command("nvidia-smi", NVIDIA_SMI_ARGS)
@@ -1080,20 +1410,583 @@ fn query_gpu_temperature() -> Option<BridgeReading> {
                 .find(|path| path.is_file())
                 .and_then(|path| run_command(&path.display().to_string(), NVIDIA_SMI_ARGS).ok())
         })
-        .and_then(|output| {
-            let temperature = parse_first_temperature(&output)?;
-            let label = output
-                .lines()
-                .next()
-                .and_then(|line| line.split_once(',').map(|(_, name)| name.trim()))
-                .filter(|name| !name.is_empty())
-                .unwrap_or("GPU");
-            Some(BridgeReading::from_temperature(
-                label,
-                temperature,
-                "NVML/nvidia-smi",
-            ))
+        .and_then(|output| nvidia_smi_gpu_reading(&output))
+        .or_else(|| query_external_hardware_metrics("GPU", external_gpu_metrics_script()))
+}
+
+#[cfg(windows)]
+fn nvidia_smi_gpu_reading(output: &str) -> Option<BridgeReading> {
+    let line = output.lines().find(|line| !line.trim().is_empty())?;
+    let columns = line.split(',').map(str::trim).collect::<Vec<_>>();
+    let label = columns
+        .get(1)
+        .copied()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("GPU");
+    let mut metrics = Vec::new();
+    if let Some(value) = columns
+        .first()
+        .and_then(|value| parse_metric_number(value))
+        .filter(|value| (-40.0..=130.0).contains(value))
+    {
+        metrics.push(BridgeMetric::new(
+            BridgeMetricKind::Temperature,
+            "GPU Core",
+            Some(round_tenth(value)),
+        ));
+    }
+    if let Some(value) = columns
+        .get(2)
+        .and_then(|value| parse_metric_number(value))
+        .map(clamp_percent)
+    {
+        metrics.push(BridgeMetric::new(
+            BridgeMetricKind::Utilization,
+            "GPU Core",
+            Some(value),
+        ));
+    }
+    if let Some(value) = columns
+        .get(3)
+        .and_then(|value| parse_metric_number(value))
+        .filter(|value| (0.0..=2000.0).contains(value))
+    {
+        metrics.push(BridgeMetric::new(
+            BridgeMetricKind::Power,
+            "GPU Board",
+            Some(round_tenth(value)),
+        ));
+    }
+    if let Some(value) = columns
+        .get(4)
+        .and_then(|value| parse_metric_number(value))
+        .filter(|value| (0.0..=20_000.0).contains(value))
+    {
+        metrics.push(BridgeMetric::new(
+            BridgeMetricKind::Clock,
+            "Core Clock",
+            Some(round_tenth(value)),
+        ));
+    }
+    if let Some(value) = columns
+        .get(5)
+        .and_then(|value| parse_metric_number(value))
+        .filter(|value| (0.0..=30_000.0).contains(value))
+    {
+        metrics.push(BridgeMetric::new(
+            BridgeMetricKind::Clock,
+            "Memory Clock",
+            Some(round_tenth(value)),
+        ));
+    }
+
+    (!metrics.is_empty()).then(|| BridgeReading::from_metrics(label, "NVML/nvidia-smi", metrics))
+}
+
+#[cfg(windows)]
+fn query_external_hardware_temperature(
+    fallback_label: &str,
+    script: &str,
+) -> Option<BridgeReading> {
+    run_slow_powershell(script).ok().and_then(|output| {
+        let mut parts = output.trim().split('\t');
+        let temperature = parts.next()?.trim().parse::<f32>().ok()?;
+        if !(-40.0..=130.0).contains(&temperature) {
+            return None;
+        }
+        let label = parts
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(fallback_label);
+        let namespace = parts
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("external hardware WMI");
+        Some(BridgeReading::from_temperature(
+            label,
+            temperature,
+            &format!("External hardware WMI ({namespace})"),
+        ))
+    })
+}
+
+#[cfg(windows)]
+fn query_external_hardware_metrics(fallback_label: &str, script: &str) -> Option<BridgeReading> {
+    let output = run_slow_powershell(script).ok()?;
+    let (metrics, provider) = parse_external_hardware_metrics(&output, fallback_label);
+    (!metrics.is_empty()).then(|| BridgeReading::from_metrics(fallback_label, &provider, metrics))
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct ExternalHardwareMetric {
+    kind: BridgeMetricKind,
+    label: String,
+    value: f32,
+    min: Option<f32>,
+    max: Option<f32>,
+    namespace: String,
+}
+
+#[cfg(windows)]
+fn parse_external_hardware_metrics(
+    output: &str,
+    fallback_label: &str,
+) -> (Vec<BridgeMetric>, String) {
+    let raw = output
+        .lines()
+        .filter_map(parse_external_hardware_metric_line)
+        .collect::<Vec<_>>();
+    let provider = raw
+        .first()
+        .map(|metric| format!("External hardware WMI ({})", metric.namespace))
+        .unwrap_or_else(|| "External hardware WMI".to_owned());
+    (
+        normalize_external_hardware_metrics(fallback_label, &raw),
+        provider,
+    )
+}
+
+#[cfg(windows)]
+fn parse_external_hardware_metric_line(line: &str) -> Option<ExternalHardwareMetric> {
+    let columns = line.split('\t').collect::<Vec<_>>();
+    let sensor_type = columns.first()?.trim();
+    let kind = external_sensor_type_kind(sensor_type)?;
+    let label = columns
+        .get(1)
+        .map(|value| clean_metric_label(value))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| kind.default_label().to_owned());
+    let value = columns
+        .get(2)
+        .and_then(|value| parse_metric_number(value))?;
+    if !metric_value_is_plausible(kind, value) {
+        return None;
+    }
+    let min = columns
+        .get(3)
+        .and_then(|value| parse_metric_number(value))
+        .filter(|value| metric_value_is_plausible(kind, *value));
+    let max = columns
+        .get(4)
+        .and_then(|value| parse_metric_number(value))
+        .filter(|value| metric_value_is_plausible(kind, *value));
+    let namespace = columns
+        .get(5)
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "hardware WMI".to_owned());
+
+    Some(ExternalHardwareMetric {
+        kind,
+        label,
+        value: metric_value_for_kind(kind, value),
+        min: min.map(|value| metric_value_for_kind(kind, value)),
+        max: max.map(|value| metric_value_for_kind(kind, value)),
+        namespace,
+    })
+}
+
+#[cfg(windows)]
+fn external_sensor_type_kind(value: &str) -> Option<BridgeMetricKind> {
+    match value.to_ascii_lowercase().as_str() {
+        "temperature" => Some(BridgeMetricKind::Temperature),
+        "load" => Some(BridgeMetricKind::Utilization),
+        "voltage" => Some(BridgeMetricKind::Voltage),
+        "power" => Some(BridgeMetricKind::Power),
+        "clock" => Some(BridgeMetricKind::Clock),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn normalize_external_hardware_metrics(
+    fallback_label: &str,
+    raw: &[ExternalHardwareMetric],
+) -> Vec<BridgeMetric> {
+    let mut metrics = Vec::new();
+    let is_cpu = fallback_label.eq_ignore_ascii_case("CPU");
+
+    if let Some(metric) = pick_preferred_external_metric(
+        raw,
+        BridgeMetricKind::Temperature,
+        if is_cpu {
+            &["package", "tctl", "tdie", "ccd", "core max", "core"]
+        } else {
+            &["hot spot", "hotspot", "junction", "core", "gpu"]
+        },
+    ) {
+        metrics.push(bridge_metric_from_external(metric, None));
+    }
+
+    if let Some(metric) = pick_preferred_external_metric(
+        raw,
+        BridgeMetricKind::Utilization,
+        if is_cpu {
+            &["cpu total", "total", "processor"]
+        } else {
+            &["gpu core", "gpu total", "3d", "graphics", "gfx", "compute"]
+        },
+    ) {
+        metrics.push(bridge_metric_from_external(metric, Some("Utilization")));
+    }
+
+    metrics.extend(select_external_metric_rows(
+        raw,
+        BridgeMetricKind::Voltage,
+        if is_cpu {
+            &["vcore", "core", "cpu", "soc", "vid"]
+        } else {
+            &["core", "gpu", "vid", "voltage"]
+        },
+        if is_cpu { 3 } else { 2 },
+    ));
+    metrics.extend(select_external_metric_rows(
+        raw,
+        BridgeMetricKind::Power,
+        if is_cpu {
+            &["package", "cpu package", "ppt", "cores", "cpu"]
+        } else {
+            &["board", "total", "chip", "gpu", "power"]
+        },
+        if is_cpu { 3 } else { 2 },
+    ));
+    metrics.extend(normalize_external_clock_metrics(fallback_label, raw));
+
+    metrics
+}
+
+#[cfg(windows)]
+fn pick_preferred_external_metric<'a>(
+    raw: &'a [ExternalHardwareMetric],
+    kind: BridgeMetricKind,
+    preferred: &[&str],
+) -> Option<&'a ExternalHardwareMetric> {
+    let candidates = raw.iter().filter(|metric| metric.kind == kind);
+    preferred
+        .iter()
+        .find_map(|needle| {
+            candidates
+                .clone()
+                .filter(|metric| metric.label.to_ascii_lowercase().contains(needle))
+                .max_by(|left, right| left.value.total_cmp(&right.value))
         })
+        .or_else(|| candidates.max_by(|left, right| left.value.total_cmp(&right.value)))
+}
+
+#[cfg(windows)]
+fn select_external_metric_rows(
+    raw: &[ExternalHardwareMetric],
+    kind: BridgeMetricKind,
+    preferred: &[&str],
+    limit: usize,
+) -> Vec<BridgeMetric> {
+    let mut candidates = raw
+        .iter()
+        .filter(|metric| metric.kind == kind)
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        metric_preference_rank(&left.label, preferred)
+            .cmp(&metric_preference_rank(&right.label, preferred))
+            .then_with(|| left.label.cmp(&right.label))
+    });
+
+    let mut seen = Vec::<String>::new();
+    let mut selected = Vec::new();
+    for metric in candidates {
+        let key = normalized_metric_label(&metric.label);
+        if seen.iter().any(|value| value == &key) {
+            continue;
+        }
+        seen.push(key);
+        selected.push(bridge_metric_from_external(metric, None));
+        if selected.len() >= limit {
+            break;
+        }
+    }
+    selected
+}
+
+#[cfg(windows)]
+fn normalize_external_clock_metrics(
+    fallback_label: &str,
+    raw: &[ExternalHardwareMetric],
+) -> Vec<BridgeMetric> {
+    let clocks = raw
+        .iter()
+        .filter(|metric| metric.kind == BridgeMetricKind::Clock)
+        .collect::<Vec<_>>();
+    if clocks.is_empty() {
+        return Vec::new();
+    }
+
+    if fallback_label.eq_ignore_ascii_case("CPU") {
+        let intel = cpu_model_name_for_bridge()
+            .map(|model| model.to_ascii_lowercase().contains("intel"))
+            .unwrap_or(false);
+        if intel {
+            let p_cores = clocks
+                .iter()
+                .copied()
+                .filter(|metric| {
+                    let label = metric.label.to_ascii_lowercase();
+                    label.contains("p-core")
+                        || label.contains("p core")
+                        || label.contains("performance")
+                })
+                .collect::<Vec<_>>();
+            let e_cores = clocks
+                .iter()
+                .copied()
+                .filter(|metric| {
+                    let label = metric.label.to_ascii_lowercase();
+                    label.contains("e-core")
+                        || label.contains("e core")
+                        || label.contains("efficient")
+                })
+                .collect::<Vec<_>>();
+            let mut grouped = Vec::new();
+            if let Some(metric) = aggregate_external_metrics("P-core Clock", &p_cores) {
+                grouped.push(metric);
+            }
+            if let Some(metric) = aggregate_external_metrics("E-core Clock", &e_cores) {
+                grouped.push(metric);
+            }
+            if !grouped.is_empty() {
+                return grouped;
+            }
+        }
+
+        let core_clocks = clocks
+            .iter()
+            .copied()
+            .filter(|metric| {
+                let label = metric.label.to_ascii_lowercase();
+                label.contains("core") && !label.contains("bus")
+            })
+            .collect::<Vec<_>>();
+        return aggregate_external_metrics(
+            if intel {
+                "Core Clock"
+            } else {
+                "CPU Core Clock"
+            },
+            if core_clocks.is_empty() {
+                &clocks
+            } else {
+                &core_clocks
+            },
+        )
+        .into_iter()
+        .collect();
+    }
+
+    let memory_clocks = clocks
+        .iter()
+        .copied()
+        .filter(|metric| metric.label.to_ascii_lowercase().contains("mem"))
+        .collect::<Vec<_>>();
+    let core_clocks = clocks
+        .iter()
+        .copied()
+        .filter(|metric| !metric.label.to_ascii_lowercase().contains("mem"))
+        .collect::<Vec<_>>();
+    [
+        aggregate_external_metrics("Core Clock", &core_clocks),
+        aggregate_external_metrics("Memory Clock", &memory_clocks),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+#[cfg(windows)]
+fn aggregate_external_metrics(
+    label: &str,
+    metrics: &[&ExternalHardwareMetric],
+) -> Option<BridgeMetric> {
+    if metrics.is_empty() {
+        return None;
+    }
+    let value = metrics
+        .iter()
+        .map(|metric| metric.value)
+        .max_by(f32::total_cmp)?;
+    let min = metrics
+        .iter()
+        .filter_map(|metric| metric.min.or(Some(metric.value)))
+        .min_by(f32::total_cmp);
+    let max = metrics
+        .iter()
+        .filter_map(|metric| metric.max.or(Some(metric.value)))
+        .max_by(f32::total_cmp);
+    Some(BridgeMetric::new(BridgeMetricKind::Clock, label, Some(value)).with_range(min, max))
+}
+
+#[cfg(windows)]
+fn bridge_metric_from_external(
+    metric: &ExternalHardwareMetric,
+    label_override: Option<&str>,
+) -> BridgeMetric {
+    BridgeMetric::new(
+        metric.kind,
+        label_override.unwrap_or(&metric.label),
+        Some(metric.value),
+    )
+    .with_range(metric.min, metric.max)
+}
+
+#[cfg(windows)]
+fn metric_preference_rank(label: &str, preferred: &[&str]) -> usize {
+    let label = label.to_ascii_lowercase();
+    preferred
+        .iter()
+        .position(|needle| label.contains(needle))
+        .unwrap_or(preferred.len())
+}
+
+#[cfg(windows)]
+fn clean_metric_label(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(|ch: char| ch == ':' || ch == '-' || ch.is_whitespace())
+        .to_owned()
+}
+
+#[cfg(windows)]
+fn normalized_metric_label(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+#[cfg(windows)]
+fn external_cpu_metrics_script() -> &'static str {
+    r#"
+$ErrorActionPreference = 'SilentlyContinue'
+function Clean($value) {
+    if ($null -eq $value) { return '' }
+    (($value -join ' ' -replace "`t", " ") -replace "`r?`n", " ").Trim()
+}
+function Num($value) {
+    if ($null -eq $value) { return '' }
+    try {
+        return [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0:F3}', [double]$value)
+    } catch {
+        return ''
+    }
+}
+function Emit($sensor, $namespace) {
+    [Console]::Out.WriteLine([string]::Join("`t", @(
+        (Clean $sensor.SensorType),
+        (Clean $sensor.Name),
+        (Num $sensor.Value),
+        (Num $sensor.Min),
+        (Num $sensor.Max),
+        $namespace,
+        (Clean $sensor.Identifier),
+        (Clean $sensor.HardwareType),
+        (Clean $sensor.Parent)
+    )))
+}
+$namespaces = @('root\LibreHardwareMonitor', 'root\OpenHardwareMonitor')
+foreach ($namespace in $namespaces) {
+    $sensors = Get-CimInstance -Namespace $namespace -ClassName Sensor -ErrorAction SilentlyContinue |
+        Where-Object {
+            $null -ne $_.Value -and
+            @('Temperature', 'Load', 'Voltage', 'Power', 'Clock') -contains [string]$_.SensorType
+        }
+    if (-not $sensors) { continue }
+    $candidates = $sensors | Where-Object {
+        "$($_.Identifier) $($_.HardwareType) $($_.Parent) $($_.Name)" -match '(?i)(/cpu|intelcpu|amdcpu|cpu)'
+    }
+    if ($candidates) {
+        foreach ($sensor in $candidates) { Emit $sensor $namespace }
+        break
+    }
+}
+exit 0
+"#
+}
+
+#[cfg(windows)]
+fn external_gpu_metrics_script() -> &'static str {
+    r#"
+$ErrorActionPreference = 'SilentlyContinue'
+function Clean($value) {
+    if ($null -eq $value) { return '' }
+    (($value -join ' ' -replace "`t", " ") -replace "`r?`n", " ").Trim()
+}
+function Num($value) {
+    if ($null -eq $value) { return '' }
+    try {
+        return [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0:F3}', [double]$value)
+    } catch {
+        return ''
+    }
+}
+function Emit($sensor, $namespace) {
+    [Console]::Out.WriteLine([string]::Join("`t", @(
+        (Clean $sensor.SensorType),
+        (Clean $sensor.Name),
+        (Num $sensor.Value),
+        (Num $sensor.Min),
+        (Num $sensor.Max),
+        $namespace,
+        (Clean $sensor.Identifier),
+        (Clean $sensor.HardwareType),
+        (Clean $sensor.Parent)
+    )))
+}
+$namespaces = @('root\LibreHardwareMonitor', 'root\OpenHardwareMonitor')
+foreach ($namespace in $namespaces) {
+    $sensors = Get-CimInstance -Namespace $namespace -ClassName Sensor -ErrorAction SilentlyContinue |
+        Where-Object {
+            $null -ne $_.Value -and
+            @('Temperature', 'Load', 'Voltage', 'Power', 'Clock') -contains [string]$_.SensorType
+        }
+    if (-not $sensors) { continue }
+    $candidates = $sensors | Where-Object {
+        "$($_.Identifier) $($_.HardwareType) $($_.Parent) $($_.Name)" -match '(?i)(/gpu|nvidia|radeon|amd|graphics|intel.*gpu|intel.*graphics)'
+    }
+    if ($candidates) {
+        foreach ($sensor in $candidates) { Emit $sensor $namespace }
+        break
+    }
+}
+exit 0
+"#
+}
+
+#[cfg(windows)]
+fn external_cpu_temperature_script() -> &'static str {
+    r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$namespaces = @('root\LibreHardwareMonitor', 'root\OpenHardwareMonitor')
+foreach ($namespace in $namespaces) {
+    $sensors = Get-CimInstance -Namespace $namespace -ClassName Sensor -ErrorAction SilentlyContinue |
+        Where-Object { $_.SensorType -eq 'Temperature' -and $null -ne $_.Value }
+    if (-not $sensors) { continue }
+    $candidates = $sensors | Where-Object {
+        "$($_.Identifier) $($_.HardwareType) $($_.Parent) $($_.Name)" -match '(?i)(/cpu|intelcpu|amdcpu|cpu)'
+    }
+    $preferred = $candidates |
+        Sort-Object @{ Expression = { if ($_.Name -match '(?i)(package|tctl|tdie|ccd|core max)') { 0 } else { 1 } } },
+                    @{ Expression = { [double]$_.Value }; Descending = $true } |
+        Select-Object -First 1
+    if ($preferred) {
+        "$([math]::Round([double]$preferred.Value, 1))`t$($preferred.Name)`t$namespace"
+        break
+    }
+}
+exit 0
+"#
 }
 
 #[cfg(windows)]
@@ -1175,6 +2068,43 @@ fn run_powershell(script: &str) -> Result<String, String> {
         ],
         FAST_COMMAND_TIMEOUT,
     )
+}
+
+#[cfg(windows)]
+fn sensor_driver_sys_path() -> Option<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(parent) = exe_path.parent() {
+            roots.extend(parent.ancestors().map(PathBuf::from));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.extend(cwd.ancestors().map(PathBuf::from));
+    }
+
+    let relative_paths = [
+        PathBuf::from("BenchScopeSensorDriver.sys"),
+        PathBuf::from("sensor-driver/x64/Release/BenchScopeSensorDriver.sys"),
+        PathBuf::from("sensor-driver/x64/Debug/BenchScopeSensorDriver.sys"),
+        PathBuf::from(
+            "sensor-driver/x64/Release/BenchScopeSensorDriver/BenchScopeSensorDriver.sys",
+        ),
+        PathBuf::from("sensor-driver/x64/Debug/BenchScopeSensorDriver/BenchScopeSensorDriver.sys"),
+    ];
+
+    roots
+        .into_iter()
+        .flat_map(|root| {
+            relative_paths
+                .iter()
+                .map(move |relative| root.join(relative))
+        })
+        .find(|path| path.is_file())
+}
+
+#[cfg(windows)]
+fn powershell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 #[cfg(windows)]
@@ -1264,12 +2194,60 @@ fn nvidia_smi_fallback_paths() -> Vec<PathBuf> {
     paths
 }
 
-fn parse_first_temperature(output: &str) -> Option<f32> {
-    output
+fn parse_metric_number(value: &str) -> Option<f32> {
+    value
         .split(|ch: char| !(ch.is_ascii_digit() || ch == '.' || ch == '-'))
         .filter(|token| !token.is_empty())
         .filter_map(|token| token.parse::<f32>().ok())
-        .find(|value| (-40.0..=130.0).contains(value))
+        .find(|value| value.is_finite())
+}
+
+fn metric_value_is_plausible(kind: BridgeMetricKind, value: f32) -> bool {
+    match kind {
+        BridgeMetricKind::Temperature => (-40.0..=130.0).contains(&value),
+        BridgeMetricKind::Utilization => (0.0..=10_000.0).contains(&value),
+        BridgeMetricKind::Voltage => (0.0..=20.0).contains(&value),
+        BridgeMetricKind::Power => (0.0..=2000.0).contains(&value),
+        BridgeMetricKind::Clock => (0.0..=30_000.0).contains(&value),
+    }
+}
+
+fn metric_value_for_kind(kind: BridgeMetricKind, value: f32) -> f32 {
+    match kind {
+        BridgeMetricKind::Utilization => clamp_percent(value),
+        _ => round_tenth(value),
+    }
+}
+
+#[cfg(all(windows, any(target_arch = "x86", target_arch = "x86_64")))]
+fn cpu_model_name_for_bridge() -> Option<String> {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::__cpuid;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::__cpuid;
+
+    let max_extended = __cpuid(0x8000_0000).eax;
+    if max_extended < 0x8000_0004 {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(48);
+    for leaf in 0x8000_0002..=0x8000_0004 {
+        let result = __cpuid(leaf);
+        for register in [result.eax, result.ebx, result.ecx, result.edx] {
+            bytes.extend_from_slice(&register.to_le_bytes());
+        }
+    }
+
+    String::from_utf8(bytes)
+        .ok()
+        .map(|value| value.trim_matches('\0').trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(all(windows, not(any(target_arch = "x86", target_arch = "x86_64"))))]
+fn cpu_model_name_for_bridge() -> Option<String> {
+    None
 }
 
 fn parse_first_utilization(output: &str) -> Option<f32> {
@@ -1303,10 +2281,18 @@ fn bridge_reading_json(reading: &BridgeReading) -> String {
         .utilization_percent
         .map(|value| format!("{value:.1}"))
         .unwrap_or_else(|| "null".to_owned());
+    let metrics = reading
+        .metrics
+        .iter()
+        .filter(|metric| metric.has_value())
+        .map(bridge_metric_json)
+        .collect::<Vec<_>>()
+        .join(",");
     let mut fields = vec![
         format!("\"label\":\"{}\"", json_escape(&reading.label)),
         format!("\"temperatureC\":{temperature}"),
         format!("\"utilizationPercent\":{utilization}"),
+        format!("\"metrics\":[{metrics}]"),
         format!("\"provider\":\"{}\"", json_escape(&reading.provider)),
         format!("\"status\":\"{}\"", json_escape(&reading.status)),
     ];
@@ -1316,6 +2302,38 @@ fn bridge_reading_json(reading: &BridgeReading) -> String {
     format!("{{{}}}", fields.join(","))
 }
 
+fn bridge_metric_json(metric: &BridgeMetric) -> String {
+    format!(
+        "{{\"kind\":\"{}\",\"label\":\"{}\",\"value\":{},\"min\":{},\"max\":{}}}",
+        metric.kind.json_key(),
+        json_escape(&metric.label),
+        json_optional_f32(metric.value),
+        json_optional_f32(metric.min),
+        json_optional_f32(metric.max),
+    )
+}
+
+#[cfg(windows)]
+fn fallback_snapshot_json(driver_error: &str, readings: BridgeReadings) -> String {
+    let message = json_escape(driver_error);
+    let fields = [
+        format!("\"timestampUtc\":\"{}\"", json_escape(&timestamp_label())),
+        "\"isElevated\":false".to_owned(),
+        "\"source\":\"BenchScopeSensorService\"".to_owned(),
+        format!(
+            "\"driver\":{{\"available\":false,\"error\":\"{}\"}}",
+            message
+        ),
+        format!("\"cpu\":{}", bridge_reading_json(&readings.cpu)),
+        format!("\"gpu\":{}", bridge_reading_json(&readings.gpu)),
+        format!("\"drive\":{}", bridge_reading_json(&readings.drive)),
+        format!("\"memory\":{}", bridge_reading_json(&readings.memory)),
+        format!("\"diagnostics\":[\"{}\"]", message),
+    ];
+    format!("{{{}}}", fields.join(","))
+}
+
+#[cfg(not(windows))]
 fn error_snapshot_json(error: &str) -> String {
     let status = if error.to_ascii_lowercase().contains("access is denied") {
         "permissionDenied"
@@ -1335,6 +2353,7 @@ fn error_snapshot_json(error: &str) -> String {
     )
 }
 
+#[cfg(not(windows))]
 fn unavailable_reading_json(label: &str, provider: &str, status: &str, message: &str) -> String {
     format!(
         "{{\"label\":\"{}\",\"temperatureC\":null,\"utilizationPercent\":null,\"provider\":\"{}\",\"status\":\"{}\",\"message\":\"{}\"}}",
@@ -1356,6 +2375,13 @@ fn json_bool_from_bool(value: bool) -> &'static str {
 fn json_optional_string(value: Option<&str>) -> String {
     value
         .map(|value| format!("\"{}\"", json_escape(value)))
+        .unwrap_or_else(|| "null".to_owned())
+}
+
+fn json_optional_f32(value: Option<f32>) -> String {
+    value
+        .filter(|value| value.is_finite())
+        .map(|value| format!("{value:.3}"))
         .unwrap_or_else(|| "null".to_owned())
 }
 
@@ -1427,5 +2453,27 @@ mod tests {
         assert_eq!(parsed.baseboard_serial, None);
         assert_eq!(parsed.controller_hints.len(), 2);
         assert!(parsed.detail().contains("Super I/O chip ID is not exposed"));
+    }
+
+    #[test]
+    fn fallback_snapshot_can_include_safe_temperature_readings() {
+        let readings = BridgeReadings {
+            cpu: BridgeReading::from_temperature("CPU Package", 63.5, "External hardware WMI"),
+            gpu: BridgeReading::from_temperature("GPU Core", 57.0, "NVML/nvidia-smi"),
+            drive: BridgeReading::unavailable(
+                "SSD",
+                "BenchScope sensor driver bridge",
+                "unavailable",
+                None,
+            ),
+            memory: BridgeReading::from_memory_utilization(42.0),
+        };
+
+        let json = fallback_snapshot_json("driver unavailable", readings);
+
+        assert!(json.contains("\"driver\":{\"available\":false"));
+        assert!(json.contains("\"cpu\":{\"label\":\"CPU Package\",\"temperatureC\":63.5"));
+        assert!(json.contains("\"gpu\":{\"label\":\"GPU Core\",\"temperatureC\":57.0"));
+        assert!(json.contains("\"memory\":{\"label\":\"System RAM\""));
     }
 }

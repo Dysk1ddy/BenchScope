@@ -87,6 +87,34 @@ impl NetworkProbeKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NetworkRunKind {
+    QuickDiagnosis,
+    SpeedTest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NetworkSpeedDirection {
+    Download,
+    Upload,
+}
+
+impl NetworkSpeedDirection {
+    fn label(self) -> &'static str {
+        match self {
+            NetworkSpeedDirection::Download => "Download",
+            NetworkSpeedDirection::Upload => "Upload",
+        }
+    }
+
+    fn script_value(self) -> &'static str {
+        match self {
+            NetworkSpeedDirection::Download => "download",
+            NetworkSpeedDirection::Upload => "upload",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct NetworkDriverInfo {
     provider: Option<String>,
@@ -167,6 +195,23 @@ struct NetworkProbeResult {
 }
 
 #[derive(Clone, Debug)]
+struct NetworkSpeedSample {
+    direction: NetworkSpeedDirection,
+    bytes: u64,
+    elapsed_ms: f64,
+    mbps: f64,
+}
+
+#[derive(Clone, Debug)]
+struct NetworkSpeedTestResult {
+    download_mbps: Option<f64>,
+    upload_mbps: Option<f64>,
+    samples: Vec<NetworkSpeedSample>,
+    notes: Vec<String>,
+    elapsed_s: f64,
+}
+
+#[derive(Clone, Debug)]
 struct NetworkFinding {
     severity: NetworkFindingSeverity,
     title: String,
@@ -208,7 +253,9 @@ struct NetworkDiagnosisResult {
 enum NetworkWorkerEvent {
     Progress(NetworkProgress),
     ProbeCompleted(NetworkProbeResult),
+    SpeedSampleCompleted(NetworkSpeedSample),
     DiagnosisDone(Result<NetworkDiagnosisResult, String>),
+    SpeedTestDone(Result<NetworkSpeedTestResult, String>),
     MonitorSample(NetworkMonitorSample),
     MonitorStopped(Result<(), String>),
     Log(String),
@@ -219,6 +266,8 @@ struct NetworkDiagnosticState {
     selected_adapter: usize,
     include_virtual: bool,
     probe_results: Vec<NetworkProbeResult>,
+    speed_samples: Vec<NetworkSpeedSample>,
+    speed_result: Option<NetworkSpeedTestResult>,
     findings: Vec<NetworkFinding>,
     signal_history: VecDeque<WifiSignalSample>,
     log: Vec<String>,
@@ -229,6 +278,7 @@ struct NetworkDiagnosticState {
     tx: Sender<NetworkWorkerEvent>,
     cancel: Option<Arc<AtomicBool>>,
     running: bool,
+    running_kind: Option<NetworkRunKind>,
     monitoring: bool,
     last_report_path: Option<PathBuf>,
 }
@@ -255,6 +305,8 @@ impl NetworkDiagnosticState {
             selected_adapter,
             include_virtual: false,
             probe_results: Vec::new(),
+            speed_samples: Vec::new(),
+            speed_result: None,
             findings: Vec::new(),
             signal_history: VecDeque::new(),
             log,
@@ -265,6 +317,7 @@ impl NetworkDiagnosticState {
             tx,
             cancel: None,
             running: false,
+            running_kind: None,
             monitoring: false,
             last_report_path: None,
         }
@@ -346,6 +399,7 @@ impl NetworkDiagnosticState {
         let worker_cancel = Arc::clone(&cancel);
         self.cancel = Some(cancel);
         self.running = true;
+        self.running_kind = Some(NetworkRunKind::QuickDiagnosis);
         thread::spawn(move || {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 run_network_quick_diagnosis(adapter_id, worker_cancel, tx.clone())
@@ -353,6 +407,39 @@ impl NetworkDiagnosticState {
             .map_err(|panic| format!("Network diagnosis panicked: {}", panic_message(&*panic)))
             .and_then(|result| result.map_err(|err| format!("{err:#}")));
             let _ = tx.send(NetworkWorkerEvent::DiagnosisDone(result));
+        });
+    }
+
+    fn start_speed_test(&mut self) {
+        if self.running || self.monitoring {
+            return;
+        }
+        self.speed_samples.clear();
+        self.speed_result = None;
+        self.progress = 0.0;
+        self.current_step = "Starting internet speed test".to_owned();
+        self.status = "Running internet speed test...".to_owned();
+        self.log(self.status.clone());
+        if let Some(adapter) = self.selected_adapter() {
+            self.log(format!(
+                "Selected adapter context: {}; speed test uses system internet routing",
+                adapter.menu_label()
+            ));
+        }
+
+        let tx = self.tx.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        self.cancel = Some(cancel);
+        self.running = true;
+        self.running_kind = Some(NetworkRunKind::SpeedTest);
+        thread::spawn(move || {
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                run_network_speed_test(worker_cancel, tx.clone())
+            }))
+            .map_err(|panic| format!("Internet speed test panicked: {}", panic_message(&*panic)))
+            .and_then(|result| result.map_err(|err| format!("{err:#}")));
+            let _ = tx.send(NetworkWorkerEvent::SpeedTestDone(result));
         });
     }
 
@@ -375,6 +462,7 @@ impl NetworkDiagnosticState {
         let worker_cancel = Arc::clone(&cancel);
         self.cancel = Some(cancel);
         self.monitoring = true;
+        self.running_kind = None;
         thread::spawn(move || {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 run_network_monitor(adapter_id, worker_cancel, tx.clone())
@@ -388,11 +476,12 @@ impl NetworkDiagnosticState {
     fn stop(&mut self) {
         if let Some(cancel) = &self.cancel {
             cancel.store(true, Ordering::Relaxed);
-            self.status = if self.running {
-                "Cancel requested for network diagnosis".to_owned()
-            } else {
-                "Stop requested for network monitor".to_owned()
-            };
+            self.status = match self.running_kind {
+                Some(NetworkRunKind::SpeedTest) => "Cancel requested for internet speed test",
+                Some(NetworkRunKind::QuickDiagnosis) => "Cancel requested for network diagnosis",
+                None => "Stop requested for network monitor",
+            }
+            .to_owned();
             self.current_step = self.status.clone();
             self.log(self.status.clone());
         }
@@ -440,8 +529,19 @@ impl NetworkDiagnosticState {
                     ));
                     self.probe_results.push(result);
                 }
+                NetworkWorkerEvent::SpeedSampleCompleted(sample) => {
+                    self.log(format!(
+                        "{} speed sample: {} in {}, {}",
+                        sample.direction.label(),
+                        format_network_payload_size(sample.bytes),
+                        format_elapsed(sample.elapsed_ms / 1000.0),
+                        format_network_speed_mbps(Some(sample.mbps))
+                    ));
+                    self.speed_samples.push(sample);
+                }
                 NetworkWorkerEvent::DiagnosisDone(result) => {
                     self.running = false;
+                    self.running_kind = None;
                     self.cancel = None;
                     match result {
                         Ok(result) => {
@@ -458,6 +558,34 @@ impl NetworkDiagnosticState {
                         Err(err) => {
                             self.progress = 0.0;
                             self.current_step = "Diagnosis stopped".to_owned();
+                            self.status = err.clone();
+                            self.log(err);
+                        }
+                    }
+                }
+                NetworkWorkerEvent::SpeedTestDone(result) => {
+                    self.running = false;
+                    self.running_kind = None;
+                    self.cancel = None;
+                    match result {
+                        Ok(result) => {
+                            self.speed_samples = result.samples.clone();
+                            self.progress = 1.0;
+                            self.current_step = "Speed test complete".to_owned();
+                            self.status = format!(
+                                "Internet speed test complete: down {}, up {}",
+                                format_network_speed_mbps(result.download_mbps),
+                                format_network_speed_mbps(result.upload_mbps)
+                            );
+                            self.log(self.status.clone());
+                            for note in &result.notes {
+                                self.log(format!("Speed test note: {note}"));
+                            }
+                            self.speed_result = Some(result);
+                        }
+                        Err(err) => {
+                            self.progress = 0.0;
+                            self.current_step = "Speed test stopped".to_owned();
                             self.status = err.clone();
                             self.log(err);
                         }

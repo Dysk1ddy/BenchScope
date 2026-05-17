@@ -18,6 +18,7 @@ struct StartupData {
     ram: RamTestState,
     battery: BatteryDiagnosticState,
     network: NetworkDiagnosticState,
+    device_info: DeviceInfoState,
 }
 
 struct BenchScopeRoot {
@@ -57,6 +58,7 @@ struct BenchScopeApp {
     ram_back_confirm: bool,
     battery_back_confirm: bool,
     network_back_confirm: bool,
+    device_info: DeviceInfoState,
     drive: DriveBenchmarkState,
     storage_health_back_confirm: bool,
     storage_health: StorageHealthState,
@@ -65,6 +67,7 @@ struct BenchScopeApp {
     network: NetworkDiagnosticState,
     sensors: SensorManager,
     temperature_run: Option<TemperatureRunTracker>,
+    sensor_window_minimized: bool,
     fullscreen: bool,
 }
 

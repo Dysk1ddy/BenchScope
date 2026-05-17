@@ -6,7 +6,7 @@ fn ui_large_back_button(ui: &mut egui::Ui) -> egui::Response {
 }
 
 fn panel_content_log_heights(available_height: f32, log_fraction: f32, log_max: f32) -> (f32, f32) {
-    let fixed_height = SENSOR_BOX_RESERVED_HEIGHT + PANEL_VERTICAL_CHROME_HEIGHT;
+    let fixed_height = PANEL_VERTICAL_CHROME_HEIGHT;
     let usable_height = (available_height - fixed_height).max(0.0);
     if usable_height <= MIN_CONTENT_HEIGHT + MIN_LOG_HEIGHT {
         let log_height = (usable_height * 0.34)

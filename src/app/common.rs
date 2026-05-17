@@ -95,6 +95,8 @@ fn load_startup_data(tx: &Sender<StartupEvent>) -> StartupData {
     let battery = BatteryDiagnosticState::new();
     startup_progress(tx, 0.92, "Detecting network adapters");
     let network = NetworkDiagnosticState::new();
+    startup_progress(tx, 0.95, "Preparing device information viewer");
+    let device_info = DeviceInfoState::new();
     startup_progress(tx, 0.98, "Starting safe sensor sampler");
 
     StartupData {
@@ -105,6 +107,7 @@ fn load_startup_data(tx: &Sender<StartupEvent>) -> StartupData {
         ram,
         battery,
         network,
+        device_info,
     }
 }
 
@@ -125,6 +128,7 @@ impl BenchScopeApp {
             ram,
             battery,
             network,
+            device_info,
         } = data;
         let (tx, rx) = mpsc::channel();
         let selected_adapter = adapters
@@ -164,6 +168,7 @@ impl BenchScopeApp {
             ram_back_confirm: false,
             battery_back_confirm: false,
             network_back_confirm: false,
+            device_info,
             drive,
             storage_health_back_confirm: false,
             storage_health,
@@ -172,6 +177,7 @@ impl BenchScopeApp {
             network,
             sensors,
             temperature_run: None,
+            sensor_window_minimized: false,
             fullscreen: false,
         };
         app.log("Application started");
@@ -246,9 +252,11 @@ impl BenchScopeApp {
             .set_target_gpu_uses_shared_cpu_temperature(gpu_uses_shared_cpu_temperature);
     }
 
-    fn ui_sensor_panel(&mut self, ui: &mut egui::Ui) {
-        let snapshot = self.sensors.latest();
-        let rows: Vec<(&str, Option<&SensorReading>)> = match self.view {
+    fn current_sensor_rows<'a>(
+        &self,
+        snapshot: &'a SensorSnapshot,
+    ) -> Option<Vec<(&'static str, Option<&'a SensorReading>)>> {
+        let rows = match self.view {
             AppView::MatrixBenchmark | AppView::MatrixStressTest => {
                 vec![
                     ("CPU", snapshot.cpu.as_ref()),
@@ -262,32 +270,80 @@ impl BenchScopeApp {
                 ("CPU", snapshot.cpu.as_ref()),
                 ("RAM", snapshot.memory.as_ref()),
             ],
-            AppView::BatteryHealthDiagnostic | AppView::NetworkDiagnostic | AppView::MainMenu => {
-                return;
-            }
+            AppView::BatteryHealthDiagnostic
+            | AppView::NetworkDiagnostic
+            | AppView::DeviceInfo
+            | AppView::MainMenu => return None,
         };
-
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
-            egui::Frame::group(ui.style())
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.set_min_width(210.0);
-                    ui.label(egui::RichText::new("Sensors").strong());
-                    ui.horizontal(|ui| {
-                        ui.set_min_width(214.0);
-                        ui.label(egui::RichText::new("").monospace());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(egui::RichText::new("Util %").small());
-                            ui.add_space(12.0);
-                            ui.label(egui::RichText::new("Temp").small());
-                        });
-                    });
-                    ui.add_space(3.0);
-                    for (label, reading) in rows {
-                        ui_sensor_row(ui, label, reading);
-                    }
-                });
-        });
+        Some(rows)
     }
 
+    fn ui_sensor_window(&mut self, ctx: &egui::Context) {
+        let snapshot = self.sensors.latest();
+        let Some(rows) = self.current_sensor_rows(&snapshot) else {
+            return;
+        };
+
+        if self.sensor_window_minimized {
+            egui::Area::new(egui::Id::new("sensor_metrics_minimized"))
+                .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-14.0, -14.0))
+                .show(ctx, |ui| {
+                    egui::Frame::group(ui.style())
+                        .inner_margin(egui::Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            if ui.button(sensor_minimized_label(&rows)).clicked() {
+                                self.sensor_window_minimized = false;
+                            }
+                        });
+                });
+            return;
+        }
+
+        egui::Window::new("Sensors")
+            .id(egui::Id::new("sensor_metrics_window"))
+            .default_pos(egui::pos2(620.0, 118.0))
+            .default_size(egui::vec2(
+                SENSOR_WINDOW_DEFAULT_WIDTH,
+                SENSOR_WINDOW_DEFAULT_HEIGHT,
+            ))
+            .min_width(SENSOR_WINDOW_MIN_WIDTH)
+            .min_height(SENSOR_WINDOW_MIN_HEIGHT)
+            .resizable(true)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(sensor_minimized_label(&rows))
+                            .strong()
+                            .monospace(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Minimize").clicked() {
+                            self.sensor_window_minimized = true;
+                        }
+                    });
+                });
+                ui.separator();
+                egui::ScrollArea::both()
+                    .id_salt("sensor_metrics_window_scroll")
+                    .auto_shrink([false, false])
+                    .max_height(ui.available_height().max(80.0))
+                    .show(ui, |ui| {
+                        ui_sensor_table(ui, &rows);
+                    });
+            });
+    }
+}
+
+fn sensor_minimized_label(rows: &[(&str, Option<&SensorReading>)]) -> String {
+    let labels = rows
+        .iter()
+        .map(|(label, _)| *label)
+        .collect::<Vec<_>>()
+        .join("/");
+    if labels.is_empty() {
+        "Sensors".to_owned()
+    } else {
+        format!("Sensors: {labels}")
+    }
 }

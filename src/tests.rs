@@ -519,6 +519,71 @@ mod tests {
     }
 
     #[test]
+    fn storage_health_direct_nvme_log_populates_deep_attributes() {
+        fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
+            bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        fn write_u128(bytes: &mut [u8], offset: usize, value: u128) {
+            bytes[offset..offset + 16].copy_from_slice(&value.to_le_bytes());
+        }
+
+        let mut bytes = vec![0_u8; 512];
+        bytes[0] = 0x02;
+        write_u16(&mut bytes, 1, 315);
+        bytes[3] = 95;
+        bytes[4] = 10;
+        bytes[5] = 7;
+        write_u128(&mut bytes, 32, 2);
+        write_u128(&mut bytes, 48, 3);
+        write_u128(&mut bytes, 64, 123);
+        write_u128(&mut bytes, 80, 456);
+        write_u128(&mut bytes, 96, 40);
+        write_u128(&mut bytes, 112, 12);
+        write_u128(&mut bytes, 128, 3456);
+        write_u128(&mut bytes, 144, 1);
+        write_u128(&mut bytes, 160, 0);
+        write_u128(&mut bytes, 176, 2);
+        write_u32_le(&mut bytes, 192, 5);
+        write_u32_le(&mut bytes, 196, 0);
+        write_u16(&mut bytes, 200, 316);
+
+        let health = parse_nvme_health_log_bytes(&bytes).unwrap();
+        let drive =
+            DriveInfo::with_device_name(PathBuf::from("C:\\"), Some("Test NVMe".to_owned()));
+        let mut snapshot = StorageHealthSnapshot::unknown(&drive, "test provider");
+        snapshot.bus_type = "NVMe".to_owned();
+
+        apply_nvme_health_log_to_snapshot(&mut snapshot, &health);
+        let snapshot = finalize_storage_health_snapshot(snapshot).unwrap();
+
+        assert_eq!(snapshot.available_spare_percent, Some(95));
+        assert_eq!(snapshot.available_spare_threshold_percent, Some(10));
+        assert_eq!(snapshot.critical_warning_flags, Some(2));
+        assert_eq!(snapshot.unsafe_shutdowns, Some(1));
+        assert_eq!(snapshot.power_on_hours, Some(3456));
+        assert_eq!(snapshot.power_cycle_count, Some(12));
+        assert_eq!(snapshot.nvme_error_info_log_entries, Some(2));
+        assert_eq!(snapshot.data_read_bytes, Some(1_024_000));
+        assert_eq!(snapshot.data_written_bytes, Some(1_536_000));
+        assert!(snapshot.remaining_life_percent.is_some_and(|value| value == 93.0));
+        assert!(snapshot.nvme_temperature_sensors_c[0].is_some());
+        assert!(
+            snapshot
+                .attributes
+                .iter()
+                .any(|attribute| attribute.name == "NVMe unsafe shutdowns"
+                    && attribute.display_value == "1")
+        );
+        assert!(
+            snapshot
+                .attributes
+                .iter()
+                .any(|attribute| attribute.name == "NVMe error information log entries"
+                    && attribute.display_value == "2")
+        );
+    }
+
+    #[test]
     fn storage_health_report_mentions_benchmark_results() {
         let drive = DriveInfo::with_device_name(PathBuf::from("C:\\"), Some("Test SSD".to_owned()));
         let mut snapshot = StorageHealthSnapshot::unknown(&drive, "test provider");
@@ -764,6 +829,25 @@ mod tests {
     }
 
     #[test]
+    fn helper_snapshot_parser_reads_hwmonitor_metrics() {
+        let line = r#"{"timestampUtc":"2026-05-16T03:36:28Z","isElevated":true,"cpu":{"label":"CPU Package","temperatureC":63.5,"provider":"BenchScopeSensorService","status":"ok","metrics":[{"kind":"temperature","label":"CPU Package","value":63.5,"min":41.0,"max":72.0},{"kind":"utilization","label":"Utilization","value":16.0,"min":4.0,"max":91.0},{"kind":"voltage","label":"Vcore","value":1.214,"min":0.711,"max":1.302},{"kind":"power","label":"CPU Package","value":45.5,"min":12.0,"max":88.2},{"kind":"clock","label":"P-core Clock","value":5200.0,"min":800.0,"max":5500.0}]}}"#;
+
+        let snapshot = parse_helper_snapshot(line).unwrap();
+        let cpu = snapshot.cpu.unwrap();
+
+        assert_eq!(cpu.temperature_c, Some(63.5));
+        assert_eq!(cpu.metrics.len(), 5);
+        let power = cpu
+            .metrics
+            .iter()
+            .find(|metric| metric.kind == SensorMetricKind::Power)
+            .unwrap();
+        assert_eq!(power.label, "CPU Package");
+        assert_eq!(power.value, Some(45.5));
+        assert_eq!(power.max, Some(88.2));
+    }
+
+    #[test]
     fn helper_snapshot_parser_preserves_unsupported_status() {
         let line = r#"{"timestampUtc":"2026-05-16T03:36:28Z","cpu":{"label":"CPU","provider":"LibreHardwareMonitor","status":"unsupported","message":"No CPU temperature sensor found"}}"#;
 
@@ -839,6 +923,31 @@ mod tests {
     }
 
     #[test]
+    fn merge_sensor_snapshots_uses_helper_for_missing_service_temperatures() {
+        let service = parse_helper_snapshot(
+            r#"{"timestampUtc":"unix-ms:1770000000000","isElevated":true,"source":"BenchScopeSensorService","cpu":{"label":"CPU","temperatureC":null,"utilizationPercent":14.0,"provider":"BenchScope sensor driver bridge","status":"partial","message":"CPU temperature unavailable; utilization is live"},"gpu":{"label":"GPU","temperatureC":null,"utilizationPercent":22.0,"provider":"BenchScope sensor driver bridge","status":"partial","message":"GPU temperature unavailable; utilization is live"}}"#,
+        )
+        .unwrap();
+        let helper = parse_helper_snapshot(
+            r#"{"timestampUtc":"2026-05-16T03:36:28Z","isElevated":true,"cpu":{"label":"CPU Package","temperatureC":63.5,"provider":"LibreHardwareMonitor","status":"ok"},"gpu":{"label":"GPU Core","temperatureC":57.0,"provider":"LibreHardwareMonitor","status":"ok"}}"#,
+        )
+        .unwrap();
+
+        let merged = merge_sensor_snapshots(Some(service), Some(helper)).unwrap();
+
+        let cpu = merged.cpu.unwrap();
+        let gpu = merged.gpu.unwrap();
+        assert_eq!(cpu.temperature_c, Some(63.5));
+        assert_eq!(cpu.utilization_percent, Some(14.0));
+        assert_eq!(cpu.status, SensorStatus::Ok);
+        assert!(cpu.provider.contains("LibreHardwareMonitor"));
+        assert_eq!(gpu.temperature_c, Some(57.0));
+        assert_eq!(gpu.utilization_percent, Some(22.0));
+        assert_eq!(gpu.status, SensorStatus::Ok);
+        assert!(gpu.provider.contains("LibreHardwareMonitor"));
+    }
+
+    #[test]
     fn integrated_gpu_fallback_uses_cpu_package_temperature() {
         let snapshot = SensorSnapshot {
             cpu: Some(SensorReading::ok(
@@ -852,6 +961,7 @@ mod tests {
                 label: "Intel Xe Graphics".to_owned(),
                 temperature_c: None,
                 utilization_percent: Some(33.0),
+                metrics: Vec::new(),
                 provider: "LibreHardwareMonitor".to_owned(),
                 updated_at: Instant::now(),
                 status: SensorStatus::Ok,
@@ -883,6 +993,7 @@ mod tests {
                 label: "Intel Xe Graphics".to_owned(),
                 temperature_c: None,
                 utilization_percent: Some(33.0),
+                metrics: Vec::new(),
                 provider: "Windows performance counters".to_owned(),
                 updated_at: Instant::now(),
                 status: SensorStatus::Ok,
@@ -901,14 +1012,13 @@ mod tests {
     }
 
     #[test]
-    fn panel_height_split_keeps_sensor_space_visible() {
+    fn panel_height_split_leaves_content_and_log_visible() {
         for available in [320.0, 480.0, 760.0] {
             let (content, log) = panel_content_log_heights(available, 0.18, 150.0);
             assert!(content >= 40.0);
             assert!(log >= 32.0);
             assert!(
-                content + log + SENSOR_BOX_RESERVED_HEIGHT + PANEL_VERTICAL_CHROME_HEIGHT
-                    <= available + 0.1
+                content + log + PANEL_VERTICAL_CHROME_HEIGHT <= available + 0.1
             );
         }
     }
@@ -924,6 +1034,48 @@ mod tests {
             Some("Samsung SSD 990 PRO 2TB")
         );
         assert_eq!(names.get(&'D').map(String::as_str), Some("WD_BLACK SN850X"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn device_info_parser_reads_core_inventory_and_driver_dates() {
+        let output = concat!(
+            "SYSTEM\tContoso\tModel X\tFamily\tSKU1\tx64-based PC\t3; 10\t34359738368\t1\t16\tWORKGROUP\t\tTrue\tuser\r\n",
+            "OS\tWindows 11 Pro\t10.0.26100\t26100\tx64\t2025-01-01\t2026-05-17\r\n",
+            "BIOS\tContoso\t1.2.3\tCONTOSO - 1\t2026-04-01\tSN-BIOS\r\n",
+            "BOARD\tContoso\tBoard X\tRev 1\tSN-BOARD\r\n",
+            "CPU\tAMD Ryzen Test\tAuthenticAMD\tAMD64 Family\tAM5\tABC123\t9\t25\t97\t2\t8\t16\t5200\t4200\t8192\t32768\tTrue\tTrue\tTrue\r\n",
+            "MEMORY\tG.Skill\tF5-6000\tRAMSN\tBANK 0\tDIMM A1\t17179869184\t6000\t5600\t8\t0\t34\t8192\t64\t64\r\n",
+            "DISK\t0\t\\\\.\\PHYSICALDRIVE0\tTest NVMe\tDISKSN\t9B2Q\tSCSI\tSSD\tNVMe\t2000000000000\t3\tOK\tHealthy\tOnline\r\n",
+            "VOLUME\tC\tSystem\tNTFS\tFixed\t1000000000\t500000000\tHealthy\tOK\r\n",
+            "GPU\tNVIDIA Test GPU\tPCI\\VEN_10DE\tNVIDIA\tNVIDIA Processor\tNVIDIA\t32.0.15\t2026-03-22\tnv_disp.inf\t8589934592\t2560\t1440\t165\tOK\r\n",
+            "NETWORK\tEthernet\tIntel Ethernet\tTrue\tAA:BB:CC:DD:EE:FF\t1000000000\tTrue\tIntel\t2.1.0\t2026-02-01\tOK\r\n",
+            "MONITOR\tGeneric PnP Monitor\tContoso\tOLED\t2560x1440\tMONITOR\\ABC\tOK\r\n",
+            "DRIVER\tDISPLAY\tNVIDIA Test GPU\tNVIDIA\tNVIDIA\t32.0.15\t2026-03-22\tMicrosoft Windows Hardware Compatibility Publisher\tnv_disp.inf\tPCI\\VEN_10DE\tTrue\r\n",
+            "NOTE\tProvider note example\r\n",
+        );
+
+        let snapshot = parse_windows_device_info_output(output);
+
+        assert_eq!(
+            snapshot.system.as_ref().and_then(|system| system.manufacturer.as_deref()),
+            Some("Contoso")
+        );
+        assert_eq!(snapshot.total_ram_bytes(), Some(34_359_738_368));
+        assert_eq!(snapshot.cpu_core_count(), Some(8));
+        assert_eq!(snapshot.cpu_logical_processor_count(), Some(16));
+        assert_eq!(snapshot.cpus[0].architecture.as_deref(), Some("x64"));
+        assert_eq!(
+            snapshot.memory_modules[0].smbios_memory_type.as_deref(),
+            Some("DDR5")
+        );
+        assert_eq!(snapshot.disks[0].bus_type.as_deref(), Some("NVMe"));
+        assert_eq!(snapshot.gpus[0].driver_date.as_deref(), Some("2026-03-22"));
+        assert_eq!(snapshot.gpus[0].resolution.as_deref(), Some("2560x1440"));
+        assert_eq!(snapshot.network_adapters[0].driver_version.as_deref(), Some("2.1.0"));
+        assert_eq!(snapshot.drivers[0].date.as_deref(), Some("2026-03-22"));
+        assert_eq!(snapshot.drivers[0].is_signed, Some(true));
+        assert_eq!(snapshot.provider_notes, vec!["Provider note example"]);
     }
 
     #[test]
@@ -953,6 +1105,51 @@ mod tests {
         let latencies = parse_ping_latencies_ms(output);
 
         assert_eq!(latencies, vec![14.0, 0.5]);
+    }
+
+    #[test]
+    fn network_speed_sample_parser_reads_result_row() {
+        let output = "noise\r\nBENCHSCOPE_SPEED\tdownload\t25000000\t2000.0\r\n";
+
+        let sample = parse_network_speed_sample_output(output).unwrap();
+
+        assert_eq!(sample.direction, NetworkSpeedDirection::Download);
+        assert_eq!(sample.bytes, 25_000_000);
+        assert_eq!(sample.elapsed_ms, 2000.0);
+        assert!((sample.mbps - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn network_speed_summary_uses_best_sample_per_direction() {
+        let samples = vec![
+            NetworkSpeedSample {
+                direction: NetworkSpeedDirection::Download,
+                bytes: 5_000_000,
+                elapsed_ms: 1000.0,
+                mbps: 40.0,
+            },
+            NetworkSpeedSample {
+                direction: NetworkSpeedDirection::Download,
+                bytes: 25_000_000,
+                elapsed_ms: 2000.0,
+                mbps: 100.0,
+            },
+            NetworkSpeedSample {
+                direction: NetworkSpeedDirection::Upload,
+                bytes: 10_000_000,
+                elapsed_ms: 4000.0,
+                mbps: 20.0,
+            },
+        ];
+
+        assert_eq!(
+            summarize_network_speed(&samples, NetworkSpeedDirection::Download),
+            Some(100.0)
+        );
+        assert_eq!(
+            summarize_network_speed(&samples, NetworkSpeedDirection::Upload),
+            Some(20.0)
+        );
     }
 
     #[test]

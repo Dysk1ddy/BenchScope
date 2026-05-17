@@ -194,6 +194,9 @@ impl BenchScopeApp {
                     if ui.button("Run quick diagnosis").clicked() {
                         self.network.start_quick_diagnosis();
                     }
+                    if ui.button("Run internet speed test").clicked() {
+                        self.network.start_speed_test();
+                    }
                     if ui.button("Start continuous monitor").clicked() {
                         self.network.start_monitor();
                     }
@@ -202,10 +205,10 @@ impl BenchScopeApp {
                     }
                 });
                 ui.add_enabled_ui(self.network.running || self.network.monitoring, |ui| {
-                    let label = if self.network.running {
-                        "Cancel diagnosis"
-                    } else {
-                        "Stop monitor"
+                    let label = match self.network.running_kind {
+                        Some(NetworkRunKind::SpeedTest) => "Cancel speed test",
+                        Some(NetworkRunKind::QuickDiagnosis) => "Cancel diagnosis",
+                        None => "Stop monitor",
                     };
                     if ui.button(label).clicked() {
                         self.network.stop();
@@ -254,6 +257,59 @@ impl BenchScopeApp {
                                     }
                                     ui.add_space(6.0);
                                 }
+                            }
+
+                            ui.separator();
+                            ui.label(egui::RichText::new("Internet Speed Test").strong());
+                            if self.network.speed_samples.is_empty() {
+                                ui.label("Run an internet speed test to measure download and upload throughput.");
+                            } else {
+                                if let Some(result) = &self.network.speed_result {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!(
+                                            "Download: {}",
+                                            format_network_speed_mbps(result.download_mbps)
+                                        ));
+                                        ui.separator();
+                                        ui.label(format!(
+                                            "Upload: {}",
+                                            format_network_speed_mbps(result.upload_mbps)
+                                        ));
+                                        ui.separator();
+                                        ui.label(format!(
+                                            "Elapsed: {}",
+                                            format_elapsed(result.elapsed_s)
+                                        ));
+                                    });
+                                    for note in &result.notes {
+                                        ui.small(note);
+                                    }
+                                } else {
+                                    ui.label("Collecting speed samples...");
+                                }
+                                egui::Grid::new("network_speed_grid")
+                                    .striped(true)
+                                    .num_columns(4)
+                                    .show(ui, |ui| {
+                                        result_header(ui, "Direction");
+                                        result_header(ui, "Payload");
+                                        result_header(ui, "Elapsed");
+                                        result_header(ui, "Throughput");
+                                        ui.end_row();
+                                        for sample in &self.network.speed_samples {
+                                            result_cell(ui, sample.direction.label());
+                                            result_cell(ui, format_network_payload_size(sample.bytes));
+                                            result_cell(
+                                                ui,
+                                                format_elapsed(sample.elapsed_ms / 1000.0),
+                                            );
+                                            result_cell(
+                                                ui,
+                                                format_network_speed_mbps(Some(sample.mbps)),
+                                            );
+                                            ui.end_row();
+                                        }
+                                    });
                             }
 
                             ui.separator();

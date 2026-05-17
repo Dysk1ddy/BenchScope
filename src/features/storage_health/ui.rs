@@ -427,9 +427,9 @@ impl BenchScopeApp {
                         ui_log_line(ui, line);
                     }
                 });
-            ui.add_space(6.0);
-            self.ui_sensor_panel(ui);
         });
+
+        self.ui_sensor_window(&ctx);
 
         if self.storage_health_back_confirm {
             egui::Window::new("Return to main menu?")

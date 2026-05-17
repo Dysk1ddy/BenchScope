@@ -35,6 +35,7 @@ include!("features/storage_health/mod.rs");
 include!("features/ram_tester/mod.rs");
 include!("features/battery_health_diagnostic/mod.rs");
 include!("features/network_diagnostic/mod.rs");
+include!("features/device_info/mod.rs");
 include!("sensors/mod.rs");
 include!("ui/mod.rs");
 include!("app/mod.rs");
