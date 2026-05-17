@@ -26,6 +26,24 @@ fn format_percent_value(value: Option<f32>) -> String {
         .unwrap_or_else(|| "N/A".to_owned())
 }
 
+fn format_percent_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| format!("{value}%"))
+        .unwrap_or_else(|| "N/A".to_owned())
+}
+
+fn format_hex_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| format!("0x{value:02x}"))
+        .unwrap_or_else(|| "N/A".to_owned())
+}
+
+fn format_optional_u64_minutes(value: Option<u64>) -> String {
+    value
+        .map(|value| format!("{value} min"))
+        .unwrap_or_else(|| "N/A".to_owned())
+}
+
 fn format_storage_health_percent(value: Option<f32>) -> String {
     value
         .map(|value| format!("{value:.0}% health"))

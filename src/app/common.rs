@@ -1,18 +1,136 @@
-impl BenchScopeApp {
+impl BenchScopeRoot {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_ui_style(&cc.egui_ctx);
         let (tx, rx) = mpsc::channel();
-        let adapters = enumerate_adapters();
-        let cpu_info = detect_cpu_info();
+        let worker_tx = tx.clone();
+        if let Err(err) = thread::Builder::new()
+            .name("benchscope-startup".to_owned())
+            .spawn(move || {
+                let result =
+                    panic::catch_unwind(AssertUnwindSafe(|| load_startup_data(&worker_tx)));
+                match result {
+                    Ok(data) => {
+                        let _ = worker_tx.send(StartupEvent::Ready(Box::new(data)));
+                    }
+                    Err(panic) => {
+                        let _ = worker_tx.send(StartupEvent::Failed(format!(
+                            "Startup failed: {}",
+                            panic_message(&*panic)
+                        )));
+                    }
+                }
+            })
+        {
+            let _ = tx.send(StartupEvent::Failed(format!(
+                "Could not start initialization worker: {err}"
+            )));
+        }
+
+        Self {
+            startup_rx: rx,
+            startup_progress: StartupProgress {
+                step: "Starting BenchScope".to_owned(),
+                progress: 0.02,
+            },
+            app: None,
+            startup_error: None,
+        }
+    }
+
+    fn poll_startup(&mut self) {
+        while let Ok(event) = self.startup_rx.try_recv() {
+            match event {
+                StartupEvent::Progress(progress) => self.startup_progress = progress,
+                StartupEvent::Ready(data) => {
+                    self.startup_progress = StartupProgress {
+                        step: "Ready".to_owned(),
+                        progress: 1.0,
+                    };
+                    self.app = Some(BenchScopeApp::from_startup(*data));
+                    self.startup_error = None;
+                }
+                StartupEvent::Failed(message) => {
+                    self.startup_error = Some(message);
+                }
+            }
+        }
+    }
+
+    fn ui_startup(&self, ui: &mut egui::Ui) {
+        ui.ctx().request_repaint_after(Duration::from_millis(50));
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            let top_space = (ui.available_height() * 0.32).clamp(64.0, 220.0);
+            ui.add_space(top_space);
+            ui.vertical_centered(|ui| {
+                ui.heading(egui::RichText::new("BenchScope").size(34.0));
+                ui.add_space(22.0);
+                if let Some(error) = &self.startup_error {
+                    ui.colored_label(egui::Color32::RED, error);
+                } else {
+                    ui.add(
+                        egui::ProgressBar::new(self.startup_progress.progress.clamp(0.0, 1.0))
+                            .desired_width(460.0)
+                            .show_percentage(),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(&self.startup_progress.step).size(16.0));
+                }
+            });
+        });
+    }
+}
+
+fn load_startup_data(tx: &Sender<StartupEvent>) -> StartupData {
+    startup_progress(tx, 0.10, "Detecting GPU adapters");
+    let adapters = enumerate_adapters();
+    startup_progress(tx, 0.36, "Reading CPU information");
+    let cpu_info = detect_cpu_info();
+    startup_progress(tx, 0.48, "Preparing drive benchmark");
+    let drive = DriveBenchmarkState::new();
+    startup_progress(tx, 0.62, "Preparing storage health");
+    let storage_health = StorageHealthState::new();
+    startup_progress(tx, 0.74, "Reading RAM status");
+    let ram = RamTestState::new();
+    startup_progress(tx, 0.84, "Preparing battery diagnostic");
+    let battery = BatteryDiagnosticState::new();
+    startup_progress(tx, 0.92, "Detecting network adapters");
+    let network = NetworkDiagnosticState::new();
+    startup_progress(tx, 0.98, "Starting safe sensor sampler");
+
+    StartupData {
+        adapters,
+        cpu_info,
+        drive,
+        storage_health,
+        ram,
+        battery,
+        network,
+    }
+}
+
+fn startup_progress(tx: &Sender<StartupEvent>, progress: f32, step: &str) {
+    let _ = tx.send(StartupEvent::Progress(StartupProgress {
+        step: step.to_owned(),
+        progress,
+    }));
+}
+
+impl BenchScopeApp {
+    fn from_startup(data: StartupData) -> Self {
+        let StartupData {
+            adapters,
+            cpu_info,
+            drive,
+            storage_health,
+            ram,
+            battery,
+            network,
+        } = data;
+        let (tx, rx) = mpsc::channel();
         let selected_adapter = adapters
             .iter()
             .position(|adapter| adapter.device_type != wgpu::DeviceType::Cpu)
             .unwrap_or(0);
-        let drive = DriveBenchmarkState::new();
-        let storage_health = StorageHealthState::new();
-        let ram = RamTestState::new();
-        let battery = BatteryDiagnosticState::new();
-        let network = NetworkDiagnosticState::new();
         let sensors = SensorManager::new(drive_letter_for_path(&PathBuf::from(
             drive.target_folder_text.trim(),
         )));
@@ -55,7 +173,6 @@ impl BenchScopeApp {
             sensors,
             temperature_run: None,
             fullscreen: false,
-            sensor_permission_prompt: sensor_permission_prompt_needed(),
         };
         app.log("Application started");
         if app.adapters.is_empty() {
@@ -157,7 +274,7 @@ impl BenchScopeApp {
                     ui.set_min_width(210.0);
                     ui.label(egui::RichText::new("Sensors").strong());
                     ui.horizontal(|ui| {
-                        ui.set_min_width(188.0);
+                        ui.set_min_width(214.0);
                         ui.label(egui::RichText::new("").monospace());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(egui::RichText::new("Util %").small());
@@ -173,30 +290,4 @@ impl BenchScopeApp {
         });
     }
 
-    fn ui_sensor_permission_prompt(&mut self, ctx: &egui::Context) {
-        if !self.sensor_permission_prompt {
-            return;
-        }
-
-        egui::Window::new("Enable Extended Sensors?")
-            .collapsible(false)
-            .resizable(false)
-            .default_width(520.0)
-            .show(ctx, |ui| {
-                ui.label("BenchScope can use safe Windows/NVIDIA probes without extra permission.");
-                ui.add_space(6.0);
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    "CPU, RAM, and some SSD temperatures may be unavailable without low-level driver access.",
-                );
-                ui.label("The optional LibreHardwareMonitor helper can create or load a WinRing driver. Microsoft Defender blocks that driver as VulnerableDriver:WinNT/Winring0 on this machine, so BenchScope will not launch the helper from the UI.");
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Use safe sensors").clicked() {
-                        self.sensor_permission_prompt = false;
-                        self.log("Extended sensor helper skipped; using safe Windows/NVIDIA probes.");
-                    }
-                });
-            });
-    }
 }

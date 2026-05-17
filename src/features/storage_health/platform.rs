@@ -139,6 +139,31 @@ Emit @(
     ($notes -join ' | ')
 )
 
+if ($counter) {
+    Emit @(
+        'NVME',
+        (First-Value @((Value $counter 'AvailableSpare'), (Value $counter 'AvailableSparePercent'))),
+        (First-Value @((Value $counter 'AvailableSpareThreshold'), (Value $counter 'AvailableSpareThresholdPercent'))),
+        (First-Value @((Value $counter 'CriticalWarning'), (Value $counter 'CriticalWarnings'))),
+        (First-Value @((Value $counter 'UnsafeShutdowns'), (Value $counter 'UnsafeShutdownCount'))),
+        (First-Value @((Value $counter 'ControllerBusyTime'), (Value $counter 'ControllerBusyTimeMinutes'))),
+        (Value $counter 'HostReadCommands'),
+        (Value $counter 'HostWriteCommands'),
+        (First-Value @((Value $counter 'WarningCompositeTemperatureTime'), (Value $counter 'WarningTemperatureTime'))),
+        (First-Value @((Value $counter 'CriticalCompositeTemperatureTime'), (Value $counter 'CriticalTemperatureTime'))),
+        (Value $counter 'ThermalManagementTemperature1TransitionCount'),
+        (Value $counter 'ThermalManagementTemperature2TransitionCount'),
+        (Value $counter 'TemperatureSensor1'),
+        (Value $counter 'TemperatureSensor2'),
+        (Value $counter 'TemperatureSensor3'),
+        (Value $counter 'TemperatureSensor4'),
+        (Value $counter 'TemperatureSensor5'),
+        (Value $counter 'TemperatureSensor6'),
+        (Value $counter 'TemperatureSensor7'),
+        (Value $counter 'TemperatureSensor8')
+    )
+}
+
 $statusItems = Safe 'MSStorageDriver_FailurePredictStatus' {
     Get-CimInstance -Namespace root\wmi -ClassName MSStorageDriver_FailurePredictStatus
 }
@@ -308,6 +333,30 @@ fn parse_windows_storage_health_output(drive: &DriveInfo, output: &str) -> Stora
                     error_count_severity(snapshot.media_errors),
                 );
             }
+            Some("NVME") => {
+                snapshot.available_spare_percent = parse_optional_u64(columns.get(1).copied());
+                snapshot.available_spare_threshold_percent =
+                    parse_optional_u64(columns.get(2).copied());
+                snapshot.critical_warning_flags = parse_optional_u64(columns.get(3).copied());
+                snapshot.unsafe_shutdowns = parse_optional_u64(columns.get(4).copied());
+                snapshot.controller_busy_time_minutes =
+                    parse_optional_u64(columns.get(5).copied());
+                snapshot.host_read_commands = parse_optional_u64(columns.get(6).copied());
+                snapshot.host_write_commands = parse_optional_u64(columns.get(7).copied());
+                snapshot.warning_temperature_time_minutes =
+                    parse_optional_u64(columns.get(8).copied());
+                snapshot.critical_temperature_time_minutes =
+                    parse_optional_u64(columns.get(9).copied());
+                snapshot.thermal_management_temp1_transition_count =
+                    parse_optional_u64(columns.get(10).copied());
+                snapshot.thermal_management_temp2_transition_count =
+                    parse_optional_u64(columns.get(11).copied());
+                for sensor_index in 0..snapshot.nvme_temperature_sensors_c.len() {
+                    snapshot.nvme_temperature_sensors_c[sensor_index] =
+                        parse_optional_f32_field(columns.get(12 + sensor_index).copied());
+                }
+                push_nvme_health_attributes(&mut snapshot);
+            }
             Some("SMARTSTATUS") => {
                 if let (Some(instance), Some(predict_failure)) =
                     (columns.get(1), parse_optional_bool(columns.get(2).copied()))
@@ -475,6 +524,55 @@ fn finalize_storage_health_snapshot(
         HealthSeverity::Warning,
         HealthSeverity::Critical,
     );
+    if let (Some(spare), Some(threshold)) = (
+        snapshot.available_spare_percent,
+        snapshot.available_spare_threshold_percent,
+    ) {
+        if spare <= threshold {
+            snapshot.warnings.push(HealthWarning {
+                severity: HealthSeverity::Critical,
+                title: "NVMe available spare is below threshold".to_owned(),
+                detail: format!(
+                    "Available spare is {spare}% and the device threshold is {threshold}%."
+                ),
+            });
+        } else if spare <= threshold.saturating_add(10) {
+            snapshot.warnings.push(HealthWarning {
+                severity: HealthSeverity::Warning,
+                title: "NVMe available spare is getting low".to_owned(),
+                detail: format!(
+                    "Available spare is {spare}% and the device threshold is {threshold}%."
+                ),
+            });
+        }
+    }
+    if let Some(flags) = snapshot.critical_warning_flags.filter(|flags| *flags != 0) {
+        snapshot.warnings.push(HealthWarning {
+            severity: HealthSeverity::Critical,
+            title: "NVMe critical warning flags are set".to_owned(),
+            detail: format!("Critical warning bitfield is 0x{flags:02x}."),
+        });
+    }
+    if let Some(minutes) = snapshot
+        .critical_temperature_time_minutes
+        .filter(|minutes| *minutes != 0)
+    {
+        snapshot.warnings.push(HealthWarning {
+            severity: HealthSeverity::Critical,
+            title: "NVMe critical temperature time recorded".to_owned(),
+            detail: format!("The drive reports {minutes} minute(s) at critical temperature."),
+        });
+    }
+    if let Some(minutes) = snapshot
+        .warning_temperature_time_minutes
+        .filter(|minutes| *minutes != 0)
+    {
+        snapshot.warnings.push(HealthWarning {
+            severity: HealthSeverity::Warning,
+            title: "NVMe warning temperature time recorded".to_owned(),
+            detail: format!("The drive reports {minutes} minute(s) at warning temperature."),
+        });
+    }
 
     if let Some(life) = snapshot.remaining_life_percent {
         if life <= 5.0 {
@@ -502,7 +600,15 @@ fn finalize_storage_health_snapshot(
         || snapshot.uncorrectable_sectors.is_some()
         || snapshot.media_errors.is_some()
         || snapshot.read_errors_total.is_some()
-        || snapshot.write_errors_total.is_some();
+        || snapshot.write_errors_total.is_some()
+        || snapshot.available_spare_percent.is_some()
+        || snapshot.critical_warning_flags.is_some()
+        || snapshot.unsafe_shutdowns.is_some()
+        || snapshot.controller_busy_time_minutes.is_some()
+        || snapshot
+            .nvme_temperature_sensors_c
+            .iter()
+            .any(Option::is_some);
     snapshot.status = if !has_health_data {
         StorageHealthStatus::Unknown
     } else if snapshot
@@ -523,6 +629,135 @@ fn finalize_storage_health_snapshot(
     snapshot.health_percent = estimate_storage_health_percent(&snapshot);
 
     Ok(snapshot)
+}
+
+fn push_nvme_health_attributes(snapshot: &mut StorageHealthSnapshot) {
+    let spare_severity = nvme_spare_severity(
+        snapshot.available_spare_percent,
+        snapshot.available_spare_threshold_percent,
+    );
+    push_optional_counter_attribute(
+        &mut snapshot.attributes,
+        "NVMe available spare",
+        snapshot.available_spare_percent,
+        "%",
+        spare_severity,
+    );
+    push_optional_counter_attribute(
+        &mut snapshot.attributes,
+        "NVMe spare threshold",
+        snapshot.available_spare_threshold_percent,
+        "%",
+        HealthSeverity::Info,
+    );
+    push_optional_counter_attribute(
+        &mut snapshot.attributes,
+        "NVMe critical warning flags",
+        snapshot.critical_warning_flags,
+        "",
+        nonzero_severity(snapshot.critical_warning_flags, HealthSeverity::Critical),
+    );
+    push_optional_counter_attribute(
+        &mut snapshot.attributes,
+        "NVMe unsafe shutdowns",
+        snapshot.unsafe_shutdowns,
+        "",
+        nonzero_severity(snapshot.unsafe_shutdowns, HealthSeverity::Warning),
+    );
+    push_optional_counter_attribute(
+        &mut snapshot.attributes,
+        "NVMe controller busy time",
+        snapshot.controller_busy_time_minutes,
+        " min",
+        HealthSeverity::Info,
+    );
+    push_optional_counter_attribute(
+        &mut snapshot.attributes,
+        "NVMe host read commands",
+        snapshot.host_read_commands,
+        "",
+        HealthSeverity::Info,
+    );
+    push_optional_counter_attribute(
+        &mut snapshot.attributes,
+        "NVMe host write commands",
+        snapshot.host_write_commands,
+        "",
+        HealthSeverity::Info,
+    );
+    push_optional_counter_attribute(
+        &mut snapshot.attributes,
+        "NVMe warning temperature time",
+        snapshot.warning_temperature_time_minutes,
+        " min",
+        nonzero_severity(
+            snapshot.warning_temperature_time_minutes,
+            HealthSeverity::Warning,
+        ),
+    );
+    push_optional_counter_attribute(
+        &mut snapshot.attributes,
+        "NVMe critical temperature time",
+        snapshot.critical_temperature_time_minutes,
+        " min",
+        nonzero_severity(
+            snapshot.critical_temperature_time_minutes,
+            HealthSeverity::Critical,
+        ),
+    );
+    push_optional_counter_attribute(
+        &mut snapshot.attributes,
+        "NVMe thermal management temp 1 transitions",
+        snapshot.thermal_management_temp1_transition_count,
+        "",
+        nonzero_severity(
+            snapshot.thermal_management_temp1_transition_count,
+            HealthSeverity::Warning,
+        ),
+    );
+    push_optional_counter_attribute(
+        &mut snapshot.attributes,
+        "NVMe thermal management temp 2 transitions",
+        snapshot.thermal_management_temp2_transition_count,
+        "",
+        nonzero_severity(
+            snapshot.thermal_management_temp2_transition_count,
+            HealthSeverity::Warning,
+        ),
+    );
+    for (index, value) in snapshot.nvme_temperature_sensors_c.iter().enumerate() {
+        if let Some(value) = value {
+            snapshot.attributes.push(StorageAttribute {
+                id: None,
+                name: format!("NVMe temperature sensor {}", index + 1),
+                current: Some(value.round() as u64),
+                worst: None,
+                threshold: None,
+                raw: Some(value.round() as u64),
+                display_value: format!("{value:.0} C"),
+                interpretation: "Additional NVMe temperature sensor.".to_owned(),
+                severity: temperature_severity(*value),
+            });
+        }
+    }
+}
+
+fn nvme_spare_severity(spare: Option<u64>, threshold: Option<u64>) -> HealthSeverity {
+    match (spare, threshold) {
+        (Some(spare), Some(threshold)) if spare <= threshold => HealthSeverity::Critical,
+        (Some(spare), Some(threshold)) if spare <= threshold.saturating_add(10) => {
+            HealthSeverity::Warning
+        }
+        _ => HealthSeverity::Info,
+    }
+}
+
+fn nonzero_severity(value: Option<u64>, severity: HealthSeverity) -> HealthSeverity {
+    if value.unwrap_or(0) == 0 {
+        HealthSeverity::Info
+    } else {
+        severity
+    }
 }
 
 fn estimate_storage_health_percent(snapshot: &StorageHealthSnapshot) -> Option<f32> {
@@ -560,6 +795,24 @@ fn estimate_storage_health_percent(snapshot: &StorageHealthSnapshot) -> Option<f
     }
     if snapshot.media_errors.unwrap_or(0) > 0 {
         score = score.min(35.0) - storage_counter_penalty(snapshot.media_errors, 6.0, 30.0);
+    }
+    if let (Some(spare), Some(threshold)) = (
+        snapshot.available_spare_percent,
+        snapshot.available_spare_threshold_percent,
+    ) {
+        if spare <= threshold {
+            score = score.min(35.0);
+        } else if spare <= threshold.saturating_add(10) {
+            score = score.min(82.0);
+        }
+    }
+    if snapshot.critical_warning_flags.unwrap_or(0) != 0 {
+        score = score.min(25.0);
+    }
+    if snapshot.critical_temperature_time_minutes.unwrap_or(0) != 0 {
+        score = score.min(40.0);
+    } else if snapshot.warning_temperature_time_minutes.unwrap_or(0) != 0 {
+        score = score.min(85.0);
     }
 
     for warning in &snapshot.warnings {
@@ -857,6 +1110,18 @@ fn parse_optional_u64(value: Option<&str>) -> Option<u64> {
     if value.is_empty() {
         return None;
     }
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        return u64::from_str_radix(
+            &hex.chars()
+                .take_while(|ch| ch.is_ascii_hexdigit())
+                .collect::<String>(),
+            16,
+        )
+        .ok();
+    }
     value
         .split(|ch: char| !(ch.is_ascii_digit()))
         .find(|part| !part.is_empty())
@@ -1119,8 +1384,36 @@ fn render_storage_health_report(
         format_temperature_value(snapshot.temperature_c)
     ));
     report.push_str(&format!(
-        "- Remaining life estimate: {}\n\n",
+        "- Remaining life estimate: {}\n",
         format_percent_value(snapshot.remaining_life_percent)
+    ));
+    report.push_str(&format!(
+        "- NVMe available spare: {}\n",
+        format_percent_u64(snapshot.available_spare_percent)
+    ));
+    report.push_str(&format!(
+        "- NVMe spare threshold: {}\n",
+        format_percent_u64(snapshot.available_spare_threshold_percent)
+    ));
+    report.push_str(&format!(
+        "- NVMe critical warning flags: {}\n",
+        format_hex_u64(snapshot.critical_warning_flags)
+    ));
+    report.push_str(&format!(
+        "- Unsafe shutdowns: {}\n",
+        format_optional_u64(snapshot.unsafe_shutdowns)
+    ));
+    report.push_str(&format!(
+        "- Controller busy time: {}\n",
+        format_optional_u64_minutes(snapshot.controller_busy_time_minutes)
+    ));
+    report.push_str(&format!(
+        "- Thermal warning time: {}\n",
+        format_optional_u64_minutes(snapshot.warning_temperature_time_minutes)
+    ));
+    report.push_str(&format!(
+        "- Thermal critical time: {}\n\n",
+        format_optional_u64_minutes(snapshot.critical_temperature_time_minutes)
     ));
 
     report.push_str("## Warnings\n\n");

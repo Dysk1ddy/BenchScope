@@ -1,5 +1,5 @@
 fn temperature_color(kind: SensorKind, value: Option<f32>, status: &SensorStatus) -> egui::Color32 {
-    if !matches!(status, SensorStatus::Ok) {
+    if !matches!(status, SensorStatus::Ok | SensorStatus::Partial(_)) {
         return egui::Color32::GRAY;
     }
     match value {
@@ -17,15 +17,16 @@ fn ui_sensor_row(ui: &mut egui::Ui, label: &str, reading: Option<&SensorReading>
                 ("-- C".to_owned(), "--%".to_owned())
             } else {
                 (
-                    format_temperature_value(reading.temperature_c),
+                    format_sensor_temperature(reading),
                     format_utilization_value(reading.utilization_percent),
                 )
             };
             let tooltip = format!(
-                "{}\nProvider: {}\nStatus: {}\nUtilization: {}",
+                "{}\nProvider: {}\nStatus: {}\nTemperature: {}\nUtilization: {}",
                 reading.label,
                 reading.provider,
                 reading.status.detail(),
+                format_sensor_temperature_detail(reading),
                 format_utilization_value(reading.utilization_percent)
             );
             (
@@ -50,7 +51,7 @@ fn ui_sensor_row(ui: &mut egui::Ui, label: &str, reading: Option<&SensorReading>
         };
 
     ui.horizontal(|ui| {
-        ui.set_min_width(188.0);
+        ui.set_min_width(214.0);
         ui.label(egui::RichText::new(label).monospace());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
@@ -68,4 +69,26 @@ fn ui_sensor_row(ui: &mut egui::Ui, label: &str, reading: Option<&SensorReading>
             .on_hover_text(tooltip);
         });
     });
+}
+
+fn format_sensor_temperature(reading: &SensorReading) -> String {
+    if reading.temperature_c.is_some() {
+        return format_temperature_value(reading.temperature_c);
+    }
+    match reading.status {
+        SensorStatus::Partial(_) if matches!(reading.kind, SensorKind::Cpu | SensorKind::Gpu) => {
+            "No safe temp".to_owned()
+        }
+        _ => "N/A".to_owned(),
+    }
+}
+
+fn format_sensor_temperature_detail(reading: &SensorReading) -> String {
+    if reading.temperature_c.is_some() {
+        format_temperature_value(reading.temperature_c)
+    } else if matches!(reading.kind, SensorKind::Cpu | SensorKind::Gpu) {
+        "No safe CPU/GPU temperature provider was found".to_owned()
+    } else {
+        "N/A".to_owned()
+    }
 }

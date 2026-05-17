@@ -17,11 +17,16 @@ impl BenchScopeApp {
                     ui.label(&self.eta_text);
                 }
             });
-            ui.add(
+            let progress_bar = if self.repeat_running && self.repeat_duration.is_infinite() {
+                egui::ProgressBar::new(0.0)
+                    .animate(true)
+                    .text("Stress test running until canceled")
+            } else {
                 egui::ProgressBar::new(self.progress)
                     .show_percentage()
-                    .text("Stress test elapsed"),
-            );
+                    .text("Stress test elapsed")
+            };
+            ui.add(progress_bar);
         });
 
         egui::Panel::left("stress_controls")
@@ -165,6 +170,11 @@ impl BenchScopeApp {
                             RepeatDuration::FiveMinutes,
                             "5 min",
                         );
+                        ui.selectable_value(
+                            &mut self.repeat_duration,
+                            RepeatDuration::Infinite,
+                            "Infinite",
+                        );
                     });
                 });
                             });
@@ -197,7 +207,11 @@ impl BenchScopeApp {
                 |ui| {
                     ui.label(format!("Mode: {}", self.repeat_mode));
                     ui.label(format!("Duration: {}", self.repeat_duration));
-                    ui.label(format!("Progress: {:.0}%", self.progress * 100.0));
+                    if self.repeat_duration.is_infinite() {
+                        ui.label("Progress: runs until canceled");
+                    } else {
+                        ui.label(format!("Progress: {:.0}%", self.progress * 100.0));
+                    }
                     if !self.eta_text.is_empty() {
                         ui.label(&self.eta_text);
                     }

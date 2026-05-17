@@ -1,5 +1,5 @@
-impl eframe::App for BenchScopeApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl BenchScopeApp {
+    fn ui_app(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.handle_global_shortcuts(&ctx);
         self.sync_sensor_state();
@@ -38,9 +38,6 @@ impl eframe::App for BenchScopeApp {
         } else if self.view != AppView::MainMenu {
             ctx.request_repaint_after(Duration::from_millis(SENSOR_POLL_MS));
         }
-        self.ui_sensor_permission_prompt(&ctx);
-
-
         match self.view {
             AppView::MainMenu => self.ui_main_menu(ui),
             AppView::DriveBenchmark => self.ui_drive_benchmark(ui),
@@ -50,6 +47,17 @@ impl eframe::App for BenchScopeApp {
             AppView::NetworkDiagnostic => self.ui_network_diagnostic(ui),
             AppView::MatrixStressTest => self.ui_matrix_stress_test(ui),
             AppView::MatrixBenchmark => self.ui_matrix_benchmark(ui, &ctx),
+        }
+    }
+}
+
+impl eframe::App for BenchScopeRoot {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.poll_startup();
+        if let Some(app) = &mut self.app {
+            app.ui_app(ui, frame);
+        } else {
+            self.ui_startup(ui);
         }
     }
 }

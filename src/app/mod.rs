@@ -1,3 +1,32 @@
+#[derive(Clone, Debug)]
+struct StartupProgress {
+    step: String,
+    progress: f32,
+}
+
+enum StartupEvent {
+    Progress(StartupProgress),
+    Ready(Box<StartupData>),
+    Failed(String),
+}
+
+struct StartupData {
+    adapters: Vec<AdapterInfo>,
+    cpu_info: CpuInfo,
+    drive: DriveBenchmarkState,
+    storage_health: StorageHealthState,
+    ram: RamTestState,
+    battery: BatteryDiagnosticState,
+    network: NetworkDiagnosticState,
+}
+
+struct BenchScopeRoot {
+    startup_rx: Receiver<StartupEvent>,
+    startup_progress: StartupProgress,
+    app: Option<BenchScopeApp>,
+    startup_error: Option<String>,
+}
+
 struct BenchScopeApp {
     view: AppView,
     adapters: Vec<AdapterInfo>,
@@ -37,7 +66,6 @@ struct BenchScopeApp {
     sensors: SensorManager,
     temperature_run: Option<TemperatureRunTracker>,
     fullscreen: bool,
-    sensor_permission_prompt: bool,
 }
 
 include!("view.rs");

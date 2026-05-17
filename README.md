@@ -18,7 +18,7 @@ The primary implementation is now Rust + `wgpu` + `egui`. The earlier Python Dir
 Double-click `scripts\RUN_TESTER.bat`, or run the release binary directly:
 
 ```powershell
-.\target\release\benchscope.exe
+.\target\release\BenchScope.exe
 ```
 
 If the release binary has not been built yet:
@@ -33,40 +33,40 @@ $env:CARGO_NET_OFFLINE='false'
 List detected `wgpu` adapters:
 
 ```powershell
-.\target\release\benchscope.exe --list-gpus
+.\target\release\BenchScope.exe --list-gpus
 ```
 
 Run a small CPU/GPU smoke test:
 
 ```powershell
-.\target\release\benchscope.exe --self-test --size 64
+.\target\release\BenchScope.exe --self-test --size 64
 ```
 
 Run a Memtest-style user-mode RAM test:
 
 ```powershell
-.\target\release\benchscope.exe --ram-test --ram-size auto
-.\target\release\benchscope.exe --ram-test --ram-size 1g
+.\target\release\BenchScope.exe --ram-test --ram-size auto
+.\target\release\BenchScope.exe --ram-test --ram-size 1g
 ```
 
 Select a specific adapter:
 
 ```powershell
-.\target\release\benchscope.exe --self-test --size 64 --adapter 1
+.\target\release\BenchScope.exe --self-test --size 64 --adapter 1
 ```
 
 Use the sampled CPU estimate path:
 
 ```powershell
-.\target\release\benchscope.exe --self-test --size 512 --estimate-cpu
+.\target\release\BenchScope.exe --self-test --size 512 --estimate-cpu
 ```
 
 Choose the GPU submission intensity used by self-test:
 
 ```powershell
-.\target\release\benchscope.exe --self-test --size 512 --gpu-intensity safe
-.\target\release\benchscope.exe --self-test --size 512 --gpu-intensity balanced
-.\target\release\benchscope.exe --self-test --size 512 --gpu-intensity high
+.\target\release\BenchScope.exe --self-test --size 512 --gpu-intensity safe
+.\target\release\BenchScope.exe --self-test --size 512 --gpu-intensity balanced
+.\target\release\BenchScope.exe --self-test --size 512 --gpu-intensity high
 ```
 
 ## Current Features
@@ -91,17 +91,18 @@ Choose the GPU submission intensity used by self-test:
 - Pre-run warning when the estimated GPU working set exceeds the selected adapter's reported VRAM/shared-memory limit, with an explicit run-anyway override.
 - Correctness validation against CPU output, using sampled validation when the CPU estimate mode is enabled.
 - Cancelable single benchmark runs.
-- Matrix stress test tool with cancelable 1-minute or 5-minute CPU/GPU repeat runs.
+- Matrix stress test tool with cancelable 1-minute, 5-minute, or infinite CPU/GPU repeat runs.
 - Separate CPU and GPU progress bars with roughly 5Hz progress sampling and an estimated time remaining during single benchmark runs.
 - Large GPU runs report real chunk/block progress so the progress bar keeps moving through long matrix computations.
 - GPU matrices that exceed an adapter's storage-buffer binding limit use intensity-controlled legal row/column blocks instead of binding the whole matrix at once.
 - CPU estimate results are labeled `Est.` and include the detected CPU model/logical processor count. Large estimates spend about two seconds computing real full-width CPU rows against the full-size B matrix, then extrapolate from completed row throughput.
+- Startup shows a loading progress bar while hardware, drive, RAM, battery, network, and sensor-permission setup completes.
 - Drive benchmark tool with sequential read, sequential write, random 4 KiB read, and random 4 KiB write tests.
 - Drive benchmark includes a detected-drive picker and editable target folder.
 - Drive tests report MB/s, IOPS for random tests, average latency, p95 latency, duration, file size, I/O mode, and notes.
 - Bottom-right sensor panel shows CPU/GPU temperature and utilization for matrix benchmark and stress views, plus SSD temperature and utilization for the selected drive benchmark target when the operating system/provider exposes readings.
 - Fullscreen can be toggled with the on-screen button or `F11`.
-- Windows/NVIDIA sensor probes are used by default; BenchScope does not launch the LibreHardwareMonitor helper from the UI because its low-level WinRing driver can be blocked by Microsoft Defender.
+- Windows/NVIDIA sensor probes are used by default; BenchScope automatically relaunches the GUI as administrator for Windows hardware probes and does not launch the LibreHardwareMonitor helper or WinRing driver path.
 - Benchmark logs and result tables include start/end/max temperature summaries when readings are available.
 - Drive tests prefer Windows direct/no-buffering I/O and fall back to cached file I/O when direct mode is unavailable.
 - Drive benchmark profiles keep measured subtests below a 30 second hard cap, with shorter Quick/Balanced/Thorough targets.
@@ -137,6 +138,6 @@ On Windows, a large compute dispatch that keeps the GPU busy for too long can tr
 
 The drive benchmark prefers direct/no-buffering I/O on Windows. If the selected path or filesystem rejects direct mode, the app falls back to cached I/O and labels the result. Cached mode is useful for quick comparisons, but it can include operating-system RAM cache effects, especially on repeated reads.
 
-Temperature and utilization readings are supplemental telemetry and are sampled continuously at 1 Hz, even when no benchmark is running. BenchScope uses command-based Windows/NVIDIA probes by default: `nvidia-smi`/NVML for GPU temperature when available, Windows performance counters for utilization, Windows storage reliability counters for the selected drive letter, and the Windows ACPI thermal-zone path for CPU temperature. Unsupported or permission-blocked sensors show `N/A` and never prevent benchmarks from running.
+Temperature and utilization readings are supplemental telemetry and are sampled continuously at 1 Hz, even when no benchmark is running. BenchScope uses command-based Windows/NVIDIA probes by default: `nvidia-smi`/NVML for GPU temperature when available, already-running OpenHardwareMonitor/LibreHardwareMonitor WMI namespaces for external CPU/GPU temperatures when present, Windows performance counters for utilization, and Windows storage reliability counters for the selected drive letter. BenchScope does not treat Windows ACPI thermal-zone values as CPU package/core temperatures because those readings are often static firmware zones. Unsupported or permission-blocked sensors show `N/A` and never prevent benchmarks from running. On Windows, BenchScope automatically relaunches the GUI as administrator before opening the main window.
 
-The optional `sensor-helper/` project uses LibreHardwareMonitor for broader hardware coverage, but LibreHardwareMonitor can create/load a WinRing driver on Windows. Microsoft Defender may identify that driver as `VulnerableDriver:WinNT/Winring0`, so BenchScope does not start the helper automatically and does not offer helper launch buttons in the UI. For local experiments only, build the helper and launch BenchScope with `BENCHSCOPE_ENABLE_SENSOR_HELPER=1`; if Defender blocks it, use the safe default probes instead.
+The optional `sensor-helper/` project remains in the repository for reference, but the Rust app does not launch it. LibreHardwareMonitor can create or load a WinRing driver on Windows, and Microsoft Defender may identify that driver as `VulnerableDriver:WinNT/Winring0`; BenchScope avoids that path and uses the safe Windows/NVIDIA probes instead.

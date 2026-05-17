@@ -4,3 +4,5 @@ __pycache__/
 .nuget/
 sensor-helper/bin/
 sensor-helper/obj/
+sensor-driver/BenchSco.*/
+sensor-driver/x64/

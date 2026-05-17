@@ -6,7 +6,7 @@ Make BenchScope temperature sensors work by launching the app only. The user sho
 
 Target experience:
 
-- User double-clicks `scripts\RUN_TESTER.bat` or `benchscope.exe`.
+- User double-clicks `scripts\RUN_TESTER.bat` or `BenchScope.exe`.
 - BenchScope initializes a bundled sensor backend automatically.
 - CPU, GPU, and SSD temperature and utilization rows populate when the hardware exposes sensors.
 - BenchScope requests elevated sensor access through a standard Windows UAC prompt when the app opens.
@@ -49,7 +49,7 @@ sensor-helper/
 Ship output beside the release executable:
 
 ```text
-target/release/benchscope.exe
+target/release/BenchScope.exe
 target/release/BenchScope.SensorHelper.exe
 target/release/LibreHardwareMonitorLib.dll
 ```
@@ -287,7 +287,7 @@ Copy-Item sensor-helper/bin/Release/net8.0-windows/win-x64/publish/* target/rele
 
 For release:
 
-- Include the helper executable and LibreHardwareMonitor DLL beside `benchscope.exe`.
+- Include the helper executable and LibreHardwareMonitor DLL beside `BenchScope.exe`.
 - Keep helper version in sync with BenchScope.
 - Add a startup diagnostic if helper files are missing.
 
@@ -405,7 +405,7 @@ Acceptance:
 
 Acceptance:
 
-- A fresh release folder works by opening `benchscope.exe`.
+- A fresh release folder works by opening `BenchScope.exe`.
 
 ## Done Definition
 

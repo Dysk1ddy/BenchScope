@@ -2,6 +2,20 @@
 name = "benchscope"
 version = "0.1.0"
 edition = "2024"
+default-run = "BenchScope"
+autobins = false
+
+[[bin]]
+name = "BenchScope"
+path = "src/main.rs"
+
+[[bin]]
+name = "benchscope_sensor_probe"
+path = "src/bin/benchscope_sensor_probe.rs"
+
+[[bin]]
+name = "benchscope_sensor_service"
+path = "src/bin/benchscope_sensor_service.rs"
 
 [dependencies]
 anyhow = "1.0"
@@ -9,4 +23,4 @@ bytemuck = { version = "1.25", features = ["derive"] }
 eframe = { version = "0.34.2", default-features = true }
 pollster = "0.4"
 wgpu = "29.0.3"
-windows = { version = "0.62.2", features = ["Win32_Graphics_Dxgi", "Win32_System_SystemInformation"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_System_SystemInformation", "Win32_System_Threading"] }

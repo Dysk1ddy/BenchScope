@@ -29,6 +29,7 @@ impl SensorKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SensorStatus {
     Ok,
+    Partial(String),
     Unsupported,
     PermissionDenied,
     Stale,
@@ -39,6 +40,7 @@ impl SensorStatus {
     fn detail(&self) -> String {
         match self {
             SensorStatus::Ok => "OK".to_owned(),
+            SensorStatus::Partial(message) => message.clone(),
             SensorStatus::Unsupported => "Unsupported".to_owned(),
             SensorStatus::PermissionDenied => "Permission denied".to_owned(),
             SensorStatus::Stale => "Stale reading".to_owned(),
@@ -96,16 +98,18 @@ impl SensorReading {
     }
 
     fn is_ok(&self) -> bool {
-        self.status == SensorStatus::Ok
+        matches!(self.status, SensorStatus::Ok | SensorStatus::Partial(_))
             && (self.temperature_c.is_some() || self.utilization_percent.is_some())
     }
 
     fn has_temperature(&self) -> bool {
-        self.status == SensorStatus::Ok && self.temperature_c.is_some()
+        matches!(self.status, SensorStatus::Ok | SensorStatus::Partial(_))
+            && self.temperature_c.is_some()
     }
 
     fn has_utilization(&self) -> bool {
-        self.status == SensorStatus::Ok && self.utilization_percent.is_some()
+        matches!(self.status, SensorStatus::Ok | SensorStatus::Partial(_))
+            && self.utilization_percent.is_some()
     }
 }
 
@@ -225,6 +229,7 @@ impl SensorManager {
         let latest = Arc::new(RwLock::new(SensorSnapshot::default()));
         let target_drive_letter = Arc::new(RwLock::new(initial_drive_letter));
         let target_gpu_uses_shared_cpu_temperature = Arc::new(AtomicBool::new(false));
+        let service_enabled = sensor_service_enabled();
         let helper_enabled = sensor_helper_enabled();
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -237,10 +242,17 @@ impl SensorManager {
         let _ = thread::Builder::new()
             .name("benchscope-sensors".to_owned())
             .spawn(move || {
+                let mut service_rx: Option<Receiver<SensorSnapshot>> = None;
+                let mut service_start_attempted = false;
+                let mut service_snapshot: Option<SensorSnapshot> = None;
                 let mut helper_rx: Option<Receiver<SensorSnapshot>> = None;
                 let mut helper_start_attempted = false;
                 let mut helper_snapshot: Option<SensorSnapshot> = None;
                 while !thread_shutdown.load(Ordering::Relaxed) {
+                    if service_rx.is_none() && !service_start_attempted && service_enabled {
+                        service_rx = start_sensor_service_reader();
+                        service_start_attempted = true;
+                    }
                     if helper_rx.is_none() && !helper_start_attempted && helper_enabled {
                         helper_rx = start_sensor_helper_reader();
                         helper_start_attempted = true;
@@ -256,16 +268,20 @@ impl SensorManager {
                             helper_snapshot = Some(snapshot);
                         }
                     }
+                    if let Some(service_rx) = &service_rx {
+                        while let Ok(snapshot) = service_rx.try_recv() {
+                            service_snapshot = Some(snapshot);
+                        }
+                    }
 
-                    let helper_preferred_snapshot = helper_snapshot.clone();
-                    let fallback_snapshot =
-                        helper_preferred_snapshot.as_ref().and_then(|snapshot| {
-                            helper_snapshot_has_gaps(snapshot)
-                                .then(|| collect_sensor_snapshot(drive_letter))
-                        });
-                    let snapshot =
-                        merge_sensor_snapshots(helper_preferred_snapshot, fallback_snapshot)
-                            .unwrap_or_else(|| collect_sensor_snapshot(drive_letter));
+                    let primary_snapshot =
+                        service_snapshot.clone().or_else(|| helper_snapshot.clone());
+                    let fallback_snapshot = primary_snapshot.as_ref().and_then(|snapshot| {
+                        helper_snapshot_has_gaps(snapshot)
+                            .then(|| collect_sensor_snapshot(drive_letter))
+                    });
+                    let snapshot = merge_sensor_snapshots(primary_snapshot, fallback_snapshot)
+                        .unwrap_or_else(|| collect_sensor_snapshot(drive_letter));
                     let snapshot = apply_integrated_gpu_temperature_fallback(
                         snapshot,
                         use_shared_gpu_temperature,

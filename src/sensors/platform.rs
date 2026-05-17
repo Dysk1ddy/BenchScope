@@ -1,20 +1,66 @@
 fn sensor_helper_enabled() -> bool {
-    env_flag_enabled(SENSOR_HELPER_ENABLE_ENV)
+    false
 }
 
-fn sensor_permission_prompt_needed() -> bool {
-    sensor_helper_path().is_some() && !sensor_helper_enabled()
+fn sensor_service_enabled() -> bool {
+    true
 }
 
-fn env_flag_enabled(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
+#[cfg(windows)]
+fn is_process_elevated() -> bool {
+    let script = r#"
+$principal = [Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    'true'
+} else {
+    'false'
+}
+"#;
+    run_powershell_sensor_script(script)
+        .map(|output| output.trim().eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn is_process_elevated() -> bool {
+    true
+}
+
+#[cfg(windows)]
+fn restart_app_as_admin() -> Result<()> {
+    let exe = std::env::current_exe().context("failed to locate BenchScope executable")?;
+    let file = powershell_single_quote(&exe.display().to_string());
+    let args = std::env::args()
+        .skip(1)
+        .map(|arg| powershell_single_quote(&arg))
+        .collect::<Vec<_>>();
+    let script = if args.is_empty() {
+        format!("Start-Process -FilePath {file} -Verb RunAs")
+    } else {
+        format!(
+            "Start-Process -FilePath {file} -ArgumentList @({}) -Verb RunAs",
+            args.join(", ")
+        )
+    };
+    let command_args = [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        script.as_str(),
+    ];
+    run_command_no_window("powershell", &command_args).map(|_| ())
+}
+
+#[cfg(not(windows))]
+fn restart_app_as_admin() -> Result<()> {
+    Err(anyhow!("administrator restart is only available on Windows"))
+}
+
+#[cfg(windows)]
+fn powershell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn start_sensor_helper_reader() -> Option<Receiver<SensorSnapshot>> {
@@ -35,6 +81,38 @@ fn start_sensor_helper_reader() -> Option<Receiver<SensorSnapshot>> {
 
     let _ = thread::Builder::new()
         .name("benchscope-sensor-helper".to_owned())
+        .spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                if let Some(snapshot) = parse_helper_snapshot(&line) {
+                    let _ = tx.send(snapshot);
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+
+    Some(rx)
+}
+
+fn start_sensor_service_reader() -> Option<Receiver<SensorSnapshot>> {
+    let service_path = sensor_service_path()?;
+    let mut command = Command::new(&service_path);
+    command
+        .arg("--stream")
+        .arg("--interval-ms")
+        .arg(SENSOR_POLL_MS.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW_RAW);
+
+    let mut child = command.spawn().ok()?;
+    let stdout = child.stdout.take()?;
+    let (tx, rx) = mpsc::channel();
+
+    let _ = thread::Builder::new()
+        .name("benchscope-sensor-service-bridge".to_owned())
         .spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines().map_while(Result::ok) {
@@ -145,6 +223,9 @@ fn apply_integrated_gpu_temperature_fallback(
     let Some(cpu) = snapshot.cpu.as_ref() else {
         return snapshot;
     };
+    if !cpu_temperature_is_package_like(cpu) {
+        return snapshot;
+    }
     let Some(cpu_temperature) = cpu.temperature_c else {
         return snapshot;
     };
@@ -172,6 +253,22 @@ fn apply_integrated_gpu_temperature_fallback(
     snapshot
 }
 
+fn cpu_temperature_is_package_like(reading: &SensorReading) -> bool {
+    if !reading.has_temperature() {
+        return false;
+    }
+
+    let provider = reading.provider.to_ascii_lowercase();
+    let label = reading.label.to_ascii_lowercase();
+    provider.contains("librehardwaremonitor")
+        || provider.contains("openhardwaremonitor")
+        || provider.contains("hwinfo")
+        || label.contains("package")
+        || label.contains("core")
+        || label.contains("tctl")
+        || label.contains("tdie")
+}
+
 fn sensor_helper_path() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(exe_path) = std::env::current_exe() {
@@ -187,6 +284,23 @@ fn sensor_helper_path() -> Option<PathBuf> {
         );
         candidates
             .push(cwd.join("sensor-helper/bin/Debug/net10.0-windows/BenchScope.SensorHelper.exe"));
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn sensor_service_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(dir) = exe_path.parent() {
+            candidates.push(dir.join("benchscope_sensor_service.exe"));
+            candidates.push(dir.join("benchscope_sensor_service"));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("target/debug/benchscope_sensor_service.exe"));
+        candidates.push(cwd.join("target/release/benchscope_sensor_service.exe"));
+        candidates.push(cwd.join("target/debug/benchscope_sensor_service"));
+        candidates.push(cwd.join("target/release/benchscope_sensor_service"));
     }
     candidates.into_iter().find(|path| path.is_file())
 }
@@ -236,7 +350,11 @@ fn parse_helper_reading(
 fn helper_sensor_status(status: &str, message: Option<String>) -> SensorStatus {
     match status.to_ascii_lowercase().as_str() {
         "ok" => SensorStatus::Ok,
+        "partial" => SensorStatus::Partial(
+            message.unwrap_or_else(|| "Partial sensor data".to_owned()),
+        ),
         "permissiondenied" | "permission_denied" | "permission" => SensorStatus::PermissionDenied,
+        "unavailable" => SensorStatus::Unsupported,
         "unsupported" => message
             .map(SensorStatus::Error)
             .unwrap_or(SensorStatus::Unsupported),
@@ -382,13 +500,69 @@ fn sensor_temperature(reading: Option<&SensorReading>) -> Option<f32> {
 }
 
 fn collect_sensor_snapshot(drive_letter: Option<char>) -> SensorSnapshot {
-    let mut cpu = query_cpu_temperature();
-    cpu.utilization_percent = query_cpu_utilization();
-    let mut gpu = query_gpu_temperature();
-    gpu.utilization_percent = query_gpu_utilization();
-    let mut drive = query_drive_temperature(drive_letter);
-    drive.utilization_percent = query_drive_utilization(drive_letter);
-    let memory = query_memory_sensor();
+    let (cpu, gpu, drive, memory) = thread::scope(|scope| {
+        let cpu = scope.spawn(|| {
+            let mut cpu = query_cpu_temperature();
+            attach_utilization(
+                &mut cpu,
+                query_cpu_utilization(),
+                "Windows performance counter",
+                "CPU temperature unavailable; utilization is live",
+            );
+            cpu
+        });
+        let gpu = scope.spawn(|| {
+            let mut gpu = query_gpu_temperature();
+            attach_utilization(
+                &mut gpu,
+                query_gpu_utilization(),
+                "Windows GPU Engine counter",
+                "GPU temperature unavailable; utilization is live",
+            );
+            gpu
+        });
+        let drive = scope.spawn(|| {
+            let mut drive = query_drive_temperature(drive_letter);
+            drive.utilization_percent = query_drive_utilization(drive_letter);
+            drive
+        });
+        let memory = scope.spawn(query_memory_sensor);
+
+        (
+            cpu.join().unwrap_or_else(|_| {
+                SensorReading::unavailable(
+                    SensorKind::Cpu,
+                    "CPU",
+                    "Windows sensors",
+                    SensorStatus::Error("CPU sensor worker panicked".to_owned()),
+                )
+            }),
+            gpu.join().unwrap_or_else(|_| {
+                SensorReading::unavailable(
+                    SensorKind::Gpu,
+                    "GPU",
+                    "Windows sensors",
+                    SensorStatus::Error("GPU sensor worker panicked".to_owned()),
+                )
+            }),
+            drive.join().unwrap_or_else(|_| {
+                SensorReading::unavailable(
+                    SensorKind::Drive,
+                    "SSD",
+                    "Windows Storage",
+                    SensorStatus::Error("Drive sensor worker panicked".to_owned()),
+                )
+            }),
+            memory.join().unwrap_or_else(|_| {
+                SensorReading::unavailable(
+                    SensorKind::Memory,
+                    "System RAM",
+                    "Windows memory status",
+                    SensorStatus::Error("Memory sensor worker panicked".to_owned()),
+                )
+            }),
+        )
+    });
 
     SensorSnapshot {
         cpu: Some(cpu),
@@ -399,33 +573,46 @@ fn collect_sensor_snapshot(drive_letter: Option<char>) -> SensorSnapshot {
     }
 }
 
+fn attach_utilization(
+    reading: &mut SensorReading,
+    utilization_percent: Option<f32>,
+    utilization_provider: &str,
+    partial_message: &str,
+) {
+    let Some(utilization_percent) = utilization_percent else {
+        return;
+    };
+    reading.utilization_percent = Some(utilization_percent);
+    if reading.provider != utilization_provider {
+        reading.provider = if reading.provider.is_empty() {
+            utilization_provider.to_owned()
+        } else {
+            format!("{} + {}", reading.provider, utilization_provider)
+        };
+    }
+    if !reading.has_temperature() {
+        reading.status = SensorStatus::Partial(partial_message.to_owned());
+    } else if !reading.is_ok() {
+        reading.status = SensorStatus::Ok;
+    }
+}
+
 fn query_cpu_temperature() -> SensorReading {
     #[cfg(windows)]
     {
-        let script = r#"
-$zone = Get-CimInstance -Namespace root/wmi -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($zone -and $zone.CurrentTemperature) {
-    [math]::Round(($zone.CurrentTemperature / 10) - 273.15, 1)
-}
-"#;
-        match run_powershell_sensor_script(script) {
-            Ok(output) => parse_first_temperature(&output)
-                .map(|temp| SensorReading::ok(SensorKind::Cpu, "CPU", temp, "ACPI thermal zone"))
-                .unwrap_or_else(|| {
-                    SensorReading::unavailable(
-                        SensorKind::Cpu,
-                        "CPU",
-                        "ACPI thermal zone",
-                        SensorStatus::Unsupported,
-                    )
-                }),
-            Err(err) => SensorReading::unavailable(
+        query_external_hardware_temperature(
+            SensorKind::Cpu,
+            "CPU",
+            external_cpu_temperature_script(),
+        )
+        .unwrap_or_else(|| {
+            SensorReading::unavailable(
                 SensorKind::Cpu,
                 "CPU",
-                "ACPI thermal zone",
-                sensor_error_status(err),
-            ),
-        }
+                "Windows safe sensors",
+                SensorStatus::Unsupported,
+            )
+        })
     }
 
     #[cfg(not(windows))]
@@ -453,12 +640,19 @@ fn query_gpu_temperature() -> SensorReading {
                         SensorStatus::Unsupported,
                     )
                 }),
-            Err(err) => SensorReading::unavailable(
+            Err(err) => query_external_hardware_temperature(
                 SensorKind::Gpu,
                 "GPU",
-                "NVML/nvidia-smi",
-                sensor_error_status(err),
-            ),
+                external_gpu_temperature_script(),
+            )
+            .unwrap_or_else(|| {
+                SensorReading::unavailable(
+                    SensorKind::Gpu,
+                    "GPU",
+                    "NVML/nvidia-smi",
+                    sensor_error_status(err),
+                )
+            }),
         }
     }
 
@@ -471,6 +665,86 @@ fn query_gpu_temperature() -> SensorReading {
             SensorStatus::Unsupported,
         )
     }
+}
+
+#[cfg(windows)]
+fn query_external_hardware_temperature(
+    kind: SensorKind,
+    fallback_label: &str,
+    script: &str,
+) -> Option<SensorReading> {
+    let output = run_powershell_sensor_script(script).ok()?;
+    let mut parts = output.trim().split('\t');
+    let temperature = parts.next()?.trim().parse::<f32>().ok()?;
+    if !(-40.0..=130.0).contains(&temperature) {
+        return None;
+    }
+    let label = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback_label);
+    let namespace = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("external hardware WMI");
+    Some(SensorReading::ok(
+        kind,
+        label,
+        temperature,
+        &format!("External hardware WMI ({namespace})"),
+    ))
+}
+
+#[cfg(windows)]
+fn external_cpu_temperature_script() -> &'static str {
+    r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$namespaces = @('root\LibreHardwareMonitor', 'root\OpenHardwareMonitor')
+foreach ($namespace in $namespaces) {
+    $sensors = Get-CimInstance -Namespace $namespace -ClassName Sensor -ErrorAction SilentlyContinue |
+        Where-Object { $_.SensorType -eq 'Temperature' -and $null -ne $_.Value }
+    if (-not $sensors) { continue }
+    $candidates = $sensors | Where-Object {
+        "$($_.Identifier) $($_.HardwareType) $($_.Parent) $($_.Name)" -match '(?i)(/cpu|intelcpu|amdcpu|cpu)'
+    }
+    $preferred = $candidates |
+        Sort-Object @{ Expression = { if ($_.Name -match '(?i)(package|tctl|tdie|ccd|core max)') { 0 } else { 1 } } },
+                    @{ Expression = { [double]$_.Value }; Descending = $true } |
+        Select-Object -First 1
+    if ($preferred) {
+        "$([math]::Round([double]$preferred.Value, 1))`t$($preferred.Name)`t$namespace"
+        break
+    }
+}
+exit 0
+"#
+}
+
+#[cfg(windows)]
+fn external_gpu_temperature_script() -> &'static str {
+    r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$namespaces = @('root\LibreHardwareMonitor', 'root\OpenHardwareMonitor')
+foreach ($namespace in $namespaces) {
+    $sensors = Get-CimInstance -Namespace $namespace -ClassName Sensor -ErrorAction SilentlyContinue |
+        Where-Object { $_.SensorType -eq 'Temperature' -and $null -ne $_.Value }
+    if (-not $sensors) { continue }
+    $candidates = $sensors | Where-Object {
+        "$($_.Identifier) $($_.HardwareType) $($_.Parent) $($_.Name)" -match '(?i)(/gpu|nvidia|radeon|amd|graphics|intel.*gpu|intel.*graphics)'
+    }
+    $preferred = $candidates |
+        Sort-Object @{ Expression = { if ($_.Name -match '(?i)(gpu core|core|hot spot|junction)') { 0 } else { 1 } } },
+                    @{ Expression = { [double]$_.Value }; Descending = $true } |
+        Select-Object -First 1
+    if ($preferred) {
+        "$([math]::Round([double]$preferred.Value, 1))`t$($preferred.Name)`t$namespace"
+        break
+    }
+}
+exit 0
+"#
 }
 
 fn query_drive_temperature(drive_letter: Option<char>) -> SensorReading {
@@ -490,16 +764,20 @@ fn query_drive_temperature(drive_letter: Option<char>) -> SensorReading {
             r#"
 $ErrorActionPreference = 'Stop'
 $letter = '{drive_letter}'
-$partition = Get-Partition -DriveLetter $letter | Select-Object -First 1
+$partition = Get-Partition -DriveLetter $letter -ErrorAction Stop | Select-Object -First 1
 if ($partition) {{
-    $disk = $partition | Get-Disk
+    $disk = $partition | Get-Disk -ErrorAction Stop
     if ($disk) {{
-        $physical = Get-PhysicalDisk |
-            Where-Object {{ $_.DeviceId -eq "$($disk.Number)" -or $_.SerialNumber -eq $disk.SerialNumber }} |
+        $physical = Get-PhysicalDisk -ErrorAction Stop |
+            Where-Object {{
+                $_.DeviceId -eq "$($disk.Number)" -or
+                ($disk.SerialNumber -and $_.SerialNumber -eq $disk.SerialNumber) -or
+                ($disk.FriendlyName -and $_.FriendlyName -eq $disk.FriendlyName)
+            }} |
             Select-Object -First 1
         if ($physical) {{
-            $counter = $physical | Get-StorageReliabilityCounter
-            if ($counter -and $counter.Temperature) {{
+            $counter = $physical | Get-StorageReliabilityCounter -ErrorAction Stop
+            if ($counter -and $null -ne $counter.Temperature) {{
                 [math]::Round($counter.Temperature, 1)
             }}
         }}
@@ -569,23 +847,23 @@ fn query_memory_sensor() -> SensorReading {
 fn query_cpu_utilization() -> Option<f32> {
     #[cfg(windows)]
     {
-        let script = r#"
+        let counter_script = r#"
+$sample = Get-Counter '\Processor(_Total)\% Processor Time' -ErrorAction Stop
+if ($sample -and $sample.CounterSamples.Count -gt 0) {
+    [math]::Round([math]::Min(100, [math]::Max(0, $sample.CounterSamples[0].CookedValue)), 1)
+}
+"#;
+        run_powershell_sensor_script(counter_script)
+            .ok()
+            .and_then(|output| parse_first_utilization(&output))
+            .or_else(|| {
+                let script = r#"
 $counter = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'" -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($counter) {
     [math]::Round([math]::Min(100, [math]::Max(0, $counter.PercentProcessorTime)), 1)
 }
 "#;
-        run_powershell_sensor_script(script)
-            .ok()
-            .and_then(|output| parse_first_utilization(&output))
-            .or_else(|| {
-                let counter_script = r#"
-$sample = Get-Counter '\Processor(_Total)\% Processor Time' -ErrorAction SilentlyContinue
-if ($sample -and $sample.CounterSamples.Count -gt 0) {
-    [math]::Round([math]::Min(100, [math]::Max(0, $sample.CounterSamples[0].CookedValue)), 1)
-}
-"#;
-                run_powershell_sensor_script(counter_script)
+                run_powershell_sensor_script(script)
                     .ok()
                     .and_then(|output| parse_first_utilization(&output))
             })
@@ -600,25 +878,25 @@ if ($sample -and $sample.CounterSamples.Count -gt 0) {
 fn query_gpu_utilization() -> Option<f32> {
     #[cfg(windows)]
     {
-        let script = r#"
+        let counter_script = r#"
+$sample = Get-Counter '\GPU Engine(*)\Utilization Percentage' -ErrorAction Stop
+if ($sample) {
+    $sum = ($sample.CounterSamples | Measure-Object -Property CookedValue -Sum).Sum
+    [math]::Round([math]::Min(100, [math]::Max(0, $sum)), 1)
+}
+"#;
+        run_powershell_sensor_script(counter_script)
+            .ok()
+            .and_then(|output| parse_first_utilization(&output))
+            .or_else(|| {
+                let script = r#"
 $engines = Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine -ErrorAction SilentlyContinue
 if ($engines) {
     $sum = ($engines | Measure-Object -Property UtilizationPercentage -Sum).Sum
     [math]::Round([math]::Min(100, [math]::Max(0, $sum)), 1)
 }
 "#;
-        run_powershell_sensor_script(script)
-            .ok()
-            .and_then(|output| parse_first_utilization(&output))
-            .or_else(|| {
-                let counter_script = r#"
-$sample = Get-Counter '\GPU Engine(*)\Utilization Percentage' -ErrorAction SilentlyContinue
-if ($sample) {
-    $sum = ($sample.CounterSamples | Measure-Object -Property CookedValue -Sum).Sum
-    [math]::Round([math]::Min(100, [math]::Max(0, $sum)), 1)
-}
-"#;
-                run_powershell_sensor_script(counter_script)
+                run_powershell_sensor_script(script)
                     .ok()
                     .and_then(|output| parse_first_utilization(&output))
             })
@@ -730,14 +1008,32 @@ fn run_nvidia_smi_temperature_query() -> Result<String> {
     match run_command_no_window("nvidia-smi", NVIDIA_SMI_ARGS) {
         Ok(output) => Ok(output),
         Err(path_err) => {
-            let fallback = r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe";
-            run_command_no_window(fallback, NVIDIA_SMI_ARGS).map_err(|fallback_err| {
-                anyhow!(
-                    "nvidia-smi unavailable on PATH ({path_err}) or at default install path ({fallback_err})"
-                )
-            })
+            for fallback in nvidia_smi_fallback_paths() {
+                if fallback.is_file() {
+                    if let Ok(output) =
+                        run_command_no_window(&fallback.display().to_string(), NVIDIA_SMI_ARGS)
+                    {
+                        return Ok(output);
+                    }
+                }
+            }
+            Err(anyhow!("nvidia-smi unavailable on PATH ({path_err}) or at known install paths"))
         }
     }
+}
+
+#[cfg(windows)]
+fn nvidia_smi_fallback_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(system_root) = std::env::var("SystemRoot") {
+        paths.push(PathBuf::from(system_root).join("System32/nvidia-smi.exe"));
+    }
+    for key in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(program_files) = std::env::var(key) {
+            paths.push(PathBuf::from(program_files).join("NVIDIA Corporation/NVSMI/nvidia-smi.exe"));
+        }
+    }
+    paths
 }
 
 #[cfg(windows)]

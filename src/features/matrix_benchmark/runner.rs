@@ -2393,12 +2393,12 @@ fn run_repeat(
     gpu_intensity: GpuIntensity,
     cancel: Arc<AtomicBool>,
     tx: Sender<WorkerEvent>,
-    duration: Duration,
+    duration: RepeatDuration,
 ) -> Result<RepeatProgress> {
     let (a, b) = generate_matrices_cancelable(size, Some(&cancel))?;
-    let deadline = Instant::now() + duration;
     let started = Instant::now();
-    let duration_s = duration.as_secs_f64();
+    let deadline = duration.duration().map(|duration| started + duration);
+    let duration_s = duration.seconds();
     let mut iterations = 0_u64;
     let mut total_ms = 0.0;
     let mut total_compute_ms = 0.0;
@@ -2414,12 +2414,15 @@ fn run_repeat(
                     canceled: bool,
                     force: bool| {
         let now = Instant::now();
-        let elapsed_s = (now - started).as_secs_f64().min(duration.as_secs_f64());
+        let elapsed_s = match duration_s {
+            Some(duration_s) => (now - started).as_secs_f64().min(duration_s),
+            None => (now - started).as_secs_f64(),
+        };
         let progress = RepeatProgress {
             mode,
             size,
             duration_s,
-            elapsed_s: elapsed_s.min(duration_s),
+            elapsed_s,
             iterations,
             latest_ms,
             average_total_ms: if iterations == 0 {
@@ -2443,7 +2446,7 @@ fn run_repeat(
 
     match mode {
         RepeatMode::Cpu => {
-            while Instant::now() < deadline && !cancel.load(Ordering::Relaxed) {
+            while repeat_should_continue(&deadline, &cancel) {
                 let (_, elapsed_ms) =
                     match cpu_multiply_cancelable(size, &a, &b, Some(&cancel), None) {
                         Ok(result) => result,
@@ -2466,7 +2469,7 @@ fn run_repeat(
         }
         RepeatMode::Gpu => {
             let runner = GpuRunner::new(adapter.index)?;
-            while Instant::now() < deadline && !cancel.load(Ordering::Relaxed) {
+            while repeat_should_continue(&deadline, &cancel) {
                 check_canceled(Some(&cancel))?;
                 let timing = match runner.multiply_cancelable(
                     size,
@@ -2510,4 +2513,14 @@ fn run_repeat(
         cancel.load(Ordering::Relaxed),
         true,
     ))
+}
+
+fn repeat_should_continue(deadline: &Option<Instant>, cancel: &AtomicBool) -> bool {
+    if cancel.load(Ordering::Relaxed) {
+        return false;
+    }
+    match deadline {
+        Some(deadline) => Instant::now() < *deadline,
+        None => true,
+    }
 }

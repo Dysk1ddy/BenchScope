@@ -1,0 +1,56 @@
+;
+; BenchScopeSensorDriver.inf
+;
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%ManufacturerName%
+CatalogFile=BenchScopeSensorDriver.cat
+DriverVer=05/17/2026,0.2.0.0
+PnpLockdown=1
+
+[DestinationDirs]
+DefaultDestDir=13
+
+[SourceDisksNames]
+1=%DiskName%,,,""
+
+[SourceDisksFiles]
+BenchScopeSensorDriver.sys=1
+
+[Manufacturer]
+%ManufacturerName%=Standard,NTamd64.10.0...16299
+
+[Standard.NTamd64.10.0...16299]
+%BenchScopeSensor.DeviceDesc%=BenchScopeSensor_Install,Root\BenchScopeSensor
+
+[BenchScopeSensor_Install.NT]
+CopyFiles=Drivers_Dir
+
+[Drivers_Dir]
+BenchScopeSensorDriver.sys
+
+[BenchScopeSensor_Install.NT.Services]
+AddService=BenchScopeSensorDriver,%SPSVCINST_ASSOCSERVICE%,BenchScopeSensor_Service_Inst
+
+[BenchScopeSensor_Install.NT.Wdf]
+KmdfService=BenchScopeSensorDriver,BenchScopeSensor_WdfSect
+
+[BenchScopeSensor_WdfSect]
+KmdfLibraryVersion=1.33
+
+[BenchScopeSensor_Service_Inst]
+DisplayName=%BenchScopeSensor.SVCDESC%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\BenchScopeSensorDriver.sys
+
+[Strings]
+SPSVCINST_ASSOCSERVICE=0x00000002
+ManufacturerName="BenchScope"
+DiskName="BenchScope Sensor Driver Installation Disk"
+BenchScopeSensor.DeviceDesc="BenchScope Sensor Driver"
+BenchScopeSensor.SVCDESC="BenchScope Sensor Driver"

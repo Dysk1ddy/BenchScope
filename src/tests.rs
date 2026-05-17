@@ -281,6 +281,46 @@ mod tests {
     }
 
     #[test]
+    fn infinite_repeat_runs_until_canceled() {
+        let adapter = AdapterInfo {
+            index: 0,
+            name: "Test GPU".to_owned(),
+            backend: wgpu::Backend::Dx12,
+            device_type: wgpu::DeviceType::DiscreteGpu,
+            vendor: 0,
+            device: 0,
+            driver: String::new(),
+            timestamp_query: true,
+            dedicated_vram_bytes: None,
+            dedicated_system_memory_bytes: None,
+            shared_system_memory_bytes: None,
+        };
+        let (tx, _rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_worker = Arc::clone(&cancel);
+        let cancel_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            cancel.store(true, Ordering::Relaxed);
+        });
+
+        let progress = run_repeat(
+            1,
+            adapter,
+            RepeatMode::Cpu,
+            GpuIntensity::Safe,
+            cancel_worker,
+            tx,
+            RepeatDuration::Infinite,
+        )
+        .unwrap();
+        cancel_thread.join().unwrap();
+
+        assert!(progress.canceled);
+        assert_eq!(progress.duration_s, None);
+        assert!(progress.elapsed_s > 0.0);
+    }
+
+    #[test]
     fn blocked_packers_keep_expected_layout() {
         let source = vec![
             1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
@@ -445,6 +485,39 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn storage_health_parser_reads_nvme_extended_counters() {
+        let drive =
+            DriveInfo::with_device_name(PathBuf::from("C:\\"), Some("Test NVMe".to_owned()));
+        let output = concat!(
+            "HEALTH\tC\tTest NVMe\tSN123\t1.0\tNVMe\tSSD\t1000000\t500000\tNTFS\tHealthy\tOK\t\t42\t12\t100\t10\t0\t0\t0\t0\t0\t100\t200\t\n",
+            "NVME\t4\t10\t2\t3\t40\t12345\t67890\t5\t2\t1\t0\t43\t44\t\t\t\t\t\t\n"
+        );
+
+        let snapshot = parse_windows_storage_health_output(&drive, output);
+
+        assert_eq!(snapshot.available_spare_percent, Some(4));
+        assert_eq!(snapshot.available_spare_threshold_percent, Some(10));
+        assert_eq!(snapshot.critical_warning_flags, Some(2));
+        assert_eq!(snapshot.unsafe_shutdowns, Some(3));
+        assert_eq!(snapshot.controller_busy_time_minutes, Some(40));
+        assert_eq!(snapshot.nvme_temperature_sensors_c[0], Some(43.0));
+        assert_eq!(snapshot.status, StorageHealthStatus::Critical);
+        assert!(
+            snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning.title.contains("available spare"))
+        );
+        assert!(
+            snapshot
+                .attributes
+                .iter()
+                .any(|attribute| attribute.name == "NVMe critical warning flags")
+        );
+    }
+
     #[test]
     fn storage_health_report_mentions_benchmark_results() {
         let drive = DriveInfo::with_device_name(PathBuf::from("C:\\"), Some("Test SSD".to_owned()));
@@ -533,10 +606,11 @@ mod tests {
 
     #[test]
     fn battery_runtime_accuracy_uses_discharge_samples() {
-        let now = Instant::now();
+        let start = Instant::now();
+        let end = start + Duration::from_secs(600);
         let mut samples = VecDeque::new();
         samples.push_back(BatteryLiveSample {
-            captured_at: now - Duration::from_secs(600),
+            captured_at: start,
             ac_connected: Some(false),
             status: "Discharging".to_owned(),
             percent: Some(80.0),
@@ -546,7 +620,7 @@ mod tests {
             windows_runtime_minutes: Some(70.0),
         });
         samples.push_back(BatteryLiveSample {
-            captured_at: now,
+            captured_at: end,
             ac_connected: Some(false),
             status: "Discharging".to_owned(),
             percent: Some(70.0),
@@ -624,6 +698,52 @@ mod tests {
     }
 
     #[test]
+    fn partial_sensor_status_keeps_utilization_live() {
+        let mut reading = SensorReading::unavailable(
+            SensorKind::Cpu,
+            "CPU",
+            "Windows safe sensors",
+            SensorStatus::Unsupported,
+        );
+
+        attach_utilization(
+            &mut reading,
+            Some(42.0),
+            "Windows performance counter",
+            "CPU temperature unavailable; utilization is live",
+        );
+
+        assert_eq!(reading.temperature_c, None);
+        assert_eq!(reading.utilization_percent, Some(42.0));
+        assert!(reading.has_utilization());
+        assert!(!reading.has_temperature());
+        assert_eq!(sensor_temperature(Some(&reading)), None);
+        assert!(matches!(reading.status, SensorStatus::Partial(_)));
+    }
+
+    #[test]
+    fn partial_cpu_temperature_label_explains_missing_safe_provider() {
+        let mut reading = SensorReading::unavailable(
+            SensorKind::Cpu,
+            "CPU",
+            "Windows safe sensors",
+            SensorStatus::Unsupported,
+        );
+        attach_utilization(
+            &mut reading,
+            Some(12.0),
+            "Windows performance counter",
+            "CPU temperature unavailable; utilization is live",
+        );
+
+        assert_eq!(format_sensor_temperature(&reading), "No safe temp");
+        assert!(
+            format_sensor_temperature_detail(&reading)
+                .contains("No safe CPU/GPU temperature provider")
+        );
+    }
+
+    #[test]
     fn helper_snapshot_parser_reads_temperatures() {
         let line = r#"{"timestampUtc":"2026-05-16T03:36:28Z","isElevated":false,"cpu":{"label":"CPU Package","temperatureC":63.5,"provider":"LibreHardwareMonitor","status":"ok","utilizationPercent":12.5},"gpu":{"label":"GPU Core","temperatureC":57.0,"provider":"LibreHardwareMonitor","status":"ok","utilizationPercent":84.0},"drive":{"label":"NVMe SSD","temperatureC":41.0,"provider":"LibreHardwareMonitor","status":"ok","utilizationPercent":6.0},"diagnostics":[]}"#;
 
@@ -655,6 +775,33 @@ mod tests {
             cpu.status,
             SensorStatus::Error("No CPU temperature sensor found".to_owned())
         );
+    }
+
+    #[test]
+    fn sensor_service_snapshot_parser_reads_driver_bridge_status() {
+        let line = r#"{"timestampUtc":"unix-ms:1770000000000","isElevated":true,"source":"BenchScopeSensorService","driver":{"protocol":1,"version":"0.1.0","cpuTemp":false,"gpuTemp":false,"driveTemp":false,"utilization":false},"cpu":{"label":"CPU","temperatureC":null,"utilizationPercent":null,"provider":"BenchScope sensor driver prototype","status":"unsupported"},"gpu":{"label":"GPU","temperatureC":null,"utilizationPercent":null,"provider":"BenchScope sensor driver prototype","status":"unsupported"},"drive":{"label":"SSD","temperatureC":null,"utilizationPercent":null,"provider":"BenchScope sensor driver prototype","status":"unsupported"},"memory":{"label":"RAM","temperatureC":null,"utilizationPercent":null,"provider":"BenchScope sensor driver prototype","status":"unsupported"}}"#;
+
+        let snapshot = parse_helper_snapshot(line).unwrap();
+
+        assert_eq!(snapshot.helper_elevated, Some(true));
+        let cpu = snapshot.cpu.unwrap();
+        assert_eq!(cpu.label, "CPU");
+        assert_eq!(cpu.provider, "BenchScope sensor driver prototype");
+        assert_eq!(cpu.temperature_c, None);
+        assert!(matches!(cpu.status, SensorStatus::Unsupported));
+    }
+
+    #[test]
+    fn sensor_service_snapshot_parser_reads_partial_utilization() {
+        let line = r#"{"timestampUtc":"unix-ms:1770000000000","isElevated":true,"source":"BenchScopeSensorService","cpu":{"label":"CPU","temperatureC":null,"utilizationPercent":16.4,"provider":"Windows performance counter","status":"partial","message":"CPU temperature unavailable; utilization is live"}}"#;
+
+        let snapshot = parse_helper_snapshot(line).unwrap();
+        let cpu = snapshot.cpu.unwrap();
+
+        assert_eq!(cpu.utilization_percent, Some(16.4));
+        assert!(matches!(cpu.status, SensorStatus::Partial(_)));
+        assert!(cpu.has_utilization());
+        assert!(!cpu.has_temperature());
     }
 
     #[test]
@@ -720,6 +867,37 @@ mod tests {
         assert_eq!(gpu.temperature_c, Some(54.0));
         assert_eq!(gpu.utilization_percent, Some(33.0));
         assert_eq!(gpu.label, "iGPU shared CPU package");
+    }
+
+    #[test]
+    fn integrated_gpu_fallback_ignores_acpi_thermal_zone_temperature() {
+        let snapshot = SensorSnapshot {
+            cpu: Some(SensorReading::ok(
+                SensorKind::Cpu,
+                "CPU",
+                28.0,
+                "ACPI thermal zone",
+            )),
+            gpu: Some(SensorReading {
+                kind: SensorKind::Gpu,
+                label: "Intel Xe Graphics".to_owned(),
+                temperature_c: None,
+                utilization_percent: Some(33.0),
+                provider: "Windows performance counters".to_owned(),
+                updated_at: Instant::now(),
+                status: SensorStatus::Ok,
+            }),
+            drive: None,
+            memory: None,
+            helper_elevated: None,
+        };
+
+        let snapshot = apply_integrated_gpu_temperature_fallback(snapshot, true);
+        let gpu = snapshot.gpu.unwrap();
+
+        assert_eq!(gpu.temperature_c, None);
+        assert_eq!(gpu.utilization_percent, Some(33.0));
+        assert_eq!(gpu.label, "Intel Xe Graphics");
     }
 
     #[test]

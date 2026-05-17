@@ -51,6 +51,17 @@ fn main() -> eframe::Result<()> {
         }
     }
 
+    #[cfg(windows)]
+    if !is_process_elevated() {
+        if let Err(err) = restart_app_as_admin() {
+            eprintln!(
+                "BenchScope must start as administrator for Windows hardware sensors: {err:#}"
+            );
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1220.0, 760.0]),
         ..Default::default()
@@ -58,7 +69,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "BenchScope",
         options,
-        Box::new(|cc| Ok(Box::new(BenchScopeApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(BenchScopeRoot::new(cc)))),
     )
 }
 

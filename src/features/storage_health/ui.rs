@@ -235,6 +235,45 @@ impl BenchScopeApp {
                                             &format_optional_u64(snapshot.power_on_hours),
                                         );
                                         ui.end_row();
+                                        storage_metric(
+                                            ui,
+                                            "NVMe spare",
+                                            &format_percent_u64(snapshot.available_spare_percent),
+                                        );
+                                        storage_metric(
+                                            ui,
+                                            "NVMe warning flags",
+                                            &format_hex_u64(snapshot.critical_warning_flags),
+                                        );
+                                        ui.end_row();
+                                        storage_metric(
+                                            ui,
+                                            "Unsafe shutdowns",
+                                            &format_optional_u64(snapshot.unsafe_shutdowns),
+                                        );
+                                        storage_metric(
+                                            ui,
+                                            "Controller busy",
+                                            &format_optional_u64_minutes(
+                                                snapshot.controller_busy_time_minutes,
+                                            ),
+                                        );
+                                        ui.end_row();
+                                        storage_metric(
+                                            ui,
+                                            "Thermal warning time",
+                                            &format_optional_u64_minutes(
+                                                snapshot.warning_temperature_time_minutes,
+                                            ),
+                                        );
+                                        storage_metric(
+                                            ui,
+                                            "Thermal critical time",
+                                            &format_optional_u64_minutes(
+                                                snapshot.critical_temperature_time_minutes,
+                                            ),
+                                        );
+                                        ui.end_row();
                                     });
 
                                 ui.add_space(10.0);

@@ -94,7 +94,7 @@ struct SingleProgress {
 struct RepeatProgress {
     mode: RepeatMode,
     size: usize,
-    duration_s: f64,
+    duration_s: Option<f64>,
     elapsed_s: f64,
     iterations: u64,
     latest_ms: f64,
@@ -173,18 +173,32 @@ impl fmt::Display for GpuIntensity {
 enum RepeatDuration {
     OneMinute,
     FiveMinutes,
+    Infinite,
 }
 
 impl RepeatDuration {
-    fn seconds(self) -> f64 {
+    fn seconds(self) -> Option<f64> {
         match self {
-            RepeatDuration::OneMinute => 60.0,
-            RepeatDuration::FiveMinutes => 300.0,
+            RepeatDuration::OneMinute => Some(60.0),
+            RepeatDuration::FiveMinutes => Some(300.0),
+            RepeatDuration::Infinite => None,
         }
     }
 
-    fn duration(self) -> Duration {
-        Duration::from_secs_f64(self.seconds())
+    fn duration(self) -> Option<Duration> {
+        self.seconds().map(Duration::from_secs_f64)
+    }
+
+    fn is_infinite(self) -> bool {
+        matches!(self, RepeatDuration::Infinite)
+    }
+
+    fn run_label(self) -> &'static str {
+        match self {
+            RepeatDuration::OneMinute => "for 1 minute",
+            RepeatDuration::FiveMinutes => "for 5 minutes",
+            RepeatDuration::Infinite => "until canceled",
+        }
     }
 }
 
@@ -193,6 +207,7 @@ impl fmt::Display for RepeatDuration {
         match self {
             RepeatDuration::OneMinute => f.write_str("1 minute"),
             RepeatDuration::FiveMinutes => f.write_str("5 minutes"),
+            RepeatDuration::Infinite => f.write_str("infinite"),
         }
     }
 }

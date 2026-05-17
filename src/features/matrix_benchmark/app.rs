@@ -180,9 +180,14 @@ impl BenchScopeApp {
         self.running = true;
         self.repeat_running = true;
         self.progress = 0.0;
-        self.status = format!("Running {mode} stress test for {duration}...");
+        self.eta_text = duration
+            .seconds()
+            .map(|seconds| format_eta(Some(seconds)))
+            .unwrap_or_else(|| "Runs until canceled".to_owned());
+        self.status = format!("Running {mode} stress test {}...", duration.run_label());
         self.log(format!(
-            "Starting {mode} {duration} stress test at {size}x{size} on {} with {} GPU intensity",
+            "Starting {mode} stress test {} at {size}x{size} on {} with {} GPU intensity",
+            duration.run_label(),
             adapter.label(),
             gpu_intensity
         ));
@@ -195,7 +200,7 @@ impl BenchScopeApp {
                     gpu_intensity,
                     worker_cancel,
                     tx.clone(),
-                    duration.duration(),
+                    duration,
                 )
             }))
             .map_err(|panic| format!("Repeat test panicked: {}", panic_message(&*panic)))
@@ -343,10 +348,14 @@ impl BenchScopeApp {
                     }
                 }
                 WorkerEvent::RepeatProgress(progress) => {
-                    self.progress =
-                        (progress.elapsed_s / progress.duration_s).clamp(0.0, 1.0) as f32;
-                    self.eta_text =
-                        format_eta(Some((progress.duration_s - progress.elapsed_s).max(0.0)));
+                    if let Some(duration_s) = progress.duration_s {
+                        self.progress = (progress.elapsed_s / duration_s).clamp(0.0, 1.0) as f32;
+                        self.eta_text =
+                            format_eta(Some((duration_s - progress.elapsed_s).max(0.0)));
+                    } else {
+                        self.progress = 0.0;
+                        self.eta_text = "Runs until canceled".to_owned();
+                    }
                     self.status = format!(
                         "{} stress: {:.1}s, {} iteration(s), latest {} ms, avg {} ms, compute avg {} ms",
                         progress.mode,
@@ -365,7 +374,7 @@ impl BenchScopeApp {
                     match result {
                         Ok(progress) => {
                             let _ = self.finish_and_log_temperature_run();
-                            if !progress.canceled {
+                            if !progress.canceled && progress.duration_s.is_some() {
                                 self.progress = 1.0;
                             }
                             let state = if progress.canceled {
