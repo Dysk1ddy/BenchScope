@@ -233,6 +233,31 @@ mod tests {
         assert!(
             gpu_submission_pause(GpuIntensity::Safe) > gpu_submission_pause(GpuIntensity::High)
         );
+        assert!(gpu_dispatch_batch_limit(GpuIntensity::High) > gpu_dispatch_batch_limit(GpuIntensity::Safe));
+        assert!(
+            gpu_repeat_batch_limit(128, GpuIntensity::High)
+                > gpu_dispatch_batch_limit(GpuIntensity::High)
+        );
+        assert_eq!(
+            gpu_repeat_batch_limit(2048, GpuIntensity::Safe),
+            gpu_dispatch_batch_limit(GpuIntensity::Safe)
+        );
+    }
+
+    #[test]
+    fn gpu_repeat_counter_accumulates_partial_batches() {
+        let mut counters = GpuRepeatCounters::default();
+
+        counters.record_batch(0, 10.0);
+        assert_eq!(counters.iterations, 0);
+        assert_eq!(counters.latest_ms, 10.0);
+
+        counters.record_batch(2, 30.0);
+        assert_eq!(counters.iterations, 2);
+        assert_eq!(counters.compute_count, 2);
+        assert_eq!(counters.total_ms, 40.0);
+        assert_eq!(counters.total_compute_ms, 40.0);
+        assert_eq!(counters.latest_ms, 20.0);
     }
 
     #[test]

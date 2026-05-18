@@ -42,6 +42,46 @@ struct BlockGpuTiming {
     output: Vec<f32>,
 }
 
+struct DirectDispatch {
+    bind_group: wgpu::BindGroup,
+    rows: usize,
+    _params_buffer: wgpu::Buffer,
+}
+
+struct PanelDispatch {
+    bind_group: wgpu::BindGroup,
+    rows: usize,
+    cols: usize,
+    _params_buffer: wgpu::Buffer,
+}
+
+#[derive(Default)]
+struct GpuRepeatCounters {
+    iterations: u64,
+    total_ms: f64,
+    total_compute_ms: f64,
+    compute_count: u64,
+    latest_ms: f64,
+    current_iteration_ms: f64,
+}
+
+impl GpuRepeatCounters {
+    fn record_batch(&mut self, completed_iterations: u64, batch_ms: f64) {
+        self.current_iteration_ms += batch_ms;
+        if completed_iterations == 0 {
+            self.latest_ms = self.current_iteration_ms;
+            return;
+        }
+
+        self.iterations += completed_iterations;
+        self.latest_ms = self.current_iteration_ms / completed_iterations as f64;
+        self.total_ms += self.current_iteration_ms;
+        self.total_compute_ms += self.current_iteration_ms;
+        self.compute_count += completed_iterations;
+        self.current_iteration_ms = 0.0;
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ColumnPanel {
     col_offset: usize,
@@ -53,6 +93,7 @@ struct GpuWorkGovernor {
     row_extent: usize,
     min_row_extent: usize,
     hard_backoff_ms: f64,
+    hard_batch_backoff_ms: f64,
     backoff_count: usize,
 }
 
@@ -62,6 +103,7 @@ impl GpuWorkGovernor {
             row_extent: row_extent.max(1),
             min_row_extent: min_row_extent.max(1),
             hard_backoff_ms: gpu_hard_backoff_ms(gpu_intensity),
+            hard_batch_backoff_ms: gpu_hard_batch_backoff_ms(gpu_intensity),
             backoff_count: 0,
         }
     }
@@ -72,6 +114,13 @@ impl GpuWorkGovernor {
 
     fn record_dispatch(&mut self, observed_ms: f64) {
         if observed_ms > self.hard_backoff_ms && self.row_extent > self.min_row_extent {
+            self.row_extent = align_block_extent((self.row_extent / 2).max(self.min_row_extent));
+            self.backoff_count += 1;
+        }
+    }
+
+    fn record_batch(&mut self, observed_ms: f64) {
+        if observed_ms > self.hard_batch_backoff_ms && self.row_extent > self.min_row_extent {
             self.row_extent = align_block_extent((self.row_extent / 2).max(self.min_row_extent));
             self.backoff_count += 1;
         }
@@ -348,6 +397,152 @@ impl GpuRunner {
         self.multiply_cancelable(n, a, b, use_timestamps, GpuIntensity::Safe, None, None)
     }
 
+    fn create_direct_dispatch(
+        &self,
+        a_buffer: &wgpu::Buffer,
+        b_buffer: &wgpu::Buffer,
+        c_buffer: &wgpu::Buffer,
+        params: Params,
+        rows: usize,
+    ) -> DirectDispatch {
+        let params_buffer =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Matrix dispatch params"),
+                    contents: bytemuck::bytes_of(&params),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Matrix multiplication dispatch bind group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: a_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: b_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: c_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        DirectDispatch {
+            bind_group,
+            rows,
+            _params_buffer: params_buffer,
+        }
+    }
+
+    fn create_panel_dispatch(
+        &self,
+        a_buffer: &wgpu::Buffer,
+        b_buffer: &wgpu::Buffer,
+        c_buffer: &wgpu::Buffer,
+        n: u32,
+        size: usize,
+        panel: &ColumnPanel,
+        row_offset: usize,
+        rows: usize,
+    ) -> Result<PanelDispatch> {
+        let a_elements = rows
+            .checked_mul(size)
+            .ok_or_else(|| anyhow!("A panel row size overflow"))?;
+        let c_elements = rows
+            .checked_mul(panel.cols)
+            .ok_or_else(|| anyhow!("C panel row size overflow"))?;
+        let a_offset = buffer_len_bytes(
+            row_offset
+                .checked_mul(size)
+                .ok_or_else(|| anyhow!("A panel offset overflow"))?,
+        )?;
+        let b_offset = buffer_len_bytes(panel.element_offset)?;
+        let c_offset = buffer_len_bytes(
+            panel
+                .element_offset
+                .checked_add(
+                    row_offset
+                        .checked_mul(panel.cols)
+                        .ok_or_else(|| anyhow!("C panel row offset overflow"))?,
+                )
+                .ok_or_else(|| anyhow!("C panel offset overflow"))?,
+        )?;
+        let a_bytes = buffer_len_bytes(a_elements)?;
+        let b_bytes = buffer_len_bytes(
+            size.checked_mul(panel.cols)
+                .ok_or_else(|| anyhow!("B panel size overflow"))?,
+        )?;
+        let c_bytes = buffer_len_bytes(c_elements)?;
+        let a_binding_size =
+            wgpu::BufferSize::new(a_bytes).ok_or_else(|| anyhow!("empty A panel"))?;
+        let b_binding_size =
+            wgpu::BufferSize::new(b_bytes).ok_or_else(|| anyhow!("empty B panel"))?;
+        let c_binding_size =
+            wgpu::BufferSize::new(c_bytes).ok_or_else(|| anyhow!("empty C panel"))?;
+        let params = BlockParams {
+            n,
+            rows: u32::try_from(rows).context("panel row block exceeds shader limits")?,
+            cols: u32::try_from(panel.cols).context("panel column block exceeds shader limits")?,
+            _pad: 0,
+        };
+        let params_buffer =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Persistent panel dispatch params"),
+                    contents: bytemuck::bytes_of(&params),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Persistent panel matrix dispatch bind group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: a_buffer,
+                        offset: a_offset,
+                        size: Some(a_binding_size),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: b_buffer,
+                        offset: b_offset,
+                        size: Some(b_binding_size),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: c_buffer,
+                        offset: c_offset,
+                        size: Some(c_binding_size),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        Ok(PanelDispatch {
+            bind_group,
+            rows,
+            cols: panel.cols,
+            _params_buffer: params_buffer,
+        })
+    }
+
     fn multiply_cancelable(
         &self,
         n: usize,
@@ -429,43 +624,6 @@ impl GpuRunner {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let params = Params {
-            n: n_u32,
-            row_offset: 0,
-            row_count: 0,
-            _pad2: 0,
-        };
-        let params_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Matrix params"),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Matrix multiplication bind group"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: a_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: b_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: c_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: params_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
         let chunk_rows = gpu_dispatch_chunk_rows(n, gpu_intensity);
         let min_chunk_rows = gpu_min_dispatch_rows(gpu_intensity).min(chunk_rows).max(1);
         let max_chunk_count = n.div_ceil(min_chunk_rows);
@@ -502,50 +660,65 @@ impl GpuRunner {
         let mut row_offset = 0usize;
         while row_offset < n {
             self.check_gpu_canceled(cancel)?;
-            let rows_this_chunk = governor.row_extent(n - row_offset);
-            let params = Params {
-                n: n_u32,
-                row_offset: row_offset as u32,
-                row_count: rows_this_chunk as u32,
-                _pad2: 0,
-            };
-            self.queue
-                .write_buffer(&params_buffer, 0, bytemuck::bytes_of(&params));
+            let mut dispatches = Vec::new();
+            let batch_limit = gpu_dispatch_batch_limit(gpu_intensity);
+            while row_offset < n && dispatches.len() < batch_limit {
+                let rows_this_chunk = governor.row_extent(n - row_offset);
+                let params = Params {
+                    n: n_u32,
+                    row_offset: row_offset as u32,
+                    row_count: rows_this_chunk as u32,
+                    _pad2: 0,
+                };
+                dispatches.push(self.create_direct_dispatch(
+                    &a_buffer,
+                    &b_buffer,
+                    &c_buffer,
+                    params,
+                    rows_this_chunk,
+                ));
+                row_offset += rows_this_chunk;
+            }
 
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Matrix multiplication chunk encoder"),
+                    label: Some("Matrix multiplication batch encoder"),
                 });
 
-            {
+            for (batch_index, dispatch) in dispatches.iter().enumerate() {
+                let timestamp_index = chunk_index + batch_index;
                 let timestamp_writes =
                     query_set
                         .as_ref()
                         .map(|query_set| wgpu::ComputePassTimestampWrites {
                             query_set,
-                            beginning_of_pass_write_index: Some((chunk_index * 2) as u32),
-                            end_of_pass_write_index: Some((chunk_index * 2 + 1) as u32),
+                            beginning_of_pass_write_index: Some((timestamp_index * 2) as u32),
+                            end_of_pass_write_index: Some((timestamp_index * 2 + 1) as u32),
                         });
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Matrix multiplication chunk pass"),
+                    label: Some("Matrix multiplication batch pass"),
                     timestamp_writes,
                 });
                 pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &bind_group, &[]);
+                pass.set_bind_group(0, &dispatch.bind_group, &[]);
                 let groups_x = n_u32.div_ceil(TILE_SIZE);
-                let groups_y = (rows_this_chunk as u32).div_ceil(TILE_SIZE);
+                let groups_y = (dispatch.rows as u32).div_ceil(TILE_SIZE);
                 pass.dispatch_workgroups(groups_x, groups_y, 1);
             }
 
+            let dispatch_count = dispatches.len().max(1);
             let dispatch_start = Instant::now();
             let submission = self.queue.submit([encoder.finish()]);
-            self.wait_for_submission(submission, cancel, "waiting for GPU matrix chunk to finish")?;
-            let observed_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
-            observed_dispatch_ms.push(observed_ms);
+            self.wait_for_submission(submission, cancel, "waiting for GPU matrix batch to finish")?;
+            let observed_batch_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
+            let observed_ms = observed_batch_ms / dispatch_count as f64;
+            for _ in 0..dispatch_count {
+                observed_dispatch_ms.push(observed_ms);
+            }
             governor.record_dispatch(observed_ms);
-            row_offset += rows_this_chunk;
-            chunk_index += 1;
+            governor.record_batch(observed_batch_ms);
+            chunk_index += dispatch_count;
             if let Some(progress) = progress.as_deref_mut() {
                 progress.set_gpu_progress(row_offset as f32 / n as f32 * 0.97, false);
             }
@@ -670,19 +843,6 @@ impl GpuRunner {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let params_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Persistent panel matrix params"),
-                contents: bytemuck::bytes_of(&BlockParams {
-                    n: n_u32,
-                    rows: 0,
-                    cols: 0,
-                    _pad: 0,
-                }),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-
         let max_dispatch_count = panels
             .iter()
             .map(|_| n.div_ceil(min_row_block))
@@ -718,139 +878,90 @@ impl GpuRunner {
         let mut observed_dispatch_ms = Vec::new();
         let mut completed_cells = 0usize;
         let mut query_pair_index = 0usize;
-        for panel in &panels {
+        let mut panel_index = 0usize;
+        let mut row_offset = 0usize;
+        while panel_index < panels.len() {
             self.check_gpu_canceled(cancel)?;
-            let b_offset = buffer_len_bytes(panel.element_offset)?;
-            let b_bytes = buffer_len_bytes(
-                n.checked_mul(panel.cols)
-                    .ok_or_else(|| anyhow!("B panel size overflow"))?,
-            )?;
-            let b_binding_size =
-                wgpu::BufferSize::new(b_bytes).ok_or_else(|| anyhow!("empty B panel"))?;
-
-            let mut row_offset = 0usize;
-            while row_offset < n {
-                self.check_gpu_canceled(cancel)?;
+            let mut dispatches = Vec::new();
+            let batch_limit = gpu_dispatch_batch_limit(gpu_intensity);
+            while panel_index < panels.len() && dispatches.len() < batch_limit {
+                let panel = &panels[panel_index];
                 let rows = governor.row_extent(n - row_offset);
-                let a_elements = rows
-                    .checked_mul(n)
-                    .ok_or_else(|| anyhow!("A panel row size overflow"))?;
-                let c_elements = rows
-                    .checked_mul(panel.cols)
-                    .ok_or_else(|| anyhow!("C panel row size overflow"))?;
-                let a_offset = buffer_len_bytes(
-                    row_offset
-                        .checked_mul(n)
-                        .ok_or_else(|| anyhow!("A panel offset overflow"))?,
-                )?;
-                let c_offset = buffer_len_bytes(
-                    panel
-                        .element_offset
-                        .checked_add(
-                            row_offset
-                                .checked_mul(panel.cols)
-                                .ok_or_else(|| anyhow!("C panel row offset overflow"))?,
-                        )
-                        .ok_or_else(|| anyhow!("C panel offset overflow"))?,
-                )?;
-                let a_bytes = buffer_len_bytes(a_elements)?;
-                let c_bytes = buffer_len_bytes(c_elements)?;
-                let a_binding_size =
-                    wgpu::BufferSize::new(a_bytes).ok_or_else(|| anyhow!("empty A panel"))?;
-                let c_binding_size =
-                    wgpu::BufferSize::new(c_bytes).ok_or_else(|| anyhow!("empty C panel"))?;
-
-                let params = BlockParams {
-                    n: n_u32,
-                    rows: u32::try_from(rows).context("panel row block exceeds shader limits")?,
-                    cols: u32::try_from(panel.cols)
-                        .context("panel column block exceeds shader limits")?,
-                    _pad: 0,
-                };
-                self.queue
-                    .write_buffer(&params_buffer, 0, bytemuck::bytes_of(&params));
-
-                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("Persistent panel matrix bind group"),
-                    layout: &self.bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: &a_buffer,
-                                offset: a_offset,
-                                size: Some(a_binding_size),
-                            }),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: &b_buffer,
-                                offset: b_offset,
-                                size: Some(b_binding_size),
-                            }),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: &c_buffer,
-                                offset: c_offset,
-                                size: Some(c_binding_size),
-                            }),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: params_buffer.as_entire_binding(),
-                        },
-                    ],
-                });
-
-                let mut encoder =
-                    self.device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("Persistent panel matrix encoder"),
-                        });
-                {
-                    let timestamp_writes =
-                        query_set
-                            .as_ref()
-                            .map(|query_set| wgpu::ComputePassTimestampWrites {
-                                query_set,
-                                beginning_of_pass_write_index: Some((query_pair_index * 2) as u32),
-                                end_of_pass_write_index: Some((query_pair_index * 2 + 1) as u32),
-                            });
-                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("Persistent panel matrix pass"),
-                        timestamp_writes,
-                    });
-                    pass.set_pipeline(&self.blocked_pipeline);
-                    pass.set_bind_group(0, &bind_group, &[]);
-                    pass.dispatch_workgroups(
-                        (panel.cols as u32).div_ceil(TILE_SIZE),
-                        (rows as u32).div_ceil(TILE_SIZE),
-                        1,
-                    );
-                }
-
-                let dispatch_start = Instant::now();
-                let submission = self.queue.submit([encoder.finish()]);
-                self.wait_for_submission(submission, cancel, "waiting for persistent panel chunk")?;
-                let observed_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
-                observed_dispatch_ms.push(observed_ms);
-                governor.record_dispatch(observed_ms);
-                query_pair_index += 1;
-                completed_cells += c_elements;
+                dispatches.push(self.create_panel_dispatch(
+                    &a_buffer,
+                    &b_buffer,
+                    &c_buffer,
+                    n_u32,
+                    n,
+                    panel,
+                    row_offset,
+                    rows,
+                )?);
                 row_offset += rows;
+                if row_offset >= n {
+                    row_offset = 0;
+                    panel_index += 1;
+                }
+            }
 
-                if let Some(progress) = progress.as_deref_mut() {
-                    progress.set_gpu_progress(
-                        (completed_cells as f32 / elements as f32 * 0.97).clamp(0.0, 0.97),
-                        false,
-                    );
-                }
-                if completed_cells < elements {
-                    pause_between_gpu_submissions(gpu_intensity, cancel)?;
-                }
+            let mut encoder =
+                self.device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Persistent panel matrix batch encoder"),
+                    });
+            for (batch_index, dispatch) in dispatches.iter().enumerate() {
+                let timestamp_index = query_pair_index + batch_index;
+                let timestamp_writes =
+                    query_set
+                        .as_ref()
+                        .map(|query_set| wgpu::ComputePassTimestampWrites {
+                            query_set,
+                            beginning_of_pass_write_index: Some((timestamp_index * 2) as u32),
+                            end_of_pass_write_index: Some((timestamp_index * 2 + 1) as u32),
+                        });
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Persistent panel matrix batch pass"),
+                    timestamp_writes,
+                });
+                pass.set_pipeline(&self.blocked_pipeline);
+                pass.set_bind_group(0, &dispatch.bind_group, &[]);
+                pass.dispatch_workgroups(
+                    (dispatch.cols as u32).div_ceil(TILE_SIZE),
+                    (dispatch.rows as u32).div_ceil(TILE_SIZE),
+                    1,
+                );
+            }
+
+            let dispatch_count = dispatches.len().max(1);
+            let completed_in_batch = dispatches
+                .iter()
+                .map(|dispatch| dispatch.rows * dispatch.cols)
+                .sum::<usize>();
+            let dispatch_start = Instant::now();
+            let submission = self.queue.submit([encoder.finish()]);
+            self.wait_for_submission(
+                submission,
+                cancel,
+                "waiting for persistent panel matrix batch",
+            )?;
+            let observed_batch_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
+            let observed_ms = observed_batch_ms / dispatch_count as f64;
+            for _ in 0..dispatch_count {
+                observed_dispatch_ms.push(observed_ms);
+            }
+            governor.record_dispatch(observed_ms);
+            governor.record_batch(observed_batch_ms);
+            query_pair_index += dispatch_count;
+            completed_cells += completed_in_batch;
+
+            if let Some(progress) = progress.as_deref_mut() {
+                progress.set_gpu_progress(
+                    (completed_cells as f32 / elements as f32 * 0.97).clamp(0.0, 0.97),
+                    false,
+                );
+            }
+            if completed_cells < elements {
+                pause_between_gpu_submissions(gpu_intensity, cancel)?;
             }
         }
 
@@ -910,6 +1021,427 @@ impl GpuRunner {
             stats,
             output,
         })
+    }
+
+    fn repeat_gpu_compute<F>(
+        &self,
+        n: usize,
+        a: &[f32],
+        b: &[f32],
+        gpu_intensity: GpuIntensity,
+        cancel: &AtomicBool,
+        deadline: &Option<Instant>,
+        emit: &mut F,
+    ) -> Result<RepeatProgress>
+    where
+        F: FnMut(u64, f64, f64, f64, u64, bool, bool) -> RepeatProgress,
+    {
+        let elements = n
+            .checked_mul(n)
+            .ok_or_else(|| anyhow!("matrix size overflow"))?;
+        if a.len() != elements || b.len() != elements {
+            return Err(anyhow!("matrix data length does not match {n}x{n}"));
+        }
+        let n_u32 = u32::try_from(n).context("matrix size exceeds GPU shader limits")?;
+        let byte_len = buffer_len_bytes(elements)?;
+
+        if self.needs_blocked_path(byte_len) {
+            if self.can_use_panelized_path(n, byte_len, gpu_intensity)? {
+                return self.repeat_panelized_gpu_compute(
+                    n,
+                    n_u32,
+                    a,
+                    b,
+                    byte_len,
+                    gpu_intensity,
+                    cancel,
+                    deadline,
+                    emit,
+                );
+            }
+            return self.repeat_streaming_gpu_compute(
+                n,
+                a,
+                b,
+                gpu_intensity,
+                cancel,
+                deadline,
+                emit,
+            );
+        }
+
+        self.repeat_direct_gpu_compute(
+            n,
+            n_u32,
+            a,
+            b,
+            byte_len,
+            gpu_intensity,
+            cancel,
+            deadline,
+            emit,
+        )
+    }
+
+    fn repeat_direct_gpu_compute<F>(
+        &self,
+        n: usize,
+        n_u32: u32,
+        a: &[f32],
+        b: &[f32],
+        byte_len: u64,
+        gpu_intensity: GpuIntensity,
+        cancel: &AtomicBool,
+        deadline: &Option<Instant>,
+        emit: &mut F,
+    ) -> Result<RepeatProgress>
+    where
+        F: FnMut(u64, f64, f64, f64, u64, bool, bool) -> RepeatProgress,
+    {
+        let a_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Stress matrix A"),
+                contents: bytemuck::cast_slice(a),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let b_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Stress matrix B"),
+                contents: bytemuck::cast_slice(b),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let c_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Stress matrix C output"),
+            size: byte_len,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let chunk_rows = gpu_dispatch_chunk_rows(n, gpu_intensity);
+        let min_chunk_rows = gpu_min_dispatch_rows(gpu_intensity).min(chunk_rows).max(1);
+        let mut governor = GpuWorkGovernor::new(chunk_rows, min_chunk_rows, gpu_intensity);
+        let mut counters = GpuRepeatCounters::default();
+        let mut row_offset = 0usize;
+
+        while repeat_should_continue(deadline, cancel) {
+            if let Err(err) = self.check_gpu_canceled(Some(cancel)) {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                return Err(err);
+            }
+            let mut dispatches = Vec::new();
+            let mut completed_iterations = 0u64;
+            let batch_limit = gpu_repeat_batch_limit(n, gpu_intensity);
+            while repeat_should_continue(deadline, cancel) && dispatches.len() < batch_limit {
+                let rows = governor.row_extent(n - row_offset);
+                let params = Params {
+                    n: n_u32,
+                    row_offset: row_offset as u32,
+                    row_count: rows as u32,
+                    _pad2: 0,
+                };
+                dispatches.push(self.create_direct_dispatch(
+                    &a_buffer, &b_buffer, &c_buffer, params, rows,
+                ));
+                row_offset += rows;
+                if row_offset >= n {
+                    row_offset = 0;
+                    completed_iterations += 1;
+                }
+            }
+            if dispatches.is_empty() {
+                break;
+            }
+
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Matrix stress direct batch encoder"),
+                });
+            for dispatch in &dispatches {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Matrix stress direct batch pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &dispatch.bind_group, &[]);
+                pass.dispatch_workgroups(
+                    n_u32.div_ceil(TILE_SIZE),
+                    (dispatch.rows as u32).div_ceil(TILE_SIZE),
+                    1,
+                );
+            }
+
+            let dispatch_count = dispatches.len().max(1);
+            let batch_start = Instant::now();
+            let submission = self.queue.submit([encoder.finish()]);
+            if let Err(err) =
+                self.wait_for_submission(submission, Some(cancel), "waiting for GPU stress batch")
+            {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                return Err(err);
+            }
+            let batch_ms = batch_start.elapsed().as_secs_f64() * 1000.0;
+            let observed_ms = batch_ms / dispatch_count as f64;
+            governor.record_dispatch(observed_ms);
+            governor.record_batch(batch_ms);
+            counters.record_batch(completed_iterations, batch_ms);
+            emit(
+                counters.iterations,
+                counters.latest_ms,
+                counters.total_ms,
+                counters.total_compute_ms,
+                counters.compute_count,
+                false,
+                false,
+            );
+            if repeat_should_continue(deadline, cancel)
+                && let Err(err) = pause_between_gpu_submissions(gpu_intensity, Some(cancel))
+            {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                return Err(err);
+            }
+        }
+
+        Ok(emit(
+            counters.iterations,
+            counters.latest_ms,
+            counters.total_ms,
+            counters.total_compute_ms,
+            counters.compute_count,
+            cancel.load(Ordering::Relaxed),
+            true,
+        ))
+    }
+
+    fn repeat_panelized_gpu_compute<F>(
+        &self,
+        n: usize,
+        n_u32: u32,
+        a: &[f32],
+        b: &[f32],
+        byte_len: u64,
+        gpu_intensity: GpuIntensity,
+        cancel: &AtomicBool,
+        deadline: &Option<Instant>,
+        emit: &mut F,
+    ) -> Result<RepeatProgress>
+    where
+        F: FnMut(u64, f64, f64, f64, u64, bool, bool) -> RepeatProgress,
+    {
+        let (row_block, col_block) = self.block_dimensions(n, gpu_intensity)?;
+        let min_row_block =
+            align_block_extent(gpu_min_dispatch_rows(gpu_intensity).min(row_block).max(1));
+        let mut governor = GpuWorkGovernor::new(row_block, min_row_block, gpu_intensity);
+        let (b_packed, panels) = pack_column_panels(b, n, col_block, Some(cancel))?;
+        self.ensure_panelized_offsets_aligned(n, min_row_block, &panels)?;
+
+        let a_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Stress persistent matrix A"),
+                contents: bytemuck::cast_slice(a),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let b_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Stress persistent packed matrix B panels"),
+                contents: bytemuck::cast_slice(&b_packed),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let c_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Stress persistent packed matrix C panels"),
+            size: byte_len,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let elements = n
+            .checked_mul(n)
+            .ok_or_else(|| anyhow!("matrix size overflow"))?;
+        let mut counters = GpuRepeatCounters::default();
+        let mut panel_index = 0usize;
+        let mut row_offset = 0usize;
+        let mut completed_cells = 0usize;
+
+        while repeat_should_continue(deadline, cancel) {
+            if let Err(err) = self.check_gpu_canceled(Some(cancel)) {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                return Err(err);
+            }
+            let mut dispatches = Vec::new();
+            let mut completed_iterations = 0u64;
+            let batch_limit = gpu_repeat_batch_limit(n, gpu_intensity);
+            while repeat_should_continue(deadline, cancel) && dispatches.len() < batch_limit {
+                let panel = &panels[panel_index];
+                let rows = governor.row_extent(n - row_offset);
+                let dispatch = self.create_panel_dispatch(
+                    &a_buffer,
+                    &b_buffer,
+                    &c_buffer,
+                    n_u32,
+                    n,
+                    panel,
+                    row_offset,
+                    rows,
+                )?;
+                completed_cells += rows * panel.cols;
+                dispatches.push(dispatch);
+                row_offset += rows;
+                if row_offset >= n {
+                    row_offset = 0;
+                    panel_index += 1;
+                }
+                if panel_index >= panels.len() {
+                    panel_index = 0;
+                    completed_cells = 0;
+                    completed_iterations += 1;
+                } else if completed_cells >= elements {
+                    completed_cells = 0;
+                    completed_iterations += 1;
+                }
+            }
+            if dispatches.is_empty() {
+                break;
+            }
+
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Matrix stress panel batch encoder"),
+                });
+            for dispatch in &dispatches {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Matrix stress panel batch pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.blocked_pipeline);
+                pass.set_bind_group(0, &dispatch.bind_group, &[]);
+                pass.dispatch_workgroups(
+                    (dispatch.cols as u32).div_ceil(TILE_SIZE),
+                    (dispatch.rows as u32).div_ceil(TILE_SIZE),
+                    1,
+                );
+            }
+
+            let dispatch_count = dispatches.len().max(1);
+            let batch_start = Instant::now();
+            let submission = self.queue.submit([encoder.finish()]);
+            if let Err(err) = self.wait_for_submission(
+                submission,
+                Some(cancel),
+                "waiting for persistent GPU stress batch",
+            ) {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                return Err(err);
+            }
+            let batch_ms = batch_start.elapsed().as_secs_f64() * 1000.0;
+            let observed_ms = batch_ms / dispatch_count as f64;
+            governor.record_dispatch(observed_ms);
+            governor.record_batch(batch_ms);
+            counters.record_batch(completed_iterations, batch_ms);
+            emit(
+                counters.iterations,
+                counters.latest_ms,
+                counters.total_ms,
+                counters.total_compute_ms,
+                counters.compute_count,
+                false,
+                false,
+            );
+            if repeat_should_continue(deadline, cancel)
+                && let Err(err) = pause_between_gpu_submissions(gpu_intensity, Some(cancel))
+            {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                return Err(err);
+            }
+        }
+
+        Ok(emit(
+            counters.iterations,
+            counters.latest_ms,
+            counters.total_ms,
+            counters.total_compute_ms,
+            counters.compute_count,
+            cancel.load(Ordering::Relaxed),
+            true,
+        ))
+    }
+
+    fn repeat_streaming_gpu_compute<F>(
+        &self,
+        n: usize,
+        a: &[f32],
+        b: &[f32],
+        gpu_intensity: GpuIntensity,
+        cancel: &AtomicBool,
+        deadline: &Option<Instant>,
+        emit: &mut F,
+    ) -> Result<RepeatProgress>
+    where
+        F: FnMut(u64, f64, f64, f64, u64, bool, bool) -> RepeatProgress,
+    {
+        let mut iterations = 0_u64;
+        let mut total_ms = 0.0;
+        let mut total_compute_ms = 0.0;
+        let mut compute_count = 0_u64;
+        let mut latest_ms = 0.0;
+
+        while repeat_should_continue(deadline, cancel) {
+            let timing = match self.multiply_cancelable(
+                n,
+                a,
+                b,
+                true,
+                gpu_intensity,
+                Some(cancel),
+                None,
+            ) {
+                Ok(timing) => timing,
+                Err(_) if cancel.load(Ordering::Relaxed) => break,
+                Err(err) => return Err(err),
+            };
+            latest_ms = timing.total_ms;
+            total_ms += timing.total_ms;
+            if let Some(compute_ms) = timing.compute_ms {
+                total_compute_ms += compute_ms;
+                compute_count += 1;
+            }
+            iterations += 1;
+            emit(
+                iterations,
+                latest_ms,
+                total_ms,
+                total_compute_ms,
+                compute_count,
+                false,
+                false,
+            );
+        }
+
+        Ok(emit(
+            iterations,
+            latest_ms,
+            total_ms,
+            total_compute_ms,
+            compute_count,
+            cancel.load(Ordering::Relaxed),
+            true,
+        ))
     }
 
     fn multiply_blocked(
@@ -1403,6 +1935,32 @@ fn gpu_block_targets(gpu_intensity: GpuIntensity) -> (usize, usize) {
     }
 }
 
+fn gpu_dispatch_batch_limit(gpu_intensity: GpuIntensity) -> usize {
+    match gpu_intensity {
+        GpuIntensity::Safe => GPU_SAFE_BATCH_DISPATCHES,
+        GpuIntensity::Balanced => GPU_BALANCED_BATCH_DISPATCHES,
+        GpuIntensity::High => GPU_HIGH_BATCH_DISPATCHES,
+    }
+}
+
+fn gpu_repeat_batch_limit(size: usize, gpu_intensity: GpuIntensity) -> usize {
+    let base = match gpu_intensity {
+        GpuIntensity::Safe => GPU_SAFE_REPEAT_BATCH_DISPATCHES,
+        GpuIntensity::Balanced => GPU_BALANCED_REPEAT_BATCH_DISPATCHES,
+        GpuIntensity::High => GPU_HIGH_REPEAT_BATCH_DISPATCHES,
+    };
+
+    if size <= 256 {
+        base
+    } else if size <= 512 {
+        (base / 2).max(gpu_dispatch_batch_limit(gpu_intensity))
+    } else if size <= 1024 {
+        (base / 4).max(gpu_dispatch_batch_limit(gpu_intensity))
+    } else {
+        gpu_dispatch_batch_limit(gpu_intensity)
+    }
+}
+
 fn gpu_submission_pause(gpu_intensity: GpuIntensity) -> Duration {
     match gpu_intensity {
         GpuIntensity::Safe => Duration::from_millis(3),
@@ -1416,6 +1974,14 @@ fn gpu_hard_backoff_ms(gpu_intensity: GpuIntensity) -> f64 {
         GpuIntensity::Safe => 500.0,
         GpuIntensity::Balanced => 750.0,
         GpuIntensity::High => 1000.0,
+    }
+}
+
+fn gpu_hard_batch_backoff_ms(gpu_intensity: GpuIntensity) -> f64 {
+    match gpu_intensity {
+        GpuIntensity::Safe => 700.0,
+        GpuIntensity::Balanced => 1100.0,
+        GpuIntensity::High => 1600.0,
     }
 }
 
@@ -2401,8 +2967,8 @@ fn run_repeat(
     let duration_s = duration.seconds();
     let mut iterations = 0_u64;
     let mut total_ms = 0.0;
-    let mut total_compute_ms = 0.0;
-    let mut compute_count = 0_u64;
+    let total_compute_ms = 0.0;
+    let compute_count = 0_u64;
     let mut latest_ms = 0.0;
     let mut last_emit = Instant::now() - Duration::from_secs(1);
 
@@ -2469,38 +3035,15 @@ fn run_repeat(
         }
         RepeatMode::Gpu => {
             let runner = GpuRunner::new(adapter.index)?;
-            while repeat_should_continue(&deadline, &cancel) {
-                check_canceled(Some(&cancel))?;
-                let timing = match runner.multiply_cancelable(
-                    size,
-                    &a,
-                    &b,
-                    true,
-                    gpu_intensity,
-                    Some(&cancel),
-                    None,
-                ) {
-                    Ok(timing) => timing,
-                    Err(_) if cancel.load(Ordering::Relaxed) => break,
-                    Err(err) => return Err(err),
-                };
-                latest_ms = timing.total_ms;
-                total_ms += timing.total_ms;
-                if let Some(compute_ms) = timing.compute_ms {
-                    total_compute_ms += compute_ms;
-                    compute_count += 1;
-                }
-                iterations += 1;
-                emit(
-                    iterations,
-                    latest_ms,
-                    total_ms,
-                    total_compute_ms,
-                    compute_count,
-                    false,
-                    false,
-                );
-            }
+            return runner.repeat_gpu_compute(
+                size,
+                &a,
+                &b,
+                gpu_intensity,
+                &cancel,
+                &deadline,
+                &mut emit,
+            );
         }
     }
 
