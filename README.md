@@ -156,7 +156,7 @@ $env:CARGO_NET_OFFLINE='false'
 
 GPU compute-only time uses `wgpu` timestamp queries. If an adapter does not expose timestamp queries, or if a large split run would need more timestamp queries than `wgpu` allows in one query set, the app still reports GPU total time and dispatch telemetry, and marks compute-only timing as `N/A`.
 
-The Rust app is cross-vendor and can enumerate multiple `wgpu` backends, such as Vulkan, DX12, OpenGL, and software adapters. For best hardware measurements, choose a real integrated or discrete GPU rather than a software adapter.
+The Rust app is cross-vendor on Windows and uses the `wgpu` DX12 backend in release builds to keep startup and binary size lean. For best hardware measurements, choose a real integrated or discrete GPU rather than a software adapter.
 
 Exact CPU multiplication is the default for every supported matrix size. For very large matrices, the optional CPU estimate mode warms up on a small matrix, spends about two seconds computing real full-width rows of the target matrix against the full B matrix, and extrapolates from the measured row throughput. Estimated timings are labeled `Est.`.
 

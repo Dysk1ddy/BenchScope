@@ -41,6 +41,32 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\BUILD_SENSOR_D
 
 The script normalizes the `Path`/`PATH` environment block before invoking MSBuild because duplicate casing can break the Visual C++ task host. `-SignMode Off` is for local compile/signability checks only; loading the driver still requires test signing or production signing. Normal `cargo check` does not build this driver.
 
+## Attestation Package Prep
+
+The repo can stage a Microsoft attestation-signing CAB, but it cannot complete EV signing or Partner Center submission by itself.
+
+Build Release x64 and create the unsigned attestation CAB:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\New-SensorDriverAttestationPackage.ps1
+```
+
+If the Release x64 driver package already exists, skip the build:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\New-SensorDriverAttestationPackage.ps1 -SkipBuild
+```
+
+The script stages files under `artifacts\attestation\stage\BenchScopeSensorDriver`, creates `artifacts\attestation\BenchScopeSensorDriver-attestation.cab`, and writes SHA-256 hashes beside it. The generated `artifacts` directory is intentionally ignored by Git.
+
+Before submitting a CAB, complete [SECURITY_REVIEW_CHECKLIST.md](SECURITY_REVIEW_CHECKLIST.md), follow [ATTESTATION_SUBMISSION_RUNBOOK.md](ATTESTATION_SUBMISSION_RUNBOOK.md), and keep the milestone plan in [plans/ATTESTATION_SIGNING_PLAN.md](../plans/ATTESTATION_SIGNING_PLAN.md) up to date.
+
+Run the lightweight source-surface check before packaging:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Test-SensorDriverSecuritySurface.ps1
+```
+
 ## Dev Install Flow
 
 Test-signed kernel drivers require Windows test-signing mode. Enabling it is a persistent boot setting and requires a reboot:

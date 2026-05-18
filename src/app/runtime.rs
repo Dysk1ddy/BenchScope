@@ -50,6 +50,7 @@ impl BenchScopeApp {
             || self.battery.scanning
             || self.battery.live_running
             || self.network.running
+            || self.network.adapter_refresh_running
             || self.network.monitoring
             || self.device_info.running
             || self.ai_training.running

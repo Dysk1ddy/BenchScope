@@ -254,9 +254,8 @@ struct StorageHealthState {
 }
 
 impl StorageHealthState {
-    fn new() -> Self {
+    fn with_drives(drives: Vec<DriveInfo>) -> Self {
         let (tx, rx) = mpsc::channel();
-        let drives = detect_drives();
         let system_root = std::env::current_dir()
             .ok()
             .and_then(|path| drive_root_for_path(&path))

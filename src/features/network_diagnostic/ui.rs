@@ -8,6 +8,7 @@ impl BenchScopeApp {
     }
     fn ui_network_diagnostic(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.network.ensure_adapters_loaded();
 
         egui::Panel::top("network_top_panel").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
@@ -45,7 +46,9 @@ impl BenchScopeApp {
 
                                 ui.label("Adapter");
                                 ui.add_enabled_ui(
-                                    !self.network.running && !self.network.monitoring,
+                                    !self.network.running
+                                        && !self.network.monitoring
+                                        && !self.network.adapter_refresh_running,
                                     |ui| {
                                         let visible_indices =
                                             self.network.visible_adapter_indices();
@@ -190,7 +193,11 @@ impl BenchScopeApp {
                 );
 
                 ui.separator();
-                ui.add_enabled_ui(!self.network.running && !self.network.monitoring, |ui| {
+                ui.add_enabled_ui(
+                    !self.network.running
+                        && !self.network.monitoring
+                        && !self.network.adapter_refresh_running,
+                    |ui| {
                     if ui.button("Run quick diagnosis").clicked() {
                         self.network.start_quick_diagnosis();
                     }
@@ -203,7 +210,8 @@ impl BenchScopeApp {
                     if ui.button("Export report").clicked() {
                         self.network.export_report();
                     }
-                });
+                    },
+                );
                 ui.add_enabled_ui(self.network.running || self.network.monitoring, |ui| {
                     let label = match self.network.running_kind {
                         Some(NetworkRunKind::SpeedTest) => "Cancel speed test",

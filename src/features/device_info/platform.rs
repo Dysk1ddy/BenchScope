@@ -1,7 +1,7 @@
 fn collect_device_info_snapshot(wgpu_adapters: Vec<AdapterInfo>) -> Result<DeviceInfoSnapshot> {
     #[cfg(windows)]
     {
-        let output = run_powershell_sensor_script(windows_device_info_script())
+        let output = run_windows_device_info_script(windows_device_info_script())
             .context("failed to query Windows device inventory")?;
         let mut snapshot = parse_windows_device_info_output(&output);
         snapshot.wgpu_adapters = wgpu_adapters;
@@ -68,6 +68,22 @@ fn collect_device_info_snapshot(wgpu_adapters: Vec<AdapterInfo>) -> Result<Devic
         snapshot.wgpu_adapters = wgpu_adapters;
         Ok(snapshot)
     }
+}
+
+#[cfg(windows)]
+fn run_windows_device_info_script(script: &str) -> Result<String> {
+    run_command_no_window_timeout(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ],
+        Duration::from_millis(DEVICE_INFO_COMMAND_TIMEOUT_MS),
+    )
 }
 
 #[cfg(windows)]
@@ -373,9 +389,9 @@ $driverClasses = @(
     'BLUETOOTH', 'BATTERY', 'MONITOR', 'SYSTEM', 'PROCESSOR', 'HIDCLASS',
     'KEYBOARD', 'MOUSE', 'IMAGE', 'CAMERA', 'SOFTWARECOMPONENT', 'FIRMWARE'
 )
+$driverFilter = ($driverClasses | ForEach-Object { "DeviceClass='$($_)'" }) -join ' OR '
 Safe 'Win32_PnPSignedDriver inventory' {
-    Get-CimInstance Win32_PnPSignedDriver |
-        Where-Object { $driverClasses -contains "$($_.DeviceClass)".ToUpperInvariant() } |
+    Get-CimInstance Win32_PnPSignedDriver -Filter $driverFilter |
         Sort-Object DeviceClass, DeviceName |
         ForEach-Object {
             Emit @(

@@ -251,6 +251,7 @@ struct NetworkDiagnosisResult {
 }
 
 enum NetworkWorkerEvent {
+    AdapterRefreshDone(Result<Vec<NetworkAdapterSnapshot>, String>),
     Progress(NetworkProgress),
     ProbeCompleted(NetworkProbeResult),
     SpeedSampleCompleted(NetworkSpeedSample),
@@ -279,6 +280,8 @@ struct NetworkDiagnosticState {
     cancel: Option<Arc<AtomicBool>>,
     running: bool,
     running_kind: Option<NetworkRunKind>,
+    adapters_loaded: bool,
+    adapter_refresh_running: bool,
     monitoring: bool,
     last_report_path: Option<PathBuf>,
 }
@@ -286,31 +289,17 @@ struct NetworkDiagnosticState {
 impl NetworkDiagnosticState {
     fn new() -> Self {
         let (tx, rx) = mpsc::channel();
-        let mut log = vec!["Network diagnostic ready".to_owned()];
-        let adapters = match detect_network_adapters() {
-            Ok(adapters) => adapters,
-            Err(err) => {
-                log.push(format!("Adapter detection unavailable: {err:#}"));
-                Vec::new()
-            }
-        };
-        let selected_adapter = preferred_network_adapter_index(&adapters).unwrap_or(0);
-        let status = if adapters.is_empty() {
-            "No network adapters detected".to_owned()
-        } else {
-            format!("Detected {} network adapter(s)", adapters.len())
-        };
         Self {
-            adapters,
-            selected_adapter,
+            adapters: Vec::new(),
+            selected_adapter: 0,
             include_virtual: false,
             probe_results: Vec::new(),
             speed_samples: Vec::new(),
             speed_result: None,
             findings: Vec::new(),
             signal_history: VecDeque::new(),
-            log,
-            status,
+            log: vec!["Network diagnostic ready".to_owned()],
+            status: "Adapter detection will run when this tool opens".to_owned(),
             current_step: "Ready".to_owned(),
             progress: 0.0,
             rx,
@@ -318,6 +307,8 @@ impl NetworkDiagnosticState {
             cancel: None,
             running: false,
             running_kind: None,
+            adapters_loaded: false,
+            adapter_refresh_running: false,
             monitoring: false,
             last_report_path: None,
         }
@@ -363,23 +354,37 @@ impl NetworkDiagnosticState {
             .unwrap_or(0);
     }
 
+    fn ensure_adapters_loaded(&mut self) {
+        if !self.adapters_loaded && !self.adapter_refresh_running {
+            self.start_adapter_refresh();
+        }
+    }
+
     fn update_adapter_snapshot(&mut self, snapshot: NetworkAdapterSnapshot) {
         self.selected_adapter = upsert_network_adapter_snapshot(&mut self.adapters, snapshot);
     }
 
     fn refresh_adapters(&mut self) {
-        match detect_network_adapters() {
-            Ok(adapters) => {
-                let count = adapters.len();
-                self.replace_adapters(adapters);
-                self.status = format!("Detected {count} network adapter(s)");
-                self.log(self.status.clone());
-            }
-            Err(err) => {
-                self.status = format!("Could not refresh adapters: {err:#}");
-                self.log(self.status.clone());
-            }
+        self.start_adapter_refresh();
+    }
+
+    fn start_adapter_refresh(&mut self) {
+        if self.adapter_refresh_running || self.running || self.monitoring {
+            return;
         }
+        self.adapter_refresh_running = true;
+        self.progress = 0.0;
+        self.current_step = "Detecting network adapters".to_owned();
+        self.status = "Detecting network adapters...".to_owned();
+        self.log(self.status.clone());
+
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = panic::catch_unwind(AssertUnwindSafe(detect_network_adapters))
+                .map_err(|panic| format!("Adapter detection panicked: {}", panic_message(&*panic)))
+                .and_then(|result| result.map_err(|err| format!("{err:#}")));
+            let _ = tx.send(NetworkWorkerEvent::AdapterRefreshDone(result));
+        });
     }
 
     fn start_quick_diagnosis(&mut self) {
@@ -515,6 +520,30 @@ impl NetworkDiagnosticState {
     fn poll_worker_events(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
+                NetworkWorkerEvent::AdapterRefreshDone(result) => {
+                    self.adapter_refresh_running = false;
+                    self.adapters_loaded = true;
+                    match result {
+                        Ok(adapters) => {
+                            let count = adapters.len();
+                            self.replace_adapters(adapters);
+                            self.progress = 1.0;
+                            self.current_step = "Ready".to_owned();
+                            self.status = if count == 0 {
+                                "No network adapters detected".to_owned()
+                            } else {
+                                format!("Detected {count} network adapter(s)")
+                            };
+                            self.log(self.status.clone());
+                        }
+                        Err(err) => {
+                            self.progress = 0.0;
+                            self.current_step = "Adapter detection unavailable".to_owned();
+                            self.status = format!("Could not refresh adapters: {err}");
+                            self.log(self.status.clone());
+                        }
+                    }
+                }
                 NetworkWorkerEvent::Progress(progress) => {
                     self.current_step = progress.step;
                     self.progress = progress.progress;

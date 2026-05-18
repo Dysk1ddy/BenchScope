@@ -27,6 +27,8 @@ Initial driver scaffolding has begun:
 
 The local development machine has passed the test-signing gate for prototype work: Secure Boot was disabled, Windows test-signing was enabled, and the test-signed BenchScope driver was installed. That is only a development state; release distribution still requires a Microsoft-compatible signing path.
 
+Attestation signing is now tracked as a dedicated milestone in [ATTESTATION_SIGNING_PLAN.md](ATTESTATION_SIGNING_PLAN.md).
+
 The prototype deliberately does not read hardware yet. It returns unsupported sensor readings until a specific provider is researched, reviewed, and added behind a narrow IOCTL/service path.
 
 Target experience:

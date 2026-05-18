@@ -50,7 +50,6 @@ struct AiTrainingBuffers {
     forward_params: wgpu::Buffer,
     weight_grad_params: wgpu::Buffer,
     input_grad_params: wgpu::Buffer,
-    sgd_params: wgpu::Buffer,
     validation_inputs: Option<AiLinearValidationInputs>,
 }
 
@@ -75,7 +74,7 @@ struct AiLinearTrainingBlock {
     forward_bind_group: wgpu::BindGroup,
     weight_grad_bind_group: wgpu::BindGroup,
     input_grad_bind_group: wgpu::BindGroup,
-    sgd_bind_group: wgpu::BindGroup,
+    sgd_chunks: Vec<AiOptimizerChunk>,
 }
 
 struct AiOptimizerChunk {
@@ -241,12 +240,24 @@ impl AiGpuRunner {
             &buffers.input_grad_params,
             "AI input-gradient GEMM bind group",
         );
-        let sgd_bind_group = self.create_sgd_bind_group(
+        let parameter_count = input
+            .checked_mul(output)
+            .ok_or_else(|| anyhow!("parameter count overflow"))?;
+        let sgd_chunks = self.create_sgd_chunks(
+            parameter_count,
+            input,
+            output,
+            self.optimizer_chunk_elements(),
             &buffers.dw,
             &buffers.weights,
             &buffers.weights_t,
-            &buffers.sgd_params,
-        );
+        )?;
+        if sgd_chunks.len() > 1 {
+            run_notes.push(format!(
+                "SGD update is chunked into {} dispatches for adapter workgroup limits.",
+                sgd_chunks.len()
+            ));
+        }
         let timestamp_plan = if self.timestamp_query {
             timestamp_query_plan(
                 config
@@ -312,7 +323,7 @@ impl AiGpuRunner {
                 &forward_bind_group,
                 &weight_grad_bind_group,
                 &input_grad_bind_group,
-                &sgd_bind_group,
+                &sgd_chunks,
                 batch,
                 input,
                 output,
@@ -556,6 +567,16 @@ impl AiGpuRunner {
         for spec in block_specs {
             blocks.push(self.create_linear_training_block(*spec, cancel)?);
         }
+        let chunked_blocks = blocks
+            .iter()
+            .filter(|block| block.sgd_chunks.len() > 1)
+            .count();
+        if chunked_blocks > 0 {
+            run_notes.push(format!(
+                "SGD update is chunked for {} block(s) to stay within adapter workgroup limits.",
+                chunked_blocks
+            ));
+        }
 
         let timestamp_plan = if self.timestamp_query {
             timestamp_query_plan(config.measured_steps.saturating_mul(timestamp_pairs_per_step))
@@ -774,8 +795,15 @@ impl AiGpuRunner {
         let weights = self.create_empty_storage_buffer("AI optimizer weights", parameter_count)?;
         let weights_t =
             self.create_empty_storage_buffer("AI optimizer transposed weights", parameter_count)?;
-        let chunks =
-            self.create_optimizer_chunks(parameter_count, max_chunk_elements, &gradient, &weights, &weights_t)?;
+        let chunks = self.create_sgd_chunks(
+            parameter_count,
+            parameter_count,
+            1,
+            max_chunk_elements,
+            &gradient,
+            &weights,
+            &weights_t,
+        )?;
 
         let timestamp_plan = if self.timestamp_query {
             timestamp_query_plan(
@@ -1017,15 +1045,6 @@ impl AiGpuRunner {
             inner: usize_to_u32(output, "output dimension")?,
             _pad: 0,
         };
-        let sgd_params = AiSgdParams {
-            element_count: usize_to_u32(dw_elements, "parameter count")?,
-            input_dim: usize_to_u32(input, "input dimension")?,
-            output_dim: usize_to_u32(output, "output dimension")?,
-            start_index: 0,
-            learning_rate: AI_SGD_LEARNING_RATE,
-            _pad1: [0.0; 3],
-        };
-
         Ok(AiTrainingBuffers {
             x: self.create_init_buffer("AI X", &x, true),
             x_t: self.create_init_buffer("AI X transpose", &x_t, true),
@@ -1038,7 +1057,6 @@ impl AiGpuRunner {
             forward_params: self.create_uniform_buffer("AI forward params", &forward_params),
             weight_grad_params: self.create_uniform_buffer("AI dW params", &weight_grad_params),
             input_grad_params: self.create_uniform_buffer("AI dX params", &input_grad_params),
-            sgd_params: self.create_uniform_buffer("AI SGD params", &sgd_params),
             validation_inputs,
         })
     }
@@ -1072,12 +1090,19 @@ impl AiGpuRunner {
             &buffers.input_grad_params,
             "AI proxy input-gradient GEMM bind group",
         );
-        let sgd_bind_group = self.create_sgd_bind_group(
+        let parameter_count = spec
+            .input
+            .checked_mul(spec.output)
+            .ok_or_else(|| anyhow!("parameter count overflow"))?;
+        let sgd_chunks = self.create_sgd_chunks(
+            parameter_count,
+            spec.input,
+            spec.output,
+            self.optimizer_chunk_elements(),
             &buffers.dw,
             &buffers.weights,
             &buffers.weights_t,
-            &buffers.sgd_params,
-        );
+        )?;
 
         Ok(AiLinearTrainingBlock {
             batch: spec.batch,
@@ -1087,7 +1112,7 @@ impl AiGpuRunner {
             forward_bind_group,
             weight_grad_bind_group,
             input_grad_bind_group,
-            sgd_bind_group,
+            sgd_chunks,
         })
     }
 
@@ -1102,7 +1127,7 @@ impl AiGpuRunner {
             &block.forward_bind_group,
             &block.weight_grad_bind_group,
             &block.input_grad_bind_group,
-            &block.sgd_bind_group,
+            &block.sgd_chunks,
             block.batch,
             block.input,
             block.output,
@@ -1113,42 +1138,47 @@ impl AiGpuRunner {
     }
 
     fn optimizer_chunk_elements(&self) -> usize {
-        let max_groups = self.max_compute_workgroups_per_dimension.max(1) as usize;
-        max_groups.saturating_mul(256).max(1)
+        ai_sgd_chunk_elements_for_workgroup_limit(self.max_compute_workgroups_per_dimension)
     }
 
-    fn create_optimizer_chunks(
+    fn create_sgd_chunks(
         &self,
-        parameter_count: usize,
+        element_count: usize,
+        input_dim: usize,
+        output_dim: usize,
         max_chunk_elements: usize,
         gradient: &wgpu::Buffer,
         weights: &wgpu::Buffer,
         weights_t: &wgpu::Buffer,
     ) -> Result<Vec<AiOptimizerChunk>> {
         let mut chunks = Vec::new();
-        let input_dim = usize_to_u32(parameter_count, "parameter count")?;
+        let input_dim = usize_to_u32(input_dim, "input dimension")?;
+        let output_dim = usize_to_u32(output_dim, "output dimension")?;
         let mut start = 0usize;
-        while start < parameter_count {
-            let element_count = max_chunk_elements.min(parameter_count - start);
+        while start < element_count {
+            let chunk_element_count = max_chunk_elements.min(element_count - start);
             let params = AiSgdParams {
-                element_count: usize_to_u32(element_count, "optimizer chunk element count")?,
+                element_count: usize_to_u32(chunk_element_count, "SGD chunk element count")?,
                 input_dim,
-                output_dim: 1,
-                start_index: usize_to_u32(start, "optimizer chunk start")?,
+                output_dim,
+                start_index: usize_to_u32(start, "SGD chunk start")?,
                 learning_rate: AI_SGD_LEARNING_RATE,
                 _pad1: [0.0; 3],
             };
-            let params_buffer =
-                self.create_uniform_buffer("AI optimizer stress SGD params", &params);
+            let params_buffer = self.create_uniform_buffer("AI SGD chunk params", &params);
             let bind_group =
                 self.create_sgd_bind_group(gradient, weights, weights_t, &params_buffer);
             chunks.push(AiOptimizerChunk {
-                element_count,
+                element_count: chunk_element_count,
                 _params: params_buffer,
                 bind_group,
             });
-            start = start.saturating_add(element_count);
+            start = start.saturating_add(chunk_element_count);
         }
+        debug_assert_eq!(
+            chunks.len(),
+            ai_sgd_chunk_count(element_count, max_chunk_elements)
+        );
         Ok(chunks)
     }
 
@@ -1157,7 +1187,7 @@ impl AiGpuRunner {
         forward_bind_group: &wgpu::BindGroup,
         weight_grad_bind_group: &wgpu::BindGroup,
         input_grad_bind_group: &wgpu::BindGroup,
-        sgd_bind_group: &wgpu::BindGroup,
+        sgd_chunks: &[AiOptimizerChunk],
         batch: usize,
         input: usize,
         output: usize,
@@ -1224,15 +1254,14 @@ impl AiGpuRunner {
                 timestamp_writes: sgd_timestamp_writes,
             });
             pass.set_pipeline(&self.sgd_pipeline);
-            pass.set_bind_group(0, sgd_bind_group, &[]);
-            let parameter_count = input
-                .checked_mul(output)
-                .ok_or_else(|| anyhow!("parameter count overflow"))?;
-            pass.dispatch_workgroups(
-                usize_to_u32(parameter_count, "parameter count")?.div_ceil(256),
-                1,
-                1,
-            );
+            for chunk in sgd_chunks {
+                pass.set_bind_group(0, &chunk.bind_group, &[]);
+                pass.dispatch_workgroups(
+                    usize_to_u32(chunk.element_count, "SGD chunk element count")?.div_ceil(256),
+                    1,
+                    1,
+                );
+            }
         }
         let submission = self.queue.submit([encoder.finish()]);
         self.wait_for_submission(submission, Some(cancel), "waiting for AI training step")
@@ -1631,9 +1660,10 @@ fn validate_ai_linear_dimensions(batch: usize, input: usize, output: usize) -> R
     usize_to_u32(batch, "batch size")?;
     usize_to_u32(input, "input dimension")?;
     usize_to_u32(output, "output dimension")?;
-    input
+    let parameter_count = input
         .checked_mul(output)
         .ok_or_else(|| anyhow!("parameter count overflow"))?;
+    usize_to_u32(parameter_count, "parameter count")?;
     Ok(())
 }
 
@@ -2250,6 +2280,20 @@ fn ai_training_throughput(config: &AiTrainingConfig, measured_steps: usize, elap
         AiTrainingWorkload::OptimizerStress => config.dimensions.parameter_count as f64,
     };
     units_per_step * measured_steps as f64 / elapsed_s.max(f64::MIN_POSITIVE)
+}
+
+fn ai_sgd_chunk_elements_for_workgroup_limit(max_workgroups_per_dimension: u32) -> usize {
+    (max_workgroups_per_dimension.max(1) as usize)
+        .saturating_mul(256)
+        .max(1)
+}
+
+fn ai_sgd_chunk_count(element_count: usize, max_chunk_elements: usize) -> usize {
+    if element_count == 0 {
+        0
+    } else {
+        element_count.div_ceil(max_chunk_elements.max(1))
+    }
 }
 
 fn percentile_sorted_copy(values: &[f64], percentile: f64) -> f64 {

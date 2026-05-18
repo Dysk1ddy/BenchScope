@@ -340,6 +340,16 @@ mod tests {
     }
 
     #[test]
+    fn ai_sgd_chunking_handles_large_linear_boundary() {
+        let max_chunk = ai_sgd_chunk_elements_for_workgroup_limit(65_535);
+        let large_linear_parameters = 4096 * 4096;
+
+        assert_eq!(max_chunk, 16_776_960);
+        assert_eq!(ai_sgd_chunk_count(large_linear_parameters, max_chunk), 2);
+        assert!(max_chunk.div_ceil(256) <= 65_535);
+    }
+
+    #[test]
     fn ai_mlp_flop_accounting_includes_two_training_blocks() {
         let adapter = AdapterInfo {
             index: 0,

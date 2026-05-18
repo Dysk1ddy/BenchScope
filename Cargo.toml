@@ -20,11 +20,16 @@ path = "src/bin/benchscope_sensor_service.rs"
 [dependencies]
 anyhow = "1.0"
 bytemuck = { version = "1.25", features = ["derive"] }
-eframe = { version = "0.34.2", default-features = true }
+eframe = { version = "0.34.2", default-features = false, features = ["accesskit", "default_fonts", "wgpu_no_default_features"] }
 pollster = "0.4"
-wgpu = "29.0.3"
+wgpu = { version = "29.0.3", default-features = false, features = ["dx12", "std", "wgsl"] }
 windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [profile.dev]
 debug = 1
 incremental = true
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

@@ -259,10 +259,9 @@ struct DriveBenchmarkState {
 }
 
 impl DriveBenchmarkState {
-    fn new() -> Self {
+    fn with_drives(drives: Vec<DriveInfo>) -> Self {
         let (tx, rx) = mpsc::channel();
         let target_folder = std::env::temp_dir();
-        let drives = detect_drives();
         let selected_drive = selected_drive_for_path(&drives, &target_folder).unwrap_or(0);
 
         Self {
