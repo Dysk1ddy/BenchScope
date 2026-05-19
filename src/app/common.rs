@@ -156,6 +156,7 @@ impl BenchScopeApp {
             selected_adapter,
             size_text: DEFAULT_SIZES[6].to_string(),
             gpu_intensity: GpuIntensity::Safe,
+            stress_gpu_backend: StressGpuBackend::Optimized,
             validate_output: true,
             estimate_cpu_time: false,
             repeat_mode: RepeatMode::Gpu,

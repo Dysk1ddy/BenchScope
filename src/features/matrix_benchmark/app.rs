@@ -52,6 +52,7 @@ impl BenchScopeApp {
                 size,
                 adapter.clone(),
                 self.gpu_intensity,
+                self.stress_gpu_backend,
                 self.validate_output,
                 self.estimate_cpu_time,
                 self.repeat_mode,
@@ -147,6 +148,7 @@ impl BenchScopeApp {
                 size,
                 adapter.clone(),
                 self.gpu_intensity,
+                self.stress_gpu_backend,
                 self.validate_output,
                 self.estimate_cpu_time,
                 self.repeat_mode,
@@ -162,6 +164,7 @@ impl BenchScopeApp {
             size,
             adapter,
             self.gpu_intensity,
+            self.stress_gpu_backend,
             self.repeat_mode,
             self.repeat_duration,
         );
@@ -172,6 +175,7 @@ impl BenchScopeApp {
         size: usize,
         adapter: AdapterInfo,
         gpu_intensity: GpuIntensity,
+        stress_gpu_backend: StressGpuBackend,
         mode: RepeatMode,
         duration: RepeatDuration,
     ) {
@@ -189,10 +193,11 @@ impl BenchScopeApp {
             .unwrap_or_else(|| "Runs until canceled".to_owned());
         self.status = format!("Running {mode} stress test {}...", duration.run_label());
         self.log(format!(
-            "Starting {mode} stress test {} at {size}x{size} on {} with {} GPU intensity",
+            "Starting {mode} stress test {} at {size}x{size} on {} with {} GPU intensity and {} backend",
             duration.run_label(),
             adapter.label(),
-            gpu_intensity
+            gpu_intensity,
+            stress_gpu_backend
         ));
         thread::spawn(move || {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -201,6 +206,7 @@ impl BenchScopeApp {
                     adapter,
                     mode,
                     gpu_intensity,
+                    stress_gpu_backend,
                     worker_cancel,
                     tx.clone(),
                     duration,
@@ -218,6 +224,7 @@ impl BenchScopeApp {
         size: usize,
         adapter: AdapterInfo,
         gpu_intensity: GpuIntensity,
+        stress_gpu_backend: StressGpuBackend,
         validate_output: bool,
         estimate_cpu_time: bool,
         repeat_mode: RepeatMode,
@@ -233,6 +240,7 @@ impl BenchScopeApp {
             size,
             adapter,
             gpu_intensity,
+            stress_gpu_backend,
             validate_output,
             estimate_cpu_time,
             repeat_mode,
@@ -267,6 +275,7 @@ impl BenchScopeApp {
                 warning.size,
                 warning.adapter,
                 warning.gpu_intensity,
+                warning.stress_gpu_backend,
                 warning.repeat_mode,
                 warning.repeat_duration,
             ),
@@ -359,11 +368,13 @@ impl BenchScopeApp {
                         self.progress = 0.0;
                         self.eta_text = "Runs until canceled".to_owned();
                     }
+                    let rate = format_stress_rate_per_min(progress.iterations, progress.elapsed_s);
                     self.status = format!(
-                        "{} stress: {:.1}s, {} iteration(s), latest {} ms, avg {} ms, compute avg {} ms",
+                        "{} stress: {:.1}s, {} iteration(s), {}, latest {} ms, avg {} ms, compute avg {} ms",
                         progress.mode,
                         progress.elapsed_s,
                         progress.iterations,
+                        rate,
                         format_ms(Some(progress.latest_ms)),
                         format_ms(Some(progress.average_total_ms)),
                         format_ms(progress.average_compute_ms)
@@ -386,15 +397,17 @@ impl BenchScopeApp {
                                 "complete"
                             };
                             self.status = format!(
-                                "Stress test {state}: {} iteration(s), avg {} ms",
+                                "Stress test {state}: {} iteration(s), {}, avg {} ms",
                                 progress.iterations,
+                                format_stress_rate_per_min(progress.iterations, progress.elapsed_s),
                                 format_ms(Some(progress.average_total_ms))
                             );
                             self.log(format!(
-                                "Stress test {state}: mode {}, size {}, iterations {}, avg {} ms, compute avg {} ms",
+                                "Stress test {state}: mode {}, size {}, iterations {}, rate {}, avg {} ms, compute avg {} ms",
                                 progress.mode,
                                 progress.size,
                                 progress.iterations,
+                                format_stress_rate_per_min(progress.iterations, progress.elapsed_s),
                                 format_ms(Some(progress.average_total_ms)),
                                 format_ms(progress.average_compute_ms)
                             ));

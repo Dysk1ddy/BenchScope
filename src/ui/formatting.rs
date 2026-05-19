@@ -126,6 +126,24 @@ fn format_optional_rate(value: Option<f64>) -> String {
     }
 }
 
+fn format_stress_rate_per_min(iterations: u64, elapsed_s: f64) -> String {
+    if elapsed_s <= 0.0 {
+        return "N/A".to_owned();
+    }
+    let rate = iterations as f64 * 60.0 / elapsed_s;
+    if rate >= 1.0e12 {
+        format!("{:.2}T/min", rate / 1.0e12)
+    } else if rate >= 1.0e9 {
+        format!("{:.2}B/min", rate / 1.0e9)
+    } else if rate >= 1.0e6 {
+        format!("{:.2}M/min", rate / 1.0e6)
+    } else if rate >= 1.0e3 {
+        format!("{:.2}K/min", rate / 1.0e3)
+    } else {
+        format!("{rate:.0}/min")
+    }
+}
+
 fn format_drive_speed(result: &DriveBenchmarkResult) -> String {
     if result.test.is_read() {
         format_optional_rate(result.read_mbps)

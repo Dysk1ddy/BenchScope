@@ -267,6 +267,23 @@ mod tests {
     }
 
     #[test]
+    fn stress_gpu_backend_keeps_archived_option() {
+        assert_eq!(StressGpuBackend::Optimized.label(), "Optimized");
+        assert_eq!(StressGpuBackend::ArchivedWgpu.label(), "Archived WGPU");
+        assert!(StressGpuBackend::ALL.contains(&StressGpuBackend::ArchivedWgpu));
+    }
+
+    #[test]
+    fn register_tiny_stress_counts_one_full_4x4_per_lane_round() {
+        assert_eq!(register_tiny_stress_equivalent_iterations(256, 8), 2048);
+    }
+
+    #[test]
+    fn stress_rate_formatter_uses_trillion_units() {
+        assert_eq!(format_stress_rate_per_min(1_700_000_000_000, 60.0), "1.70T/min");
+    }
+
+    #[test]
     fn gpu_intensity_parser_accepts_aliases() {
         assert_eq!(parse_gpu_intensity("safe").unwrap(), GpuIntensity::Safe);
         assert_eq!(parse_gpu_intensity("maximum").unwrap(), GpuIntensity::High);
@@ -708,6 +725,7 @@ mod tests {
             adapter,
             RepeatMode::Cpu,
             GpuIntensity::Safe,
+            StressGpuBackend::Optimized,
             cancel_worker,
             tx,
             RepeatDuration::Infinite,

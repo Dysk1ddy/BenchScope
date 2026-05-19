@@ -38,6 +38,7 @@ struct BenchScopeApp {
     selected_adapter: usize,
     size_text: String,
     gpu_intensity: GpuIntensity,
+    stress_gpu_backend: StressGpuBackend,
     validate_output: bool,
     estimate_cpu_time: bool,
     repeat_mode: RepeatMode,

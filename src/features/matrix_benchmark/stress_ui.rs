@@ -98,6 +98,21 @@ impl BenchScopeApp {
                     );
                 }
 
+                ui.add_space(6.0);
+                ui.label("GPU stress backend");
+                ui.add_enabled_ui(!self.running && self.repeat_mode == RepeatMode::Gpu, |ui| {
+                    ui.horizontal(|ui| {
+                        for backend in StressGpuBackend::ALL {
+                            ui.selectable_value(
+                                &mut self.stress_gpu_backend,
+                                backend,
+                                backend.label(),
+                            );
+                        }
+                    });
+                });
+                ui.small(self.stress_gpu_backend.description());
+
                 if ui.button("Refresh GPUs").clicked() && !self.running {
                     self.adapters = enumerate_adapters();
                     self.selected_adapter = 0;
@@ -206,6 +221,9 @@ impl BenchScopeApp {
                 egui::Layout::top_down(egui::Align::LEFT),
                 |ui| {
                     ui.label(format!("Mode: {}", self.repeat_mode));
+                    if self.repeat_mode == RepeatMode::Gpu {
+                        ui.label(format!("GPU backend: {}", self.stress_gpu_backend));
+                    }
                     ui.label(format!("Duration: {}", self.repeat_duration));
                     if self.repeat_duration.is_infinite() {
                         ui.label("Progress: runs until canceled");

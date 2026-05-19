@@ -19,6 +19,7 @@ struct PendingVramWarning {
     size: usize,
     adapter: AdapterInfo,
     gpu_intensity: GpuIntensity,
+    stress_gpu_backend: StressGpuBackend,
     validate_output: bool,
     estimate_cpu_time: bool,
     repeat_mode: RepeatMode,
@@ -349,6 +350,7 @@ struct GpuRunner {
     pipeline: wgpu::ComputePipeline,
     blocked_pipeline: wgpu::ComputePipeline,
     tiny_stress_pipeline: wgpu::ComputePipeline,
+    register_tiny_stress_pipeline: wgpu::ComputePipeline,
     panel_stress_pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     timestamp_query: bool,
@@ -396,6 +398,11 @@ impl GpuRunner {
             label: Some("Tiny matrix stress shader"),
             source: wgpu::ShaderSource::Wgsl(TINY_STRESS_MATMUL_SHADER.into()),
         });
+        let register_tiny_stress_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Register tiny matrix stress shader"),
+                source: wgpu::ShaderSource::Wgsl(REGISTER_TINY_STRESS_MATMUL_SHADER.into()),
+            });
         let panel_stress_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Panel matrix stress shader"),
             source: wgpu::ShaderSource::Wgsl(PANEL_STRESS_MATMUL_SHADER.into()),
@@ -451,6 +458,15 @@ impl GpuRunner {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
+        let register_tiny_stress_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Register tiny matrix stress compute pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &register_tiny_stress_shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
         let panel_stress_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Panel matrix stress compute pipeline"),
@@ -467,6 +483,7 @@ impl GpuRunner {
             pipeline,
             blocked_pipeline,
             tiny_stress_pipeline,
+            register_tiny_stress_pipeline,
             panel_stress_pipeline,
             bind_group_layout,
             timestamp_query,
@@ -1230,6 +1247,7 @@ impl GpuRunner {
         a: &[f32],
         b: &[f32],
         gpu_intensity: GpuIntensity,
+        stress_gpu_backend: StressGpuBackend,
         cancel: &AtomicBool,
         deadline: &Option<Instant>,
         emit: &mut F,
@@ -1245,6 +1263,18 @@ impl GpuRunner {
         }
         let n_u32 = u32::try_from(n).context("matrix size exceeds GPU shader limits")?;
         let byte_len = buffer_len_bytes(elements)?;
+
+        if n == 4 && stress_gpu_backend == StressGpuBackend::Optimized {
+            return self.repeat_register_tiny_gpu_compute(
+                n_u32,
+                a,
+                b,
+                gpu_intensity,
+                cancel,
+                deadline,
+                emit,
+            );
+        }
 
         if n <= GPU_TINY_STRESS_MAX_SIZE {
             return self.repeat_tiny_gpu_compute(
@@ -1295,6 +1325,141 @@ impl GpuRunner {
             deadline,
             emit,
         )
+    }
+
+    fn repeat_register_tiny_gpu_compute<F>(
+        &self,
+        n_u32: u32,
+        a: &[f32],
+        b: &[f32],
+        gpu_intensity: GpuIntensity,
+        cancel: &AtomicBool,
+        deadline: &Option<Instant>,
+        emit: &mut F,
+    ) -> Result<RepeatProgress>
+    where
+        F: FnMut(u64, f64, f64, f64, u64, bool, bool) -> RepeatProgress,
+    {
+        let a_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Register tiny stress matrix A"),
+                contents: bytemuck::cast_slice(a),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let b_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Register tiny stress matrix B"),
+                contents: bytemuck::cast_slice(b),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let workgroups = gpu_register_tiny_stress_workgroups(gpu_intensity);
+        let scratch_elements = (workgroups as usize)
+            .checked_mul(GPU_TINY_STRESS_LANES_PER_WORKGROUP)
+            .ok_or_else(|| anyhow!("register tiny stress scratch buffer size overflow"))?;
+        let scratch_bytes = buffer_len_bytes(scratch_elements)?;
+        self.ensure_block_buffer_fits("Register tiny stress scratch output", scratch_bytes)?;
+        let scratch_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Register tiny stress scratch output"),
+            size: scratch_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let params = Params {
+            n: n_u32,
+            row_offset: 0,
+            row_count: gpu_register_tiny_stress_rounds(gpu_intensity),
+            _pad2: 0,
+        };
+        let dispatch = self.create_direct_dispatch(
+            &a_buffer,
+            &b_buffer,
+            &scratch_buffer,
+            params,
+            scratch_elements,
+        );
+        let equivalent_iterations =
+            register_tiny_stress_equivalent_iterations(scratch_elements, params.row_count);
+        let max_batch_limit = gpu_register_tiny_stress_batch_limit(gpu_intensity).max(1);
+        let mut batch_limit = max_batch_limit;
+        let mut counters = GpuRepeatCounters::default();
+
+        while repeat_should_continue(deadline, cancel) {
+            if let Err(err) = self.check_gpu_canceled(Some(cancel)) {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                return Err(err);
+            }
+
+            let mut encoder =
+                self.device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Register tiny matrix stress batch encoder"),
+                    });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Register tiny matrix stress batch pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.register_tiny_stress_pipeline);
+                pass.set_bind_group(0, &dispatch.bind_group, &[]);
+                for _ in 0..batch_limit {
+                    pass.dispatch_workgroups(workgroups, 1, 1);
+                }
+            }
+
+            let batch_start = Instant::now();
+            let submission = self.queue.submit([encoder.finish()]);
+            if let Err(err) = self.wait_for_submission(
+                submission,
+                Some(cancel),
+                "waiting for register tiny matrix GPU stress batch",
+            ) {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                return Err(err);
+            }
+
+            let batch_ms = batch_start.elapsed().as_secs_f64() * 1000.0;
+            let completed_iterations =
+                (batch_limit as u64).saturating_mul(equivalent_iterations);
+            counters.record_batch(completed_iterations, batch_ms);
+            if batch_ms > gpu_hard_batch_backoff_ms(gpu_intensity) {
+                batch_limit = (batch_limit / 2).max(1);
+            } else if batch_ms < gpu_target_low_ms(gpu_intensity) && batch_limit < max_batch_limit {
+                batch_limit = (batch_limit * 2).min(max_batch_limit);
+            }
+            emit(
+                counters.iterations,
+                counters.latest_ms,
+                counters.total_ms,
+                counters.total_compute_ms,
+                counters.compute_count,
+                false,
+                false,
+            );
+            if repeat_should_continue(deadline, cancel)
+                && let Err(err) = pause_between_gpu_submissions(gpu_intensity, Some(cancel))
+            {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                return Err(err);
+            }
+        }
+
+        Ok(emit(
+            counters.iterations,
+            counters.latest_ms,
+            counters.total_ms,
+            counters.total_compute_ms,
+            counters.compute_count,
+            cancel.load(Ordering::Relaxed),
+            true,
+        ))
     }
 
     fn repeat_tiny_gpu_compute<F>(
@@ -2555,6 +2720,14 @@ fn gpu_tiny_stress_rounds(size: usize, gpu_intensity: GpuIntensity) -> u32 {
     scaled.clamp(1, u64::from(u32::MAX)) as u32
 }
 
+fn gpu_register_tiny_stress_workgroups(gpu_intensity: GpuIntensity) -> u32 {
+    gpu_tiny_stress_workgroups(gpu_intensity)
+}
+
+fn gpu_register_tiny_stress_rounds(gpu_intensity: GpuIntensity) -> u32 {
+    gpu_tiny_stress_rounds(4, gpu_intensity)
+}
+
 fn gpu_dense_stress_workgroups(gpu_intensity: GpuIntensity) -> u32 {
     match gpu_intensity {
         GpuIntensity::Safe => GPU_SAFE_DENSE_STRESS_WORKGROUPS,
@@ -2610,12 +2783,24 @@ fn tiny_stress_equivalent_iterations(
     equivalent_iterations.min(u64::MAX as u128) as u64
 }
 
+fn register_tiny_stress_equivalent_iterations(
+    scratch_elements: usize,
+    rounds: u32,
+) -> u64 {
+    let equivalent_iterations = (scratch_elements as u128).saturating_mul(rounds as u128);
+    equivalent_iterations.min(u64::MAX as u128) as u64
+}
+
 fn gpu_tiny_stress_batch_limit(gpu_intensity: GpuIntensity) -> usize {
     match gpu_intensity {
         GpuIntensity::Safe => GPU_SAFE_TINY_STRESS_BATCH_DISPATCHES,
         GpuIntensity::Balanced => GPU_BALANCED_TINY_STRESS_BATCH_DISPATCHES,
         GpuIntensity::High => GPU_HIGH_TINY_STRESS_BATCH_DISPATCHES,
     }
+}
+
+fn gpu_register_tiny_stress_batch_limit(_gpu_intensity: GpuIntensity) -> usize {
+    1
 }
 
 fn gpu_submission_pause(gpu_intensity: GpuIntensity) -> Duration {
@@ -3635,6 +3820,7 @@ fn run_repeat(
     adapter: AdapterInfo,
     mode: RepeatMode,
     gpu_intensity: GpuIntensity,
+    stress_gpu_backend: StressGpuBackend,
     cancel: Arc<AtomicBool>,
     tx: Sender<WorkerEvent>,
     duration: RepeatDuration,
@@ -3714,6 +3900,34 @@ fn run_repeat(
             }
         }
         RepeatMode::Gpu => {
+            if size == 4 && stress_gpu_backend == StressGpuBackend::Optimized {
+                let _ = tx.send(WorkerEvent::Log(
+                    "Trying PyTorch CUDA tensor-core equivalent stress backend for 4x4"
+                        .to_owned(),
+                ));
+                match repeat_pytorch_cuda_tiny_matrix_stress(
+                    size,
+                    gpu_intensity,
+                    &cancel,
+                    &deadline,
+                    &mut emit,
+                ) {
+                    Ok(Some(progress)) => {
+                        let _ = tx.send(WorkerEvent::Log(
+                            "4x4 stress used the PyTorch CUDA tensor-core equivalent backend"
+                                .to_owned(),
+                        ));
+                        return Ok(progress);
+                    }
+                    Ok(None) => {
+                        let _ = tx.send(WorkerEvent::Log(
+                            "PyTorch CUDA 4x4 stress backend unavailable; falling back to WGPU register microkernel"
+                                .to_owned(),
+                        ));
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
             if size > GPU_TINY_STRESS_MAX_SIZE {
                 let _ = tx.send(WorkerEvent::Log(format!(
                     "Trying PyTorch CUDA/cuBLAS stress backend for {size}x{size}"
@@ -3748,6 +3962,7 @@ fn run_repeat(
                 &a,
                 &b,
                 gpu_intensity,
+                stress_gpu_backend,
                 &cancel,
                 &deadline,
                 &mut emit,
@@ -3948,7 +4163,234 @@ except Exception as exc:
     emit("NOTE", traceback.format_exc(limit=6))
 "#;
 
+const PYTORCH_CUDA_TINY_MATRIX_STRESS_SCRIPT: &str = r#"
+import argparse
+import math
+import sys
+import time
+import traceback
+
+def clean(value):
+    return str(value).replace("\t", " ").replace("\n", " ")
+
+def emit(key, *values):
+    if values:
+        print(key + "\t" + "\t".join(clean(value) for value in values), flush=True)
+    else:
+        print(key, flush=True)
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--device", type=int, default=0)
+parser.add_argument("--size", type=int, required=True)
+parser.add_argument("--time-limit", type=float, required=True)
+parser.add_argument("--intensity", choices=("safe", "balanced", "high"), default="balanced")
+args = parser.parse_args()
+
+try:
+    import torch
+except Exception as exc:
+    emit("PYTORCH_MATRIX_UNAVAILABLE", type(exc).__name__ + ": " + str(exc))
+    sys.exit(0)
+
+try:
+    emit("TORCH", getattr(torch, "__version__", ""))
+    emit("CUDA", getattr(torch.version, "cuda", "") or "")
+    available = bool(torch.cuda.is_available())
+    emit("CUDA_AVAILABLE", available)
+    count = int(torch.cuda.device_count()) if available else 0
+    emit("DEVICE_COUNT", count)
+    if not available:
+        emit("PYTORCH_MATRIX_UNAVAILABLE", "torch.cuda.is_available() is false")
+        sys.exit(0)
+    if args.device < 0 or args.device >= count:
+        emit("PYTORCH_MATRIX_UNAVAILABLE", "CUDA device {} is not available".format(args.device))
+        sys.exit(0)
+    if args.size != 4:
+        emit("PYTORCH_MATRIX_UNAVAILABLE", "tensor-core equivalent stress currently targets 4x4")
+        sys.exit(0)
+
+    torch.cuda.set_device(args.device)
+    device = torch.device("cuda:{}".format(args.device))
+    props = torch.cuda.get_device_properties(args.device)
+    emit("RESULT_GPU_NAME", props.name)
+    emit("RESULT_DEVICE_INDEX", args.device)
+    emit("PYTORCH_MATRIX_BACKEND", "torch.mm fp16 tensor-core equivalent 4x4")
+
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+    except Exception:
+        pass
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
+    dtype = torch.float16
+    bytes_per_value = 2
+    memory_fraction = {"safe": 0.12, "balanced": 0.22, "high": 0.36}[args.intensity]
+    desired_size = {"safe": 8192, "balanced": 16384, "high": 32768}[args.intensity]
+    min_size = 4096
+
+    def align_down(value, step=1024):
+        return max(step, (int(value) // step) * step)
+
+    memory_limited = align_down(math.sqrt(max(1, int(props.total_memory * memory_fraction)) / (3 * bytes_per_value)))
+    target = align_down(min(desired_size, memory_limited))
+    candidates = []
+    while target >= min_size:
+        candidates.append(target)
+        next_target = align_down(target * 3 // 4)
+        if next_target >= target:
+            next_target = target - 1024
+        target = next_target
+    if not candidates:
+        candidates.append(min_size)
+
+    a = b = c = None
+    last_error = None
+    effective_size = None
+    for candidate in candidates:
+        try:
+            torch.cuda.empty_cache()
+            a = torch.randn((candidate, candidate), device=device, dtype=dtype)
+            b = torch.randn((candidate, candidate), device=device, dtype=dtype)
+            c = torch.empty((candidate, candidate), device=device, dtype=dtype)
+            torch.mm(a, b, out=c)
+            torch.cuda.synchronize()
+            effective_size = candidate
+            break
+        except Exception as exc:
+            last_error = exc
+            message = str(exc).lower()
+            if "out of memory" in message or "cuda error" in message:
+                a = b = c = None
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                continue
+            raise
+
+    if a is None or b is None or c is None or effective_size is None:
+        emit("ERROR", "could not allocate CUDA tensor-core stress matrices: " + str(last_error))
+        sys.exit(0)
+
+    equivalent_per_mm = max(1, (effective_size ** 3) // (args.size ** 3))
+    emit("RESULT_EFFECTIVE_SIZE", effective_size)
+    emit("RESULT_DTYPE", "float16")
+    emit("RESULT_EQUIVALENT_4X4_PER_MM", equivalent_per_mm)
+    if effective_size != desired_size:
+        emit("NOTE", "using {}x{} tensor-core GEMM for equivalent 4x4 accounting".format(effective_size, effective_size))
+
+    warmups = {"safe": 1, "balanced": 2, "high": 3}[args.intensity]
+    for _ in range(warmups):
+        torch.mm(a, b, out=c)
+    torch.cuda.synchronize()
+    try:
+        torch.cuda.reset_peak_memory_stats(device)
+    except Exception:
+        pass
+
+    inner_batch = 1
+    if effective_size <= 8192:
+        inner_batch = {"safe": 2, "balanced": 4, "high": 8}[args.intensity]
+    elif effective_size <= 16384:
+        inner_batch = {"safe": 1, "balanced": 2, "high": 4}[args.intensity]
+    emit("RESULT_INNER_BATCH", inner_batch)
+
+    iterations = 0
+    total_wall_ms = 0.0
+    total_gpu_ms = 0.0
+    end_at = time.perf_counter() + max(args.time_limit, 0.1)
+
+    while True:
+        if iterations > 0 and time.perf_counter() >= end_at:
+            break
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        wall_start = time.perf_counter()
+        start_event.record()
+        for _ in range(inner_batch):
+            torch.mm(a, b, out=c)
+        end_event.record()
+        torch.cuda.synchronize()
+        wall_ms = (time.perf_counter() - wall_start) * 1000.0
+        gpu_ms = float(start_event.elapsed_time(end_event))
+        completed = equivalent_per_mm * inner_batch
+        iterations += completed
+        total_wall_ms += wall_ms
+        total_gpu_ms += gpu_ms
+        emit(
+            "PROGRESS",
+            iterations,
+            "{:.12f}".format(wall_ms / max(completed, 1)),
+            "{:.6f}".format(total_wall_ms),
+            "{:.6f}".format(total_gpu_ms),
+            iterations,
+        )
+
+    try:
+        peak_allocated = int(torch.cuda.max_memory_allocated(device))
+        peak_reserved = int(torch.cuda.max_memory_reserved(device))
+        emit("RESULT_PEAK_ALLOCATED_BYTES", peak_allocated)
+        emit("RESULT_PEAK_RESERVED_BYTES", peak_reserved)
+    except Exception:
+        pass
+    emit(
+        "DONE",
+        iterations,
+        "{:.12f}".format(total_wall_ms / max(iterations, 1)),
+        "{:.6f}".format(total_wall_ms),
+        "{:.6f}".format(total_gpu_ms),
+        iterations,
+    )
+except Exception as exc:
+    emit("ERROR", type(exc).__name__ + ": " + str(exc))
+    emit("NOTE", traceback.format_exc(limit=6))
+"#;
+
 fn repeat_pytorch_cuda_matrix_stress<F>(
+    size: usize,
+    gpu_intensity: GpuIntensity,
+    cancel: &AtomicBool,
+    deadline: &Option<Instant>,
+    emit: &mut F,
+) -> Result<Option<RepeatProgress>>
+where
+    F: FnMut(u64, f64, f64, f64, u64, bool, bool) -> RepeatProgress,
+{
+    repeat_pytorch_cuda_matrix_stress_script(
+        PYTORCH_CUDA_MATRIX_STRESS_SCRIPT,
+        size,
+        gpu_intensity,
+        cancel,
+        deadline,
+        emit,
+    )
+}
+
+fn repeat_pytorch_cuda_tiny_matrix_stress<F>(
+    size: usize,
+    gpu_intensity: GpuIntensity,
+    cancel: &AtomicBool,
+    deadline: &Option<Instant>,
+    emit: &mut F,
+) -> Result<Option<RepeatProgress>>
+where
+    F: FnMut(u64, f64, f64, f64, u64, bool, bool) -> RepeatProgress,
+{
+    repeat_pytorch_cuda_matrix_stress_script(
+        PYTORCH_CUDA_TINY_MATRIX_STRESS_SCRIPT,
+        size,
+        gpu_intensity,
+        cancel,
+        deadline,
+        emit,
+    )
+}
+
+fn repeat_pytorch_cuda_matrix_stress_script<F>(
+    script: &str,
     size: usize,
     gpu_intensity: GpuIntensity,
     cancel: &AtomicBool,
@@ -3971,7 +4413,7 @@ where
     let mut command = Command::new(python);
     command
         .arg("-c")
-        .arg(PYTORCH_CUDA_MATRIX_STRESS_SCRIPT)
+        .arg(script)
         .arg("--device")
         .arg("0")
         .arg("--size")

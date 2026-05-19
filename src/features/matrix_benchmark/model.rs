@@ -102,6 +102,44 @@ struct RepeatProgress {
     average_compute_ms: Option<f64>,
     canceled: bool,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StressGpuBackend {
+    Optimized,
+    ArchivedWgpu,
+}
+
+impl StressGpuBackend {
+    const ALL: [StressGpuBackend; 2] = [
+        StressGpuBackend::Optimized,
+        StressGpuBackend::ArchivedWgpu,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            StressGpuBackend::Optimized => "Optimized",
+            StressGpuBackend::ArchivedWgpu => "Archived WGPU",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            StressGpuBackend::Optimized => {
+                "For 4x4, uses CUDA tensor-core equivalent work when available, otherwise a register-heavy WGPU microkernel."
+            }
+            StressGpuBackend::ArchivedWgpu => {
+                "Keeps the previous tiny-matrix WGPU stress shader for comparison."
+            }
+        }
+    }
+}
+
+impl fmt::Display for StressGpuBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RepeatMode {
     Gpu,
