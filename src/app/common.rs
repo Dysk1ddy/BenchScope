@@ -323,7 +323,7 @@ impl BenchScopeApp {
 
         egui::Window::new("Sensors")
             .id(egui::Id::new("sensor_metrics_window"))
-            .default_pos(sensor_window_default_pos(ctx))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-14.0, -14.0))
             .default_size(egui::vec2(
                 SENSOR_WINDOW_DEFAULT_WIDTH,
                 SENSOR_WINDOW_DEFAULT_HEIGHT,
@@ -371,12 +371,4 @@ fn sensor_minimized_label(rows: &[(&str, Option<&SensorReading>)]) -> String {
     } else {
         format!("Sensors: {labels}")
     }
-}
-
-fn sensor_window_default_pos(ctx: &egui::Context) -> egui::Pos2 {
-    let rect = ctx.content_rect();
-    egui::pos2(
-        (rect.right() - SENSOR_WINDOW_DEFAULT_WIDTH).max(rect.left()),
-        (rect.bottom() - SENSOR_WINDOW_DEFAULT_HEIGHT).max(rect.top()),
-    )
 }

@@ -4,6 +4,7 @@ enum WorkerEvent {
     SingleDone(Result<BenchmarkResult, String>),
     RepeatProgress(RepeatProgress),
     RepeatDone(Result<RepeatProgress, String>),
+    Log(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +81,29 @@ impl GpuRepeatCounters {
         self.compute_count += completed_iterations;
         self.current_iteration_ms = 0.0;
     }
+}
+
+#[derive(Default)]
+struct PyTorchMatrixStressState {
+    cuda_available: Option<bool>,
+    unavailable_reason: Option<String>,
+    error: Option<String>,
+    gpu_name: Option<String>,
+    effective_size: Option<usize>,
+    iterations: u64,
+    latest_ms: f64,
+    total_ms: f64,
+    total_compute_ms: f64,
+    compute_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PyTorchMatrixStressProgressSample {
+    iterations: u64,
+    latest_ms: f64,
+    total_ms: f64,
+    total_compute_ms: f64,
+    compute_count: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -3511,6 +3535,11 @@ fn run_single_cancelable(
     let mut progress = SingleProgressTracker::new(size, &adapter, gpu_intensity, progress_tx);
     let cpu_info = detect_cpu_info();
     progress.set_phase("Generating matrices", true);
+    ensure_matrix_host_memory_available(
+        size,
+        if estimate_cpu_time { 3 } else { 4 },
+        "matrix benchmark",
+    )?;
     let (a, b) = generate_matrices_cancelable(size, Some(cancel))?;
     let (cpu_output, cpu_ms, cpu_estimated) = if estimate_cpu_time {
         let cpu_ms =
@@ -3610,7 +3639,6 @@ fn run_repeat(
     tx: Sender<WorkerEvent>,
     duration: RepeatDuration,
 ) -> Result<RepeatProgress> {
-    let (a, b) = generate_matrices_cancelable(size, Some(&cancel))?;
     let started = Instant::now();
     let deadline = duration.duration().map(|duration| started + duration);
     let duration_s = duration.seconds();
@@ -3621,13 +3649,14 @@ fn run_repeat(
     let mut latest_ms = 0.0;
     let mut last_emit = Instant::now() - Duration::from_secs(1);
 
-    let mut emit = |iterations: u64,
-                    latest_ms: f64,
-                    total_ms: f64,
-                    total_compute_ms: f64,
-                    compute_count: u64,
-                    canceled: bool,
-                    force: bool| {
+    let progress_tx = tx.clone();
+    let mut emit = move |iterations: u64,
+                         latest_ms: f64,
+                         total_ms: f64,
+                         total_compute_ms: f64,
+                         compute_count: u64,
+                         canceled: bool,
+                         force: bool| {
         let now = Instant::now();
         let elapsed_s = match duration_s {
             Some(duration_s) => (now - started).as_secs_f64().min(duration_s),
@@ -3653,7 +3682,7 @@ fn run_repeat(
             canceled,
         };
         if force || now.duration_since(last_emit) >= Duration::from_millis(PROGRESS_SAMPLE_MS) {
-            let _ = tx.send(WorkerEvent::RepeatProgress(progress.clone()));
+            let _ = progress_tx.send(WorkerEvent::RepeatProgress(progress.clone()));
             last_emit = now;
         }
         progress
@@ -3661,6 +3690,8 @@ fn run_repeat(
 
     match mode {
         RepeatMode::Cpu => {
+            ensure_matrix_host_memory_available(size, 3, "CPU matrix stress test")?;
+            let (a, b) = generate_matrices_cancelable(size, Some(&cancel))?;
             while repeat_should_continue(&deadline, &cancel) {
                 let (_, elapsed_ms) =
                     match cpu_multiply_cancelable(size, &a, &b, Some(&cancel), None) {
@@ -3683,6 +3714,34 @@ fn run_repeat(
             }
         }
         RepeatMode::Gpu => {
+            if size > GPU_TINY_STRESS_MAX_SIZE {
+                let _ = tx.send(WorkerEvent::Log(format!(
+                    "Trying PyTorch CUDA/cuBLAS stress backend for {size}x{size}"
+                )));
+                match repeat_pytorch_cuda_matrix_stress(
+                    size,
+                    gpu_intensity,
+                    &cancel,
+                    &deadline,
+                    &mut emit,
+                ) {
+                    Ok(Some(progress)) => {
+                        let _ = tx.send(WorkerEvent::Log(
+                            "Large matrix stress used the PyTorch CUDA/cuBLAS backend".to_owned(),
+                        ));
+                        return Ok(progress);
+                    }
+                    Ok(None) => {
+                        let _ = tx.send(WorkerEvent::Log(
+                            "PyTorch CUDA stress backend unavailable; falling back to WGPU"
+                                .to_owned(),
+                        ));
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            ensure_matrix_host_memory_available(size, 3, "WGPU GPU matrix stress fallback")?;
+            let (a, b) = generate_matrices_cancelable(size, Some(&cancel))?;
             let runner = GpuRunner::new(adapter.index)?;
             return runner.repeat_gpu_compute(
                 size,
@@ -3705,6 +3764,480 @@ fn run_repeat(
         cancel.load(Ordering::Relaxed),
         true,
     ))
+}
+
+const PYTORCH_CUDA_MATRIX_STRESS_SCRIPT: &str = r#"
+import argparse
+import sys
+import time
+import traceback
+
+def clean(value):
+    return str(value).replace("\t", " ").replace("\n", " ")
+
+def emit(key, *values):
+    if values:
+        print(key + "\t" + "\t".join(clean(value) for value in values), flush=True)
+    else:
+        print(key, flush=True)
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--device", type=int, default=0)
+parser.add_argument("--size", type=int, required=True)
+parser.add_argument("--time-limit", type=float, required=True)
+parser.add_argument("--intensity", choices=("safe", "balanced", "high"), default="balanced")
+args = parser.parse_args()
+
+try:
+    import torch
+except Exception as exc:
+    emit("PYTORCH_MATRIX_UNAVAILABLE", type(exc).__name__ + ": " + str(exc))
+    sys.exit(0)
+
+try:
+    emit("TORCH", getattr(torch, "__version__", ""))
+    emit("CUDA", getattr(torch.version, "cuda", "") or "")
+    available = bool(torch.cuda.is_available())
+    emit("CUDA_AVAILABLE", available)
+    count = int(torch.cuda.device_count()) if available else 0
+    emit("DEVICE_COUNT", count)
+    if not available:
+        emit("PYTORCH_MATRIX_UNAVAILABLE", "torch.cuda.is_available() is false")
+        sys.exit(0)
+    if args.device < 0 or args.device >= count:
+        emit("PYTORCH_MATRIX_UNAVAILABLE", "CUDA device {} is not available".format(args.device))
+        sys.exit(0)
+    if args.size <= 0:
+        emit("ERROR", "matrix size must be positive")
+        sys.exit(0)
+
+    torch.cuda.set_device(args.device)
+    device = torch.device("cuda:{}".format(args.device))
+    props = torch.cuda.get_device_properties(args.device)
+    emit("RESULT_GPU_NAME", props.name)
+    emit("RESULT_DEVICE_INDEX", args.device)
+    emit("PYTORCH_MATRIX_BACKEND", "torch.mm fp16 CUDA")
+
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+    except Exception:
+        pass
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
+    dtype = torch.float16
+    bytes_per_value = 2
+    memory_fraction = {"safe": 0.58, "balanced": 0.72, "high": 0.84}[args.intensity]
+    min_size = min(args.size, 2048)
+
+    def align_down(value, step=256):
+        return max(step, (int(value) // step) * step)
+
+    candidates = []
+    target = align_down(args.size)
+    while target >= min_size:
+        required = target * target * bytes_per_value * 3
+        if required <= int(props.total_memory * memory_fraction):
+            candidates.append(target)
+        next_target = align_down(target * 3 // 4)
+        if next_target >= target:
+            next_target = target - 256
+        target = next_target
+    if not candidates:
+        candidates.append(align_down(min_size))
+
+    a = b = c = None
+    last_error = None
+    effective_size = None
+    for candidate in candidates:
+        try:
+            torch.cuda.empty_cache()
+            a = torch.randn((candidate, candidate), device=device, dtype=dtype)
+            b = torch.randn((candidate, candidate), device=device, dtype=dtype)
+            c = torch.empty((candidate, candidate), device=device, dtype=dtype)
+            torch.mm(a, b, out=c)
+            torch.cuda.synchronize()
+            effective_size = candidate
+            break
+        except Exception as exc:
+            last_error = exc
+            message = str(exc).lower()
+            if "out of memory" in message or "cuda error" in message:
+                a = b = c = None
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                continue
+            raise
+
+    if a is None or b is None or c is None or effective_size is None:
+        emit("ERROR", "could not allocate CUDA stress matrices: " + str(last_error))
+        sys.exit(0)
+
+    emit("RESULT_EFFECTIVE_SIZE", effective_size)
+    emit("RESULT_DTYPE", "float16")
+    if effective_size != args.size:
+        emit("NOTE", "reduced CUDA stress matrix to {}x{} to stay within memory limits".format(effective_size, effective_size))
+
+    warmups = {"safe": 1, "balanced": 2, "high": 3}[args.intensity]
+    for _ in range(warmups):
+        torch.mm(a, b, out=c)
+    torch.cuda.synchronize()
+    try:
+        torch.cuda.reset_peak_memory_stats(device)
+    except Exception:
+        pass
+    if effective_size < 4096:
+        inner_batch = {"safe": 8, "balanced": 16, "high": 32}[args.intensity]
+    elif effective_size < 8192:
+        inner_batch = {"safe": 4, "balanced": 8, "high": 16}[args.intensity]
+    else:
+        inner_batch = 1
+    emit("RESULT_INNER_BATCH", inner_batch)
+
+    iterations = 0
+    total_wall_ms = 0.0
+    total_gpu_ms = 0.0
+    end_at = time.perf_counter() + max(args.time_limit, 0.1)
+
+    while True:
+        if iterations > 0 and time.perf_counter() >= end_at:
+            break
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        wall_start = time.perf_counter()
+        start_event.record()
+        for _ in range(inner_batch):
+            torch.mm(a, b, out=c)
+        end_event.record()
+        torch.cuda.synchronize()
+        wall_ms = (time.perf_counter() - wall_start) * 1000.0
+        gpu_ms = float(start_event.elapsed_time(end_event))
+        iterations += inner_batch
+        total_wall_ms += wall_ms
+        total_gpu_ms += gpu_ms
+        emit(
+            "PROGRESS",
+            iterations,
+            "{:.6f}".format(wall_ms / max(inner_batch, 1)),
+            "{:.6f}".format(total_wall_ms),
+            "{:.6f}".format(total_gpu_ms),
+            iterations,
+        )
+
+    try:
+        peak_allocated = int(torch.cuda.max_memory_allocated(device))
+        peak_reserved = int(torch.cuda.max_memory_reserved(device))
+        emit("RESULT_PEAK_ALLOCATED_BYTES", peak_allocated)
+        emit("RESULT_PEAK_RESERVED_BYTES", peak_reserved)
+    except Exception:
+        pass
+    emit(
+        "DONE",
+        iterations,
+        "{:.6f}".format(total_wall_ms / max(iterations, 1)),
+        "{:.6f}".format(total_wall_ms),
+        "{:.6f}".format(total_gpu_ms),
+        iterations,
+    )
+except Exception as exc:
+    emit("ERROR", type(exc).__name__ + ": " + str(exc))
+    emit("NOTE", traceback.format_exc(limit=6))
+"#;
+
+fn repeat_pytorch_cuda_matrix_stress<F>(
+    size: usize,
+    gpu_intensity: GpuIntensity,
+    cancel: &AtomicBool,
+    deadline: &Option<Instant>,
+    emit: &mut F,
+) -> Result<Option<RepeatProgress>>
+where
+    F: FnMut(u64, f64, f64, f64, u64, bool, bool) -> RepeatProgress,
+{
+    let python = default_pytorch_python_executable();
+    let python = python.trim();
+    if python.is_empty() {
+        return Ok(None);
+    }
+
+    let time_limit_s = deadline
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()).as_secs_f64())
+        .unwrap_or(86_400.0)
+        .max(0.1);
+    let mut command = Command::new(python);
+    command
+        .arg("-c")
+        .arg(PYTORCH_CUDA_MATRIX_STRESS_SCRIPT)
+        .arg("--device")
+        .arg("0")
+        .arg("--size")
+        .arg(size.to_string())
+        .arg("--time-limit")
+        .arg(format!("{time_limit_s:.3}"))
+        .arg("--intensity")
+        .arg(pytorch_matrix_stress_intensity_arg(gpu_intensity))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW_RAW);
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return Ok(None),
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(None);
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(None);
+    };
+
+    let (line_tx, line_rx) = mpsc::channel::<String>();
+    let stdout_thread = thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if line_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let stderr_thread = thread::spawn(move || {
+        let mut text = String::new();
+        let mut reader = BufReader::new(stderr);
+        let _ = reader.read_to_string(&mut text);
+        text
+    });
+
+    let mut state = PyTorchMatrixStressState::default();
+    let startup_timeout_at = Instant::now() + Duration::from_secs(60);
+    let deadline_timeout_at = deadline.map(|deadline| deadline + Duration::from_secs(180));
+    let mut canceled = false;
+    let mut timed_out = false;
+    let status = loop {
+        drain_pytorch_matrix_stress_lines(&line_rx, &mut state, emit);
+        if cancel.load(Ordering::Relaxed) {
+            canceled = true;
+            let _ = child.kill();
+            break child
+                .wait()
+                .with_context(|| format!("failed to wait for PyTorch CUDA worker {python}"))?;
+        }
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("failed to query PyTorch CUDA worker {python}"))?
+        {
+            break status;
+        }
+
+        let now = Instant::now();
+        if state.cuda_available.is_none() && state.iterations == 0 && now >= startup_timeout_at {
+            timed_out = true;
+            let _ = child.kill();
+            break child
+                .wait()
+                .with_context(|| format!("failed to wait for PyTorch CUDA worker {python}"))?;
+        }
+        if let Some(timeout_at) = deadline_timeout_at
+            && now >= timeout_at
+        {
+            timed_out = true;
+            let _ = child.kill();
+            break child
+                .wait()
+                .with_context(|| format!("failed to wait for PyTorch CUDA worker {python}"))?;
+        }
+
+        thread::sleep(Duration::from_millis(25));
+    };
+    let _ = stdout_thread.join();
+    drain_pytorch_matrix_stress_lines(&line_rx, &mut state, emit);
+    let stderr = stderr_thread.join().unwrap_or_default();
+
+    if canceled {
+        return Ok(Some(emit(
+            state.iterations,
+            state.latest_ms,
+            state.total_ms,
+            state.total_compute_ms,
+            state.compute_count,
+            true,
+            true,
+        )));
+    }
+    if timed_out && state.iterations == 0 {
+        return Ok(None);
+    }
+    if !status.success() {
+        if state.iterations == 0 {
+            return Ok(None);
+        }
+        return Err(anyhow!(
+            "PyTorch CUDA matrix stress worker failed{}",
+            if stderr.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr.trim())
+            }
+        ));
+    }
+    if let Some(error) = state.error.as_deref() {
+        if state.iterations == 0 {
+            return Ok(None);
+        }
+        return Err(anyhow!("PyTorch CUDA matrix stress failed: {error}"));
+    }
+    if state.cuda_available == Some(false) || state.unavailable_reason.is_some() {
+        return Ok(None);
+    }
+    if state.iterations == 0 && state.cuda_available != Some(true) {
+        return Ok(None);
+    }
+
+    Ok(Some(emit(
+        state.iterations,
+        state.latest_ms,
+        state.total_ms,
+        state.total_compute_ms,
+        state.compute_count,
+        false,
+        true,
+    )))
+}
+
+fn drain_pytorch_matrix_stress_lines<F>(
+    line_rx: &Receiver<String>,
+    state: &mut PyTorchMatrixStressState,
+    emit: &mut F,
+) where
+    F: FnMut(u64, f64, f64, f64, u64, bool, bool) -> RepeatProgress,
+{
+    while let Ok(line) = line_rx.try_recv() {
+        record_pytorch_matrix_stress_line(&line, state, emit);
+    }
+}
+
+fn record_pytorch_matrix_stress_line<F>(
+    line: &str,
+    state: &mut PyTorchMatrixStressState,
+    emit: &mut F,
+) where
+    F: FnMut(u64, f64, f64, f64, u64, bool, bool) -> RepeatProgress,
+{
+    let mut parts = line.split('\t');
+    let key = parts.next().unwrap_or_default();
+    let values = parts.collect::<Vec<_>>();
+    match key {
+        "CUDA_AVAILABLE" => {
+            state.cuda_available = values.first().copied().map(parse_probe_bool);
+        }
+        "PYTORCH_MATRIX_UNAVAILABLE" => {
+            let reason = values.join(" ");
+            if !reason.trim().is_empty() {
+                state.unavailable_reason = Some(reason);
+            }
+        }
+        "ERROR" => {
+            let error = values.join(" ");
+            if !error.trim().is_empty() {
+                state.error = Some(error);
+            }
+        }
+        "RESULT_GPU_NAME" => {
+            let name = values.join(" ");
+            if !name.trim().is_empty() {
+                state.gpu_name = Some(name);
+            }
+        }
+        "RESULT_EFFECTIVE_SIZE" => {
+            state.effective_size = values.first().and_then(|value| value.parse().ok());
+        }
+        "PROGRESS" => {
+            if let Some(sample) = parse_pytorch_matrix_stress_progress_line(line) {
+                state.iterations = sample.iterations;
+                state.latest_ms = sample.latest_ms;
+                state.total_ms = sample.total_ms;
+                state.total_compute_ms = sample.total_compute_ms;
+                state.compute_count = sample.compute_count;
+                emit(
+                    state.iterations,
+                    state.latest_ms,
+                    state.total_ms,
+                    state.total_compute_ms,
+                    state.compute_count,
+                    false,
+                    false,
+                );
+            }
+        }
+        "DONE" => {
+            if let Some(sample) = parse_pytorch_matrix_stress_progress_line(line) {
+                state.iterations = sample.iterations;
+                state.latest_ms = sample.latest_ms;
+                state.total_ms = sample.total_ms;
+                state.total_compute_ms = sample.total_compute_ms;
+                state.compute_count = sample.compute_count;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_pytorch_matrix_stress_progress_line(
+    line: &str,
+) -> Option<PyTorchMatrixStressProgressSample> {
+    let mut parts = line.split('\t');
+    let key = parts.next()?;
+    if key != "PROGRESS" && key != "DONE" {
+        return None;
+    }
+    Some(PyTorchMatrixStressProgressSample {
+        iterations: parts.next()?.parse().ok()?,
+        latest_ms: parts.next()?.parse().ok()?,
+        total_ms: parts.next()?.parse().ok()?,
+        total_compute_ms: parts.next()?.parse().ok()?,
+        compute_count: parts.next()?.parse().ok()?,
+    })
+}
+
+fn pytorch_matrix_stress_intensity_arg(gpu_intensity: GpuIntensity) -> &'static str {
+    match gpu_intensity {
+        GpuIntensity::Safe => "safe",
+        GpuIntensity::Balanced => "balanced",
+        GpuIntensity::High => "high",
+    }
+}
+
+fn ensure_matrix_host_memory_available(
+    size: usize,
+    matrix_count: u64,
+    workload: &str,
+) -> Result<()> {
+    let required = matrix_buffers_bytes(size, matrix_count)
+        .ok_or_else(|| anyhow!("matrix memory estimate overflow"))?;
+    let Ok(info) = detect_ram_memory_info() else {
+        return Ok(());
+    };
+    let safe_available = info
+        .available_physical_bytes
+        .saturating_sub(RAM_OS_HEADROOM_BYTES);
+    if safe_available > 0 && required > safe_available {
+        return Err(anyhow!(
+            "{workload} needs about {} of system memory for {size}x{size}; safely available memory is {}",
+            format_bytes(required),
+            format_bytes(safe_available)
+        ));
+    }
+    Ok(())
 }
 
 fn repeat_should_continue(deadline: &Option<Instant>, cancel: &AtomicBool) -> bool {

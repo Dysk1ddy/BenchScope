@@ -8,8 +8,11 @@ impl BenchScopeApp {
         if size == 0 {
             return Err(anyhow!("matrix size must be positive"));
         }
-        if size > 16384 {
-            return Err(anyhow!("matrix size is capped at 16384 for this version"));
+        let max_size = DEFAULT_SIZES.last().copied().unwrap_or(32_768);
+        if size > max_size {
+            return Err(anyhow!(
+                "matrix size is capped at {max_size} for this version"
+            ));
         }
         Ok(size)
     }
@@ -403,6 +406,7 @@ impl BenchScopeApp {
                         }
                     }
                 }
+                WorkerEvent::Log(message) => self.log(message),
             }
         }
     }

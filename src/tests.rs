@@ -201,6 +201,12 @@ mod tests {
     #[test]
     fn gpu_working_set_counts_four_matrices() {
         assert_eq!(gpu_working_set_bytes(16_384), Some(4 * 1024 * 1024 * 1024));
+        assert_eq!(gpu_working_set_bytes(32_768), Some(16 * 1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn default_matrix_sizes_include_32768() {
+        assert!(DEFAULT_SIZES.contains(&32_768));
     }
 
     #[test]
@@ -539,6 +545,21 @@ mod tests {
         );
         assert!(!benchmark.time_limited);
         assert_eq!(benchmark.environment.notes, vec!["benchmark note".to_owned()]);
+    }
+
+    #[test]
+    fn pytorch_matrix_stress_progress_parser_reads_progress_lines() {
+        let progress = parse_pytorch_matrix_stress_progress_line(
+            "PROGRESS\t3\t12.500000\t40.000000\t38.000000\t3",
+        )
+        .unwrap();
+
+        assert_eq!(progress.iterations, 3);
+        assert_eq!(progress.latest_ms, 12.5);
+        assert_eq!(progress.total_ms, 40.0);
+        assert_eq!(progress.total_compute_ms, 38.0);
+        assert_eq!(progress.compute_count, 3);
+        assert!(parse_pytorch_matrix_stress_progress_line("NOTE\tignored").is_none());
     }
 
     #[test]
