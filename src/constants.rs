@@ -3,7 +3,7 @@ const DEFAULT_SIZES: &[usize] = &[
 ];
 const TILE_SIZE: u32 = 16;
 const GPU_SHADER_COLS_PER_THREAD: u32 = 4;
-const GPU_TINY_STRESS_MAX_SIZE: usize = 16;
+const GPU_TINY_STRESS_MAX_SIZE: usize = 1024;
 const GPU_TINY_STRESS_LANES_PER_WORKGROUP: usize = (TILE_SIZE as usize) * (TILE_SIZE as usize);
 const CANCEL_CHECK_INTERVAL: usize = 1_048_576;
 const PROGRESS_SAMPLE_MS: u64 = 200;

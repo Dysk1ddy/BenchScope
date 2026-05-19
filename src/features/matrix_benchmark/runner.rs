@@ -1228,6 +1228,8 @@ impl GpuRunner {
             params,
             scratch_elements,
         );
+        let equivalent_iterations =
+            tiny_stress_equivalent_iterations(scratch_elements, n, params.row_count);
         let max_batch_limit = gpu_tiny_stress_batch_limit(gpu_intensity).max(1);
         let mut batch_limit = max_batch_limit;
         let mut counters = GpuRepeatCounters::default();
@@ -1271,7 +1273,9 @@ impl GpuRunner {
             }
 
             let batch_ms = batch_start.elapsed().as_secs_f64() * 1000.0;
-            counters.record_batch(batch_limit as u64, batch_ms);
+            let completed_iterations =
+                (batch_limit as u64).saturating_mul(equivalent_iterations);
+            counters.record_batch(completed_iterations, batch_ms);
             if batch_ms > gpu_hard_batch_backoff_ms(gpu_intensity) {
                 batch_limit = (batch_limit / 2).max(1);
             } else if batch_ms < gpu_target_low_ms(gpu_intensity) && batch_limit < max_batch_limit {
@@ -1343,122 +1347,17 @@ impl GpuRunner {
             mapped_at_creation: false,
         });
 
-        let chunk_rows = gpu_dispatch_chunk_rows(n, gpu_intensity);
-        if n <= chunk_rows {
-            return self.repeat_direct_full_gpu_compute(
-                n,
-                n_u32,
-                &a_buffer,
-                &b_buffer,
-                &c_buffer,
-                gpu_intensity,
-                cancel,
-                deadline,
-                emit,
-            );
-        }
-
-        let min_chunk_rows = gpu_min_dispatch_rows(gpu_intensity).min(chunk_rows).max(1);
-        let mut governor = GpuWorkGovernor::new(chunk_rows, min_chunk_rows, n, gpu_intensity);
-        let mut counters = GpuRepeatCounters::default();
-        let mut row_offset = 0usize;
-
-        while repeat_should_continue(deadline, cancel) {
-            if let Err(err) = self.check_gpu_canceled(Some(cancel)) {
-                if cancel.load(Ordering::Relaxed) {
-                    break;
-                }
-                return Err(err);
-            }
-            let mut dispatches = Vec::new();
-            let mut completed_iterations = 0u64;
-            let batch_limit = gpu_repeat_batch_limit(n, gpu_intensity);
-            while repeat_should_continue(deadline, cancel) && dispatches.len() < batch_limit {
-                let rows = governor.row_extent(n - row_offset);
-                let params = Params {
-                    n: n_u32,
-                    row_offset: row_offset as u32,
-                    row_count: rows as u32,
-                    _pad2: 0,
-                };
-                dispatches.push(self.create_direct_dispatch(
-                    &a_buffer, &b_buffer, &c_buffer, params, rows,
-                ));
-                row_offset += rows;
-                if row_offset >= n {
-                    row_offset = 0;
-                    completed_iterations += 1;
-                }
-            }
-            if dispatches.is_empty() {
-                break;
-            }
-
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Matrix stress direct batch encoder"),
-                });
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Matrix stress direct batch pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pipeline);
-                for dispatch in &dispatches {
-                    pass.set_bind_group(0, &dispatch.bind_group, &[]);
-                    pass.dispatch_workgroups(
-                        gpu_column_workgroups(n_u32),
-                        (dispatch.rows as u32).div_ceil(TILE_SIZE),
-                        1,
-                    );
-                }
-            }
-
-            let dispatch_count = dispatches.len().max(1);
-            let batch_start = Instant::now();
-            let submission = self.queue.submit([encoder.finish()]);
-            if let Err(err) =
-                self.wait_for_submission(submission, Some(cancel), "waiting for GPU stress batch")
-            {
-                if cancel.load(Ordering::Relaxed) {
-                    break;
-                }
-                return Err(err);
-            }
-            let batch_ms = batch_start.elapsed().as_secs_f64() * 1000.0;
-            let observed_ms = batch_ms / dispatch_count as f64;
-            governor.record_dispatch(observed_ms);
-            governor.record_batch(batch_ms);
-            counters.record_batch(completed_iterations, batch_ms);
-            emit(
-                counters.iterations,
-                counters.latest_ms,
-                counters.total_ms,
-                counters.total_compute_ms,
-                counters.compute_count,
-                false,
-                false,
-            );
-            if repeat_should_continue(deadline, cancel)
-                && let Err(err) = pause_between_gpu_submissions(gpu_intensity, Some(cancel))
-            {
-                if cancel.load(Ordering::Relaxed) {
-                    break;
-                }
-                return Err(err);
-            }
-        }
-
-        Ok(emit(
-            counters.iterations,
-            counters.latest_ms,
-            counters.total_ms,
-            counters.total_compute_ms,
-            counters.compute_count,
-            cancel.load(Ordering::Relaxed),
-            true,
-        ))
+        self.repeat_direct_full_gpu_compute(
+            n,
+            n_u32,
+            &a_buffer,
+            &b_buffer,
+            &c_buffer,
+            gpu_intensity,
+            cancel,
+            deadline,
+            emit,
+        )
     }
 
     fn repeat_direct_full_gpu_compute<F>(
@@ -1485,7 +1384,7 @@ impl GpuRunner {
         let dispatch = self.create_direct_dispatch(a_buffer, b_buffer, c_buffer, params, n);
         let groups_x = gpu_column_workgroups(n_u32);
         let groups_y = n_u32.div_ceil(TILE_SIZE);
-        let max_batch_limit = gpu_repeat_batch_limit(n, gpu_intensity).max(1);
+        let max_batch_limit = gpu_stress_repeat_batch_limit(n, gpu_intensity).max(1);
         let mut batch_limit = max_batch_limit;
         let mut counters = GpuRepeatCounters::default();
 
@@ -1582,9 +1481,7 @@ impl GpuRunner {
         let (row_block, col_block) = self.block_dimensions(n, gpu_intensity)?;
         let min_row_block =
             align_block_extent(gpu_min_dispatch_rows(gpu_intensity).min(row_block).max(1));
-        let initial_row_block = gpu_dispatch_chunk_rows(n, gpu_intensity)
-            .min(row_block)
-            .max(min_row_block);
+        let initial_row_block = row_block.max(min_row_block);
         let mut governor =
             GpuWorkGovernor::new(initial_row_block, min_row_block, row_block, gpu_intensity);
         let (b_packed, panels) = pack_column_panels(b, n, col_block, Some(cancel))?;
@@ -1628,7 +1525,7 @@ impl GpuRunner {
             }
             let mut dispatches = Vec::new();
             let mut completed_iterations = 0u64;
-            let batch_limit = gpu_repeat_batch_limit(n, gpu_intensity);
+            let batch_limit = gpu_stress_repeat_batch_limit(n, gpu_intensity);
             while repeat_should_continue(deadline, cancel) && dispatches.len() < batch_limit {
                 let panel = &panels[panel_index];
                 let rows = governor.row_extent(n - row_offset);
@@ -2314,6 +2211,44 @@ fn gpu_repeat_batch_limit(size: usize, gpu_intensity: GpuIntensity) -> usize {
     }
 }
 
+fn gpu_stress_repeat_batch_limit(size: usize, gpu_intensity: GpuIntensity) -> usize {
+    if size <= 1024 {
+        return gpu_repeat_batch_limit(size, gpu_intensity);
+    }
+
+    let base = if size <= 2048 {
+        match gpu_intensity {
+            GpuIntensity::Safe => 32,
+            GpuIntensity::Balanced => 128,
+            GpuIntensity::High => 256,
+        }
+    } else if size <= 4096 {
+        match gpu_intensity {
+            GpuIntensity::Safe => 8,
+            GpuIntensity::Balanced => 32,
+            GpuIntensity::High => 64,
+        }
+    } else if size <= 8192 {
+        match gpu_intensity {
+            GpuIntensity::Safe => 2,
+            GpuIntensity::Balanced => 8,
+            GpuIntensity::High => 16,
+        }
+    } else {
+        match gpu_intensity {
+            GpuIntensity::Safe => 1,
+            GpuIntensity::Balanced => 4,
+            GpuIntensity::High => 8,
+        }
+    };
+
+    if size <= 8192 {
+        base.max(gpu_dispatch_batch_limit(gpu_intensity))
+    } else {
+        base.max(1)
+    }
+}
+
 fn gpu_tiny_stress_workgroups(gpu_intensity: GpuIntensity) -> u32 {
     match gpu_intensity {
         GpuIntensity::Safe => GPU_SAFE_TINY_STRESS_WORKGROUPS,
@@ -2328,10 +2263,22 @@ fn gpu_tiny_stress_rounds(size: usize, gpu_intensity: GpuIntensity) -> u32 {
         GpuIntensity::Balanced => GPU_BALANCED_TINY_STRESS_ROUNDS,
         GpuIntensity::High => GPU_HIGH_TINY_STRESS_ROUNDS,
     };
-    let size_scale = GPU_TINY_STRESS_MAX_SIZE
-        .saturating_div(size.max(1))
-        .max(1);
-    base.saturating_mul(size_scale as u32)
+    let scaled = (u64::from(base) * u64::from(TILE_SIZE)).div_ceil(size.max(1) as u64);
+    scaled.clamp(1, u64::from(u32::MAX)) as u32
+}
+
+fn tiny_stress_equivalent_iterations(
+    scratch_elements: usize,
+    size: usize,
+    rounds: u32,
+) -> u64 {
+    let cells_per_matrix = size
+        .checked_mul(size)
+        .map(|cells| cells.max(1) as u128)
+        .unwrap_or(u128::MAX);
+    let repeated_cells = (scratch_elements as u128).saturating_mul(rounds as u128);
+    let equivalent_iterations = (repeated_cells / cells_per_matrix).max(1);
+    equivalent_iterations.min(u64::MAX as u128) as u64
 }
 
 fn gpu_tiny_stress_batch_limit(gpu_intensity: GpuIntensity) -> usize {
