@@ -95,26 +95,53 @@ fn probe_pytorch_cuda(python: &str) -> Result<PyTorchCudaEnvironment> {
     Ok(parse_pytorch_cuda_probe_output(&output, python))
 }
 
+fn validate_pytorch_cuda_training_config(config: &AiTrainingConfig) -> Result<()> {
+    match config.workload {
+        AiTrainingWorkload::LinearLayer => validate_ai_linear_dimensions(
+            config.dimensions.batch_size,
+            config.dimensions.input_dim,
+            config.dimensions.output_dim,
+        ),
+        AiTrainingWorkload::Mlp => validate_ai_linear_dimensions(
+            config.dimensions.batch_size,
+            config.dimensions.hidden_size,
+            config.dimensions.output_dim,
+        ),
+        AiTrainingWorkload::TransformerBlock => {
+            if config.dimensions.batch_size == 0
+                || config.dimensions.sequence_len == 0
+                || config.dimensions.hidden_size == 0
+                || config.dimensions.attention_heads == 0
+            {
+                return Err(anyhow!("AI transformer dimensions must be non-zero"));
+            }
+            usize_to_u32(config.dimensions.batch_size, "batch size")?;
+            usize_to_u32(config.dimensions.sequence_len, "sequence length")?;
+            usize_to_u32(config.dimensions.hidden_size, "hidden size")?;
+            usize_to_u32(config.dimensions.attention_heads, "attention heads")?;
+            if !config
+                .dimensions
+                .hidden_size
+                .is_multiple_of(config.dimensions.attention_heads)
+            {
+                return Err(anyhow!(
+                    "hidden size must be divisible by attention heads for PyTorch transformer training"
+                ));
+            }
+            Ok(())
+        }
+        AiTrainingWorkload::OptimizerStress => Err(anyhow!(
+            "PyTorch CUDA currently supports linear, MLP, and transformer training workloads"
+        )),
+    }
+}
+
 fn run_pytorch_cuda_training_benchmark(
     config: AiTrainingConfig,
     cancel: Arc<AtomicBool>,
     tx: Sender<AiTrainingWorkerEvent>,
 ) -> Result<AiTrainingResult> {
-    if config.workload != AiTrainingWorkload::LinearLayer {
-        return Err(anyhow!(
-            "PyTorch CUDA currently supports only the linear layer training workload"
-        ));
-    }
-    if config.precision != AiTrainingPrecision::F32 {
-        return Err(anyhow!(
-            "PyTorch CUDA currently supports only f32 precision"
-        ));
-    }
-    validate_ai_linear_dimensions(
-        config.dimensions.batch_size,
-        config.dimensions.input_dim,
-        config.dimensions.output_dim,
-    )?;
+    validate_pytorch_cuda_training_config(&config)?;
     check_canceled_with(Some(cancel.as_ref()), "PyTorch CUDA benchmark canceled")?;
 
     let total_steps = config.warmup_steps.saturating_add(config.measured_steps);
@@ -129,8 +156,8 @@ fn run_pytorch_cuda_training_benchmark(
         true,
     );
     let _ = tx.send(AiTrainingWorkerEvent::Log(format!(
-        "Launching PyTorch CUDA linear training via {} on CUDA device {}",
-        config.pytorch_python, config.pytorch_cuda_device
+        "Launching PyTorch CUDA {} {} training via {} on CUDA device {}",
+        config.workload, config.precision, config.pytorch_python, config.pytorch_cuda_device
     )));
 
     let timeout = pytorch_cuda_benchmark_timeout(config.time_limit_s);
@@ -252,7 +279,7 @@ fn run_pytorch_cuda_training_benchmark(
         preset: config.preset,
         precision: config.precision,
         gpu_names: vec![gpu_name],
-        shape: linear_shape_label(&config.dimensions),
+        shape: ai_training_shape_label(config.workload, &config.dimensions),
         flops_per_step,
         measured_steps,
         compute_tflops,
@@ -544,9 +571,14 @@ def emit(key, *values):
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--device", type=int, default=0)
+parser.add_argument("--workload", choices=("linear", "mlp", "transformer"), required=True)
+parser.add_argument("--precision", choices=("f32", "bf16", "f16"), required=True)
 parser.add_argument("--batch", type=int, required=True)
 parser.add_argument("--input", type=int, required=True)
 parser.add_argument("--output", type=int, required=True)
+parser.add_argument("--sequence", type=int, required=True)
+parser.add_argument("--hidden", type=int, required=True)
+parser.add_argument("--heads", type=int, required=True)
 parser.add_argument("--warmup", type=int, required=True)
 parser.add_argument("--measured", type=int, required=True)
 parser.add_argument("--time-limit", type=float, required=True)
@@ -556,6 +588,7 @@ args = parser.parse_args()
 emit("PYTHON", sys.version.split()[0])
 try:
     import torch
+    import torch.nn as nn
     import torch.nn.functional as F
 
     emit("TORCH", getattr(torch, "__version__", ""))
@@ -595,22 +628,105 @@ try:
     if args.batch <= 0 or args.input <= 0 or args.output <= 0 or args.measured <= 0:
         emit("ERROR", "batch, input, output, and measured steps must be positive")
         sys.exit(0)
+    if args.sequence <= 0 or args.hidden <= 0 or args.heads <= 0:
+        emit("ERROR", "sequence, hidden, and heads must be positive")
+        sys.exit(0)
 
     torch.cuda.set_device(args.device)
     device = torch.device("cuda:{}".format(args.device))
     props = torch.cuda.get_device_properties(args.device)
     torch.manual_seed(1234)
     torch.cuda.manual_seed_all(1234)
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    except Exception:
+        pass
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
 
-    model = torch.nn.Linear(args.input, args.output, bias=False).to(device=device, dtype=torch.float32)
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate)
-    x = torch.randn(args.batch, args.input, device=device, dtype=torch.float32)
-    target = torch.randn(args.batch, args.output, device=device, dtype=torch.float32)
+    if args.precision == "f32":
+        dtype = torch.float32
+    elif args.precision == "bf16":
+        if hasattr(torch.cuda, "is_bf16_supported") and not torch.cuda.is_bf16_supported():
+            emit("ERROR", "bf16 is not supported on this CUDA device")
+            sys.exit(0)
+        dtype = torch.bfloat16
+    else:
+        dtype = torch.float16
+
+    def make_optimizer(parameters):
+        try:
+            return torch.optim.AdamW(parameters, lr=args.learning_rate, fused=True)
+        except Exception as exc:
+            emit("NOTE", "Fused AdamW unavailable; using standard AdamW: " + str(exc))
+            return torch.optim.AdamW(parameters, lr=args.learning_rate)
+
+    class BenchMlp(nn.Module):
+        def __init__(self, hidden, expansion):
+            super().__init__()
+            self.fc1 = nn.Linear(hidden, expansion, bias=False)
+            self.fc2 = nn.Linear(expansion, hidden, bias=False)
+
+        def forward(self, x):
+            return self.fc2(F.gelu(self.fc1(x), approximate="tanh"))
+
+    class BenchTransformerBlock(nn.Module):
+        def __init__(self, hidden, heads):
+            super().__init__()
+            if hidden % heads != 0:
+                raise ValueError("hidden size must be divisible by attention heads")
+            self.hidden = hidden
+            self.heads = heads
+            self.head_dim = hidden // heads
+            self.ln1 = nn.LayerNorm(hidden)
+            self.qkv = nn.Linear(hidden, hidden * 3, bias=False)
+            self.proj = nn.Linear(hidden, hidden, bias=False)
+            self.ln2 = nn.LayerNorm(hidden)
+            self.fc1 = nn.Linear(hidden, hidden * 4, bias=False)
+            self.fc2 = nn.Linear(hidden * 4, hidden, bias=False)
+
+        def forward(self, x):
+            batch, seq, hidden = x.shape
+            residual = x
+            x_norm = self.ln1(x)
+            qkv = self.qkv(x_norm)
+            qkv = qkv.reshape(batch, seq, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv[0], qkv[1], qkv[2]
+            if hasattr(F, "scaled_dot_product_attention"):
+                attn = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+            else:
+                scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(float(self.head_dim))
+                attn = torch.matmul(torch.softmax(scores, dim=-1), v)
+            attn = attn.transpose(1, 2).contiguous().view(batch, seq, hidden)
+            x = residual + self.proj(attn)
+            residual = x
+            x_norm = self.ln2(x)
+            x = residual + self.fc2(F.gelu(self.fc1(x_norm), approximate="tanh"))
+            return x
+
+    if args.workload == "linear":
+        model = nn.Linear(args.input, args.output, bias=False)
+        x = torch.randn(args.batch, args.input, device=device, dtype=dtype)
+        target = torch.randn(args.batch, args.output, device=device, dtype=dtype)
+    elif args.workload == "mlp":
+        model = BenchMlp(args.hidden, args.output)
+        x = torch.randn(args.batch, args.hidden, device=device, dtype=dtype)
+        target = torch.randn(args.batch, args.hidden, device=device, dtype=dtype)
+    else:
+        model = BenchTransformerBlock(args.hidden, args.heads)
+        x = torch.randn(args.batch, args.sequence, args.hidden, device=device, dtype=dtype)
+        target = torch.randn(args.batch, args.sequence, args.hidden, device=device, dtype=dtype)
+
+    model = model.to(device=device, dtype=dtype)
+    optimizer = make_optimizer(model.parameters())
 
     def train_step():
         optimizer.zero_grad(set_to_none=True)
         y = model(x)
-        loss = F.mse_loss(y, target)
+        loss = F.mse_loss(y.float(), target.float())
         loss.backward()
         optimizer.step()
         return loss
@@ -660,6 +776,8 @@ try:
 
     emit("RESULT_DEVICE_INDEX", args.device)
     emit("RESULT_GPU_NAME", props.name)
+    emit("RESULT_WORKLOAD", args.workload)
+    emit("RESULT_PRECISION", args.precision)
     emit("RESULT_MEASURED_STEPS", len(gpu_step_ms))
     emit("RESULT_GPU_STEP_MS", *["{:.6f}".format(value) for value in gpu_step_ms])
     emit("RESULT_WALL_STEP_MS", *["{:.6f}".format(value) for value in wall_step_ms])
@@ -667,7 +785,7 @@ try:
     emit("RESULT_PEAK_RESERVED_BYTES", peak_reserved)
     emit("RESULT_VALIDATION", "Passed: finite loss {:.6g}".format(final_loss))
     emit("RESULT_TIME_LIMITED", time_limited)
-    emit("NOTE", "PyTorch CUDA linear benchmark uses torch.nn.Linear, MSE loss, backward, and SGD on one CUDA device.")
+    emit("NOTE", "PyTorch CUDA benchmark keeps tensors resident, runs forward/backward/AdamW steps, times with CUDA events, and reads back only final loss.")
 except Exception as exc:
     emit("ERROR", type(exc).__name__ + ": " + str(exc))
     emit("NOTE", traceback.format_exc(limit=6))
@@ -679,12 +797,22 @@ except Exception as exc:
         .arg(script)
         .arg("--device")
         .arg(config.pytorch_cuda_device.to_string())
+        .arg("--workload")
+        .arg(pytorch_cuda_workload_arg(config.workload))
+        .arg("--precision")
+        .arg(pytorch_cuda_precision_arg(config.precision))
         .arg("--batch")
         .arg(config.dimensions.batch_size.to_string())
         .arg("--input")
         .arg(config.dimensions.input_dim.to_string())
         .arg("--output")
         .arg(config.dimensions.output_dim.to_string())
+        .arg("--sequence")
+        .arg(config.dimensions.sequence_len.to_string())
+        .arg("--hidden")
+        .arg(config.dimensions.hidden_size.to_string())
+        .arg("--heads")
+        .arg(config.dimensions.attention_heads.to_string())
         .arg("--warmup")
         .arg(config.warmup_steps.to_string())
         .arg("--measured")
@@ -743,6 +871,23 @@ except Exception as exc:
             format!(": {stderr}")
         }
     ))
+}
+
+fn pytorch_cuda_workload_arg(workload: AiTrainingWorkload) -> &'static str {
+    match workload {
+        AiTrainingWorkload::LinearLayer => "linear",
+        AiTrainingWorkload::Mlp => "mlp",
+        AiTrainingWorkload::TransformerBlock => "transformer",
+        AiTrainingWorkload::OptimizerStress => "optimizer",
+    }
+}
+
+fn pytorch_cuda_precision_arg(precision: AiTrainingPrecision) -> &'static str {
+    match precision {
+        AiTrainingPrecision::F32 => "f32",
+        AiTrainingPrecision::Bf16 => "bf16",
+        AiTrainingPrecision::F16 => "f16",
+    }
 }
 
 fn yes_no(value: bool) -> &'static str {

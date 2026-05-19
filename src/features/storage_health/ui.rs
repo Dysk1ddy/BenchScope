@@ -110,7 +110,7 @@ impl BenchScopeApp {
                                     "Quick benchmark writes temporary data and may add SSD wear.",
                                 );
                                 ui.add_enabled_ui(!self.storage_health.running, |ui| {
-                                    if ui.button("Run quick read/write benchmark").clicked() {
+                                    if ui_start_action_button(ui, "Run quick read/write benchmark").clicked() {
                                         self.storage_health.start_quick_benchmark();
                                     }
                                     if ui.button("Open full Drive Benchmark").clicked() {
@@ -127,7 +127,7 @@ impl BenchScopeApp {
 
                 ui.separator();
                 ui.add_enabled_ui(self.storage_health.running, |ui| {
-                    if ui.button("Cancel storage task").clicked() {
+                    if ui_cancel_action_button(ui, "Cancel storage task").clicked() {
                         self.storage_health.cancel();
                     }
                 });

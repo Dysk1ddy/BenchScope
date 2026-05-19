@@ -102,12 +102,12 @@ impl BenchScopeApp {
                 );
                 ui.separator();
                 ui.add_enabled_ui(!self.ram.running, |ui| {
-                    if ui.button("Run RAM test").clicked() {
+                    if ui_start_action_button(ui, "Run RAM test").clicked() {
                         self.ram.start();
                     }
                 });
                 ui.add_enabled_ui(self.ram.running, |ui| {
-                    if ui.button("Cancel RAM test").clicked() {
+                    if ui_cancel_action_button(ui, "Cancel RAM test").clicked() {
                         self.ram.cancel();
                     }
                 });

@@ -576,6 +576,73 @@ mod tests {
     }
 
     #[test]
+    fn ai_training_precision_parser_accepts_mixed_precision_aliases() {
+        assert_eq!(
+            parse_ai_training_precision("fp32").unwrap(),
+            AiTrainingPrecision::F32
+        );
+        assert_eq!(
+            parse_ai_training_precision("bfloat16").unwrap(),
+            AiTrainingPrecision::Bf16
+        );
+        assert_eq!(
+            parse_ai_training_precision("half").unwrap(),
+            AiTrainingPrecision::F16
+        );
+        assert!(parse_ai_training_precision("int8").is_err());
+    }
+
+    #[test]
+    fn pytorch_cuda_validation_allows_requested_training_workloads() {
+        let adapter = AdapterInfo {
+            index: 0,
+            name: "test".to_owned(),
+            vendor: 0,
+            device: 0,
+            device_type: wgpu::DeviceType::DiscreteGpu,
+            backend: wgpu::Backend::Dx12,
+            driver: String::new(),
+            timestamp_query: true,
+            dedicated_vram_bytes: Some(32 * 1024 * 1024 * 1024),
+            dedicated_system_memory_bytes: Some(0),
+            shared_system_memory_bytes: Some(16 * 1024 * 1024 * 1024),
+        };
+        let mut config = ai_training_smoke_config_for_workload(
+            adapter,
+            GpuIntensity::Safe,
+            AiTrainingWorkload::Mlp,
+        );
+        config.backend = AiTrainingBackend::PyTorchCuda;
+        config.precision = AiTrainingPrecision::Bf16;
+        assert!(validate_pytorch_cuda_training_config(&config).is_ok());
+
+        config.workload = AiTrainingWorkload::TransformerBlock;
+        config.precision = AiTrainingPrecision::F16;
+        config.dimensions = AiTrainingDimensions::transformer(1, 16, 64, 4);
+        assert!(validate_pytorch_cuda_training_config(&config).is_ok());
+
+        config.workload = AiTrainingWorkload::OptimizerStress;
+        assert!(validate_pytorch_cuda_training_config(&config).is_err());
+    }
+
+    #[test]
+    fn rtx5090_ai_training_preset_uses_large_shapes() {
+        let linear =
+            AiTrainingDimensions::for_preset(AiTrainingWorkload::LinearLayer, AiTrainingPreset::Rtx5090);
+        assert_eq!(linear.batch_size, 8192);
+        assert_eq!(linear.input_dim, 8192);
+        assert_eq!(linear.output_dim, 8192);
+
+        let transformer = AiTrainingDimensions::for_preset(
+            AiTrainingWorkload::TransformerBlock,
+            AiTrainingPreset::Rtx5090,
+        );
+        assert_eq!(transformer.sequence_len, 4096);
+        assert_eq!(transformer.hidden_size, 4096);
+        assert_eq!(transformer.attention_heads, 32);
+    }
+
+    #[test]
     fn cpu_worker_count_leaves_room_for_system() {
         assert_eq!(cpu_worker_count(64), 1);
         let available = thread::available_parallelism()
@@ -1415,6 +1482,46 @@ mod tests {
         reading.utilization_percent = Some(utilization_percent);
         reading.sync_legacy_metrics();
         reading
+    }
+
+    #[test]
+    fn memory_utilization_without_temperature_does_not_request_fallback() {
+        let mut memory = SensorReading::unavailable(
+            SensorKind::Memory,
+            "System RAM",
+            "Windows memory status",
+            SensorStatus::Ok,
+        );
+        memory.utilization_percent = Some(44.0);
+        memory.sync_legacy_metrics();
+        let snapshot = SensorSnapshot {
+            cpu: Some(sensor_reading_with_temperature_and_utilization(
+                SensorKind::Cpu,
+                "CPU",
+                55.0,
+                12.0,
+                "service",
+            )),
+            gpu: Some(sensor_reading_with_temperature_and_utilization(
+                SensorKind::Gpu,
+                "GPU",
+                50.0,
+                18.0,
+                "service",
+            )),
+            gpu_memory: None,
+            drive: Some(sensor_reading_with_temperature_and_utilization(
+                SensorKind::Drive,
+                "SSD",
+                41.0,
+                3.0,
+                "service",
+            )),
+            memory: Some(memory),
+            helper_elevated: Some(true),
+        };
+
+        assert!(!sensor_snapshot_needs_fallback(&snapshot, Instant::now()));
     }
 
     #[test]

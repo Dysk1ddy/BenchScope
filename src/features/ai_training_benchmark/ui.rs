@@ -164,7 +164,9 @@ impl BenchScopeApp {
                                 ui.label("Precision");
                                 ui.horizontal(|ui| {
                                     for precision in AiTrainingPrecision::ALL {
-                                        let enabled = precision == AiTrainingPrecision::F32;
+                                        let enabled = self.ai_training.backend
+                                            == AiTrainingBackend::PyTorchCuda
+                                            || precision == AiTrainingPrecision::F32;
                                         ui.add_enabled_ui(enabled, |ui| {
                                             ui.selectable_value(
                                                 &mut self.ai_training.precision,
@@ -174,10 +176,16 @@ impl BenchScopeApp {
                                         });
                                     }
                                 });
-                                if self.ai_training.precision == AiTrainingPrecision::F16 {
+                                if self.ai_training.backend != AiTrainingBackend::PyTorchCuda
+                                    && self.ai_training.precision != AiTrainingPrecision::F32
+                                {
                                     self.ai_training.precision = AiTrainingPrecision::F32;
                                 }
-                                ui.small("f16 will be enabled after the shader feature path is implemented.");
+                                if self.ai_training.backend == AiTrainingBackend::PyTorchCuda {
+                                    ui.small("PyTorch CUDA uses f32, bf16, or f16 tensors with CUDA event timing.");
+                                } else {
+                                    ui.small("Portable wgpu currently supports f32 precision.");
+                                }
 
                                 ui.add_space(8.0);
                                 ui.label("GPU intensity");
@@ -227,7 +235,7 @@ impl BenchScopeApp {
                 ui.separator();
                 let can_run = self.ai_training.can_run() && !self.adapters.is_empty();
                 ui.add_enabled_ui(can_run, |ui| {
-                    if ui.button("Run training benchmark").clicked() {
+                    if ui_start_action_button(ui, "Run training benchmark").clicked() {
                         if let Some(adapter) = self.adapters.get(self.selected_adapter).cloned() {
                             self.ai_training.start(adapter, self.gpu_intensity);
                         }
@@ -239,7 +247,7 @@ impl BenchScopeApp {
                         || (self.ai_training.pytorch_cuda_can_run_selection()
                             && !self.ai_training.pytorch_python.trim().is_empty()));
                 ui.add_enabled_ui(can_smoke, |ui| {
-                    if ui.button("Run smoke test").clicked() {
+                    if ui_start_action_button(ui, "Run smoke test").clicked() {
                         if let Some(adapter) = self.adapters.get(self.selected_adapter).cloned() {
                             self.ai_training
                                 .start_smoke_test(adapter, self.gpu_intensity);
@@ -247,18 +255,19 @@ impl BenchScopeApp {
                     }
                 });
                 ui.add_enabled_ui(self.ai_training.running, |ui| {
-                    if ui.button("Cancel training benchmark").clicked() {
+                    if ui_cancel_action_button(ui, "Cancel training benchmark").clicked() {
                         self.ai_training.cancel();
                     }
                 });
                 if self.ai_training.backend == AiTrainingBackend::PyTorchCuda {
                     if !self.ai_training.pytorch_cuda_can_run_selection() {
-                        ui.small("PyTorch CUDA currently runs the linear f32 training benchmark.");
+                        ui.small("PyTorch CUDA currently runs linear, MLP, and transformer training.");
                     } else if !self.ai_training.pytorch_cuda_ready() {
                         ui.small("Probe PyTorch CUDA before a full run. Smoke tests can still report setup errors directly.");
                     } else {
                         ui.small(format!(
-                            "PyTorch CUDA will run single-process linear training on CUDA device {}.",
+                            "PyTorch CUDA will run single-process {} training on CUDA device {}.",
+                            self.ai_training.workload.label(),
                             self.ai_training.pytorch_cuda_device
                         ));
                     }

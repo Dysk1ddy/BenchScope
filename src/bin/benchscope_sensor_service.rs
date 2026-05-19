@@ -33,7 +33,7 @@ use sensor_driver_client::{
 #[cfg(windows)]
 const CREATE_NO_WINDOW_RAW: u32 = 0x0800_0000;
 const DEFAULT_INTERVAL_MS: u64 = 1_000;
-const FAST_PROVIDER_TTL: Duration = Duration::from_millis(900);
+const FAST_PROVIDER_TTL: Duration = Duration::from_millis(450);
 const GPU_TEMP_TTL: Duration = Duration::from_secs(5);
 const DRIVE_TEMP_TTL: Duration = Duration::from_secs(15);
 const STALE_PROVIDER_AFTER: Duration = Duration::from_secs(45);

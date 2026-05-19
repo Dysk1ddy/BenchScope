@@ -5,6 +5,64 @@ fn ui_large_back_button(ui: &mut egui::Ui) -> egui::Response {
     )
 }
 
+fn ui_start_action_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui_highlighted_action_button(
+        ui,
+        label,
+        egui::Color32::from_rgb(31, 129, 91),
+        egui::Color32::from_rgb(84, 224, 160),
+        egui::Color32::from_rgb(47, 67, 61),
+        egui::Color32::from_rgb(84, 111, 100),
+    )
+}
+
+fn ui_cancel_action_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui_highlighted_action_button(
+        ui,
+        label,
+        egui::Color32::from_rgb(166, 58, 67),
+        egui::Color32::from_rgb(244, 127, 135),
+        egui::Color32::from_rgb(74, 52, 55),
+        egui::Color32::from_rgb(119, 82, 87),
+    )
+}
+
+fn ui_highlighted_action_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    active_fill: egui::Color32,
+    active_stroke: egui::Color32,
+    disabled_fill: egui::Color32,
+    disabled_stroke: egui::Color32,
+) -> egui::Response {
+    let enabled = ui.is_enabled();
+    let fill = if enabled { active_fill } else { disabled_fill };
+    let stroke = if enabled {
+        egui::Stroke::new(1.6, active_stroke)
+    } else {
+        egui::Stroke::new(1.0, disabled_stroke)
+    };
+    let text_color = if enabled {
+        egui::Color32::from_rgb(248, 250, 252)
+    } else {
+        egui::Color32::from_rgb(166, 176, 184)
+    };
+    let width = ui.available_width().clamp(220.0, 360.0);
+
+    ui.add_sized(
+        [width, 38.0],
+        egui::Button::new(
+            egui::RichText::new(label)
+                .size(17.0)
+                .strong()
+                .color(text_color),
+        )
+        .fill(fill)
+        .stroke(stroke)
+        .corner_radius(egui::CornerRadius::same(6)),
+    )
+}
+
 fn panel_content_log_heights(available_height: f32, log_fraction: f32, log_max: f32) -> (f32, f32) {
     let fixed_height = PANEL_VERTICAL_CHROME_HEIGHT;
     let usable_height = (available_height - fixed_height).max(0.0);

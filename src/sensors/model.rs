@@ -466,6 +466,104 @@ struct TemperatureRunReport {
     drive: TemperatureSummary,
 }
 
+struct SensorFallbackWorker {
+    snapshot: Option<SensorSnapshot>,
+    rx: Option<Receiver<SensorSnapshot>>,
+    target_drive_letter: Option<char>,
+    pending_drive_letter: Option<char>,
+    started_at: Option<Instant>,
+    last_finished_at: Option<Instant>,
+}
+
+impl SensorFallbackWorker {
+    fn new() -> Self {
+        Self {
+            snapshot: None,
+            rx: None,
+            target_drive_letter: None,
+            pending_drive_letter: None,
+            started_at: None,
+            last_finished_at: None,
+        }
+    }
+
+    fn refresh_target_drive(&mut self, drive_letter: Option<char>) {
+        if self.target_drive_letter == drive_letter {
+            return;
+        }
+        self.target_drive_letter = drive_letter;
+        self.pending_drive_letter = None;
+        self.snapshot = None;
+        self.rx = None;
+        self.started_at = None;
+        self.last_finished_at = None;
+    }
+
+    fn collect_finished(&mut self, now: Instant) {
+        let result = self.rx.as_ref().map(|receiver| receiver.try_recv());
+        match result {
+            Some(Ok(snapshot)) => {
+                if self.pending_drive_letter == self.target_drive_letter {
+                    self.snapshot = Some(snapshot);
+                }
+                self.rx = None;
+                self.pending_drive_letter = None;
+                self.started_at = None;
+                self.last_finished_at = Some(now);
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.rx = None;
+                self.pending_drive_letter = None;
+                self.started_at = None;
+                self.last_finished_at = Some(now);
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) => {
+                if self.started_at.is_some_and(|started_at| {
+                    now.duration_since(started_at)
+                        > Duration::from_millis(SENSOR_FALLBACK_ABANDON_MS)
+                }) {
+                    self.rx = None;
+                    self.pending_drive_letter = None;
+                    self.started_at = None;
+                    self.last_finished_at = Some(now);
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn maybe_start(&mut self, drive_letter: Option<char>, now: Instant) {
+        self.refresh_target_drive(drive_letter);
+        self.collect_finished(now);
+        if self.rx.is_some() {
+            return;
+        }
+        if self.last_finished_at.is_some_and(|finished_at| {
+            now.duration_since(finished_at) < Duration::from_millis(SENSOR_FALLBACK_REFRESH_MS)
+        }) {
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let spawn_result = thread::Builder::new()
+            .name("benchscope-sensors-fallback".to_owned())
+            .spawn(move || {
+                let _ = tx.send(collect_sensor_snapshot(drive_letter));
+            });
+        if spawn_result.is_ok() {
+            self.rx = Some(rx);
+            self.pending_drive_letter = drive_letter;
+            self.started_at = Some(now);
+        } else {
+            self.last_finished_at = Some(now);
+        }
+    }
+
+    fn latest(&self) -> Option<SensorSnapshot> {
+        self.snapshot.clone()
+    }
+}
+
 fn drain_sensor_bridge_receiver(
     rx: &mut Option<Receiver<SensorSnapshot>>,
     snapshot: &mut Option<SensorSnapshot>,
@@ -526,6 +624,7 @@ impl SensorManager {
                 let mut service_snapshot: Option<SensorSnapshot> = None;
                 let mut helper_rx: Option<Receiver<SensorSnapshot>> = None;
                 let mut helper_snapshot: Option<SensorSnapshot> = None;
+                let mut fallback_worker = SensorFallbackWorker::new();
                 let mut next_service_start = Instant::now();
                 let mut next_helper_start = Instant::now();
                 while !thread_shutdown.load(Ordering::Relaxed) {
@@ -558,16 +657,28 @@ impl SensorManager {
                     let primary_snapshot =
                         merge_sensor_snapshots(service_snapshot.clone(), helper_snapshot.clone());
                     let snapshot_now = Instant::now();
-                    let fallback_snapshot = primary_snapshot.as_ref().and_then(|snapshot| {
-                        sensor_snapshot_needs_fallback(snapshot, snapshot_now)
-                            .then(|| collect_sensor_snapshot(drive_letter))
-                    });
+                    let needs_fallback = match primary_snapshot.as_ref() {
+                        None => true,
+                        Some(snapshot) if sensor_snapshot_has_stale_data(snapshot, snapshot_now) => {
+                            true
+                        }
+                        Some(snapshot) => {
+                            service_snapshot.is_none() && helper_snapshot_has_gaps(snapshot)
+                        }
+                    };
+                    if needs_fallback {
+                        fallback_worker.maybe_start(drive_letter, snapshot_now);
+                    } else {
+                        fallback_worker.refresh_target_drive(drive_letter);
+                        fallback_worker.collect_finished(snapshot_now);
+                    }
+                    let fallback_snapshot = fallback_worker.latest();
                     let snapshot = merge_sensor_snapshots_prefer_fresh(
                         primary_snapshot,
                         fallback_snapshot,
                         snapshot_now,
                     )
-                    .unwrap_or_else(|| collect_sensor_snapshot(drive_letter));
+                    .unwrap_or_default();
                     let snapshot = apply_integrated_gpu_temperature_fallback(
                         snapshot,
                         use_shared_gpu_temperature,

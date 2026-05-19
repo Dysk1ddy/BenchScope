@@ -59,22 +59,22 @@ impl BenchScopeApp {
 
                                 ui.add_space(10.0);
                                 ui.add_enabled_ui(!self.battery.scanning, |ui| {
-                                    if ui.button("Refresh battery scan").clicked() {
+                                    if ui_start_action_button(ui, "Refresh battery scan").clicked() {
                                         self.battery.start_scan();
                                     }
                                 });
                                 ui.add_enabled_ui(self.battery.scanning, |ui| {
-                                    if ui.button("Cancel scan").clicked() {
+                                    if ui_cancel_action_button(ui, "Cancel scan").clicked() {
                                         self.battery.cancel_scan();
                                     }
                                 });
 
                                 ui.add_space(10.0);
                                 if self.battery.live_running {
-                                    if ui.button("Stop live sampling").clicked() {
+                                    if ui_cancel_action_button(ui, "Stop live sampling").clicked() {
                                         self.battery.stop_live_sampling();
                                     }
-                                } else if ui.button("Start live sampling").clicked() {
+                                } else if ui_start_action_button(ui, "Start live sampling").clicked() {
                                     self.battery.start_live_sampling();
                                 }
                                 ui.small(format!(

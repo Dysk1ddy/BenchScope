@@ -183,12 +183,12 @@ impl BenchScopeApp {
                 ui.separator();
 
                 ui.add_enabled_ui(!self.running && !self.adapters.is_empty(), |ui| {
-                    if ui.button("Start stress test").clicked() {
+                    if ui_start_action_button(ui, "Start stress test").clicked() {
                         self.start_repeat();
                     }
                 });
                 ui.add_enabled_ui(self.repeat_running, |ui| {
-                    if ui.button("Cancel stress test").clicked() {
+                    if ui_cancel_action_button(ui, "Cancel stress test").clicked() {
                         self.cancel_repeat();
                     }
                 });

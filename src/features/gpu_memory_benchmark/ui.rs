@@ -210,12 +210,12 @@ impl BenchScopeApp {
 
                 ui.separator();
                 ui.add_enabled_ui(!self.gpu_memory.running && !self.adapters.is_empty(), |ui| {
-                    if ui.button("Run GPU memory benchmark").clicked() {
+                    if ui_start_action_button(ui, "Run GPU memory benchmark").clicked() {
                         self.start_gpu_memory_benchmark();
                     }
                 });
                 ui.add_enabled_ui(self.gpu_memory.running, |ui| {
-                    if ui.button("Cancel GPU memory benchmark").clicked() {
+                    if ui_cancel_action_button(ui, "Cancel GPU memory benchmark").clicked() {
                         self.gpu_memory.cancel();
                     }
                 });

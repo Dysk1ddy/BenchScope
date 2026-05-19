@@ -148,15 +148,21 @@ impl fmt::Display for AiTrainingProfile {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AiTrainingPrecision {
     F32,
+    Bf16,
     F16,
 }
 
 impl AiTrainingPrecision {
-    const ALL: [AiTrainingPrecision; 2] = [AiTrainingPrecision::F32, AiTrainingPrecision::F16];
+    const ALL: [AiTrainingPrecision; 3] = [
+        AiTrainingPrecision::F32,
+        AiTrainingPrecision::Bf16,
+        AiTrainingPrecision::F16,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             AiTrainingPrecision::F32 => "f32",
+            AiTrainingPrecision::Bf16 => "bf16",
             AiTrainingPrecision::F16 => "f16",
         }
     }
@@ -164,6 +170,7 @@ impl AiTrainingPrecision {
     fn bytes_per_value(self) -> u64 {
         match self {
             AiTrainingPrecision::F32 => 4,
+            AiTrainingPrecision::Bf16 => 2,
             AiTrainingPrecision::F16 => 2,
         }
     }
@@ -181,15 +188,17 @@ enum AiTrainingPreset {
     Small,
     Medium,
     Large,
+    Rtx5090,
     Custom,
 }
 
 impl AiTrainingPreset {
-    const ALL: [AiTrainingPreset; 5] = [
+    const ALL: [AiTrainingPreset; 6] = [
         AiTrainingPreset::Tiny,
         AiTrainingPreset::Small,
         AiTrainingPreset::Medium,
         AiTrainingPreset::Large,
+        AiTrainingPreset::Rtx5090,
         AiTrainingPreset::Custom,
     ];
 
@@ -199,6 +208,7 @@ impl AiTrainingPreset {
             AiTrainingPreset::Small => "Small",
             AiTrainingPreset::Medium => "Medium",
             AiTrainingPreset::Large => "Large",
+            AiTrainingPreset::Rtx5090 => "RTX 5090",
             AiTrainingPreset::Custom => "Custom",
         }
     }
@@ -229,6 +239,7 @@ impl AiTrainingDimensions {
                 AiTrainingPreset::Small => Self::linear(256, 1024, 1024),
                 AiTrainingPreset::Medium => Self::linear(512, 2048, 2048),
                 AiTrainingPreset::Large => Self::linear(1024, 4096, 4096),
+                AiTrainingPreset::Rtx5090 => Self::linear(8192, 8192, 8192),
                 AiTrainingPreset::Custom => Self::linear(256, 1024, 1024),
             },
             AiTrainingWorkload::Mlp => match preset {
@@ -236,6 +247,7 @@ impl AiTrainingDimensions {
                 AiTrainingPreset::Small => Self::mlp(256, 1024, 2048),
                 AiTrainingPreset::Medium => Self::mlp(512, 2048, 4096),
                 AiTrainingPreset::Large => Self::mlp(1024, 4096, 8192),
+                AiTrainingPreset::Rtx5090 => Self::mlp(8192, 8192, 32768),
                 AiTrainingPreset::Custom => Self::mlp(256, 1024, 2048),
             },
             AiTrainingWorkload::TransformerBlock => match preset {
@@ -243,6 +255,7 @@ impl AiTrainingDimensions {
                 AiTrainingPreset::Small => Self::transformer(4, 256, 768, 12),
                 AiTrainingPreset::Medium => Self::transformer(2, 512, 1024, 16),
                 AiTrainingPreset::Large => Self::transformer(1, 1024, 2048, 16),
+                AiTrainingPreset::Rtx5090 => Self::transformer(1, 4096, 4096, 32),
                 AiTrainingPreset::Custom => Self::transformer(4, 256, 768, 12),
             },
             AiTrainingWorkload::OptimizerStress => match preset {
@@ -250,6 +263,7 @@ impl AiTrainingDimensions {
                 AiTrainingPreset::Small => Self::optimizer(64_000_000),
                 AiTrainingPreset::Medium => Self::optimizer(128_000_000),
                 AiTrainingPreset::Large => Self::optimizer(256_000_000),
+                AiTrainingPreset::Rtx5090 => Self::optimizer(1_000_000_000),
                 AiTrainingPreset::Custom => Self::optimizer(64_000_000),
             },
         }
@@ -523,8 +537,12 @@ impl AiTrainingBenchmarkState {
     }
 
     fn pytorch_cuda_can_run_selection(&self) -> bool {
-        self.workload == AiTrainingWorkload::LinearLayer
-            && self.precision == AiTrainingPrecision::F32
+        matches!(
+            self.workload,
+            AiTrainingWorkload::LinearLayer
+                | AiTrainingWorkload::Mlp
+                | AiTrainingWorkload::TransformerBlock
+        )
     }
 
     fn pytorch_cuda_ready(&self) -> bool {
@@ -550,12 +568,14 @@ impl AiTrainingBenchmarkState {
         }
         if self.backend == AiTrainingBackend::PyTorchCuda && !self.pytorch_cuda_can_run_selection() {
             self.status =
-                "PyTorch CUDA currently supports the linear f32 training benchmark".to_owned();
+                "PyTorch CUDA supports linear, MLP, and transformer training workloads".to_owned();
             self.log(self.status.clone());
             return;
         }
-        if self.precision != AiTrainingPrecision::F32 {
-            self.status = "Only f32 precision is implemented in this milestone".to_owned();
+        if self.backend == AiTrainingBackend::PortableWgpu
+            && self.precision != AiTrainingPrecision::F32
+        {
+            self.status = "Portable wgpu currently supports f32 precision".to_owned();
             self.log(self.status.clone());
             return;
         }
@@ -633,7 +653,7 @@ impl AiTrainingBenchmarkState {
         }
         if self.backend == AiTrainingBackend::PyTorchCuda && !self.pytorch_cuda_can_run_selection() {
             self.status =
-                "PyTorch CUDA smoke tests currently support linear f32 training".to_owned();
+                "PyTorch CUDA smoke tests support linear, MLP, and transformer training".to_owned();
             self.log(self.status.clone());
             return;
         }
@@ -646,6 +666,7 @@ impl AiTrainingBenchmarkState {
         config.backend = self.backend;
         config.pytorch_python = self.pytorch_python.trim().to_owned();
         config.pytorch_cuda_device = self.pytorch_cuda_device;
+        config.precision = self.precision;
         let mut sizing_notes = Vec::new();
         let adapter_memory_limit = if config.backend == AiTrainingBackend::PyTorchCuda {
             self.selected_pytorch_cuda_memory_bytes()

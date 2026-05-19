@@ -153,10 +153,10 @@ fn helper_snapshot_needs_elevation(snapshot: &SensorSnapshot) -> bool {
 }
 
 fn helper_snapshot_has_gaps(snapshot: &SensorSnapshot) -> bool {
-    sensor_reading_has_gap(snapshot.cpu.as_ref())
-        || sensor_reading_has_gap(snapshot.gpu.as_ref())
-        || sensor_reading_has_gap(snapshot.drive.as_ref())
-        || sensor_reading_has_gap(snapshot.memory.as_ref())
+    sensor_reading_has_gap(snapshot.cpu.as_ref(), SensorKind::Cpu)
+        || sensor_reading_has_gap(snapshot.gpu.as_ref(), SensorKind::Gpu)
+        || sensor_reading_has_gap(snapshot.drive.as_ref(), SensorKind::Drive)
+        || sensor_reading_has_gap(snapshot.memory.as_ref(), SensorKind::Memory)
 }
 
 fn sensor_snapshot_needs_fallback(snapshot: &SensorSnapshot, now: Instant) -> bool {
@@ -175,9 +175,18 @@ fn sensor_snapshot_has_stale_data(snapshot: &SensorSnapshot, now: Instant) -> bo
     .any(|reading| sensor_reading_is_stale(reading, now))
 }
 
-fn sensor_reading_has_gap(reading: Option<&SensorReading>) -> bool {
+fn sensor_reading_has_gap(reading: Option<&SensorReading>, kind: SensorKind) -> bool {
     match reading {
-        Some(reading) => !reading.has_temperature() || !reading.has_utilization(),
+        Some(reading) => match kind {
+            SensorKind::Cpu | SensorKind::Gpu | SensorKind::Drive => {
+                !reading.has_temperature() || !reading.has_utilization()
+            }
+            SensorKind::Memory => !reading.has_utilization(),
+            SensorKind::GpuMemory => reading
+                .metrics_for(SensorMetricKind::MemoryUsage)
+                .next()
+                .is_none(),
+        },
         None => true,
     }
 }

@@ -198,13 +198,13 @@ impl BenchScopeApp {
                         && !self.network.monitoring
                         && !self.network.adapter_refresh_running,
                     |ui| {
-                    if ui.button("Run quick diagnosis").clicked() {
+                    if ui_start_action_button(ui, "Run quick diagnosis").clicked() {
                         self.network.start_quick_diagnosis();
                     }
-                    if ui.button("Run internet speed test").clicked() {
+                    if ui_start_action_button(ui, "Run internet speed test").clicked() {
                         self.network.start_speed_test();
                     }
-                    if ui.button("Start continuous monitor").clicked() {
+                    if ui_start_action_button(ui, "Start continuous monitor").clicked() {
                         self.network.start_monitor();
                     }
                     if ui.button("Export report").clicked() {
@@ -218,7 +218,7 @@ impl BenchScopeApp {
                         Some(NetworkRunKind::QuickDiagnosis) => "Cancel diagnosis",
                         None => "Stop monitor",
                     };
-                    if ui.button(label).clicked() {
+                    if ui_cancel_action_button(ui, label).clicked() {
                         self.network.stop();
                     }
                 });

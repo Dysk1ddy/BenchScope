@@ -95,6 +95,12 @@ fn run_cli(args: &[String]) -> Result<bool> {
             .map(parse_gpu_intensity)
             .transpose()?
             .unwrap_or(GpuIntensity::Safe);
+        let precision = arg_value(args, "--precision")
+            .or_else(|| arg_value(args, "--ai-precision"))
+            .as_deref()
+            .map(parse_ai_training_precision)
+            .transpose()?
+            .unwrap_or(AiTrainingPrecision::F32);
         let pytorch_python = arg_value(args, "--python")
             .unwrap_or_else(default_pytorch_python_executable);
         let pytorch_cuda_device = arg_value(args, "--cuda-device")
@@ -129,6 +135,7 @@ fn run_cli(args: &[String]) -> Result<bool> {
         config.backend = backend;
         config.pytorch_python = pytorch_python;
         config.pytorch_cuda_device = pytorch_cuda_device;
+        config.precision = precision;
         let result = run_ai_training_benchmark(config, cancel, tx)?;
         println!("Backend: {}", result.backend);
         println!("Workload: {}", result.workload);
@@ -243,6 +250,17 @@ fn parse_ai_training_backend(value: &str) -> Result<AiTrainingBackend> {
         "pytorch" | "pytorchcuda" | "cuda" => Ok(AiTrainingBackend::PyTorchCuda),
         other => Err(anyhow!(
             "--ai-training-backend must be one of wgpu or pytorch-cuda (got {other})"
+        )),
+    }
+}
+
+fn parse_ai_training_precision(value: &str) -> Result<AiTrainingPrecision> {
+    match value.to_ascii_lowercase().replace(['_', '-'], "").as_str() {
+        "f32" | "fp32" | "float32" => Ok(AiTrainingPrecision::F32),
+        "bf16" | "bfloat16" => Ok(AiTrainingPrecision::Bf16),
+        "f16" | "fp16" | "float16" | "half" => Ok(AiTrainingPrecision::F16),
+        other => Err(anyhow!(
+            "--precision must be one of f32, bf16, or f16 (got {other})"
         )),
     }
 }

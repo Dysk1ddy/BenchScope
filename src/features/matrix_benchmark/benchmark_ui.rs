@@ -180,12 +180,12 @@ impl BenchScopeApp {
                 ui.separator();
 
                 ui.add_enabled_ui(!self.running && !self.adapters.is_empty(), |ui| {
-                    if ui.button("Run benchmark").clicked() {
+                    if ui_start_action_button(ui, "Run benchmark").clicked() {
                         self.start_single();
                     }
                 });
                 ui.add_enabled_ui(self.running && !self.repeat_running, |ui| {
-                    if ui.button("Cancel benchmark").clicked() {
+                    if ui_cancel_action_button(ui, "Cancel benchmark").clicked() {
                         self.cancel_single();
                     }
                 });

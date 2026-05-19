@@ -155,7 +155,7 @@ impl BenchScopeApp {
                 );
                 ui.separator();
                 ui.add_enabled_ui(!self.drive.running, |ui| {
-                    if ui.button("Run drive benchmark").clicked() {
+                    if ui_start_action_button(ui, "Run drive benchmark").clicked() {
                         let was_running = self.drive.running;
                         self.drive.start();
                         if !was_running && self.drive.running {
@@ -164,7 +164,7 @@ impl BenchScopeApp {
                     }
                 });
                 ui.add_enabled_ui(self.drive.running, |ui| {
-                    if ui.button("Cancel drive benchmark").clicked() {
+                    if ui_cancel_action_button(ui, "Cancel drive benchmark").clicked() {
                         self.drive.cancel();
                     }
                 });
