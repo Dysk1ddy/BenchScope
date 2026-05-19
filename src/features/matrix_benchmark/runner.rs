@@ -324,6 +324,7 @@ struct GpuRunner {
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     blocked_pipeline: wgpu::ComputePipeline,
+    tiny_stress_pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     timestamp_query: bool,
     max_storage_buffer_binding_size: u64,
@@ -365,6 +366,10 @@ impl GpuRunner {
         let blocked_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Blocked matrix multiplication shader"),
             source: wgpu::ShaderSource::Wgsl(BLOCKED_MATMUL_SHADER.into()),
+        });
+        let tiny_stress_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Tiny matrix stress shader"),
+            source: wgpu::ShaderSource::Wgsl(TINY_STRESS_MATMUL_SHADER.into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -408,12 +413,22 @@ impl GpuRunner {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
+        let tiny_stress_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Tiny matrix stress compute pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &tiny_stress_shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
 
         let runner = Self {
             device,
             queue,
             pipeline,
             blocked_pipeline,
+            tiny_stress_pipeline,
             bind_group_layout,
             timestamp_query,
             max_storage_buffer_binding_size: requested_limits.max_storage_buffer_binding_size,
@@ -1109,6 +1124,19 @@ impl GpuRunner {
         let n_u32 = u32::try_from(n).context("matrix size exceeds GPU shader limits")?;
         let byte_len = buffer_len_bytes(elements)?;
 
+        if n <= GPU_TINY_STRESS_MAX_SIZE {
+            return self.repeat_tiny_gpu_compute(
+                n,
+                n_u32,
+                a,
+                b,
+                gpu_intensity,
+                cancel,
+                deadline,
+                emit,
+            );
+        }
+
         if self.needs_blocked_path(byte_len) {
             if self.can_use_panelized_path(n, byte_len, gpu_intensity)? {
                 return self.repeat_panelized_gpu_compute(
@@ -1145,6 +1173,138 @@ impl GpuRunner {
             deadline,
             emit,
         )
+    }
+
+    fn repeat_tiny_gpu_compute<F>(
+        &self,
+        n: usize,
+        n_u32: u32,
+        a: &[f32],
+        b: &[f32],
+        gpu_intensity: GpuIntensity,
+        cancel: &AtomicBool,
+        deadline: &Option<Instant>,
+        emit: &mut F,
+    ) -> Result<RepeatProgress>
+    where
+        F: FnMut(u64, f64, f64, f64, u64, bool, bool) -> RepeatProgress,
+    {
+        let a_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Tiny stress matrix A"),
+                contents: bytemuck::cast_slice(a),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let b_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Tiny stress matrix B"),
+                contents: bytemuck::cast_slice(b),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let workgroups = gpu_tiny_stress_workgroups(gpu_intensity);
+        let scratch_elements = (workgroups as usize)
+            .checked_mul(GPU_TINY_STRESS_LANES_PER_WORKGROUP)
+            .ok_or_else(|| anyhow!("tiny stress scratch buffer size overflow"))?;
+        let scratch_bytes = buffer_len_bytes(scratch_elements)?;
+        self.ensure_block_buffer_fits("Tiny stress scratch output", scratch_bytes)?;
+        let scratch_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Tiny stress scratch output"),
+            size: scratch_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let params = Params {
+            n: n_u32,
+            row_offset: 0,
+            row_count: gpu_tiny_stress_rounds(n, gpu_intensity),
+            _pad2: 0,
+        };
+        let dispatch = self.create_direct_dispatch(
+            &a_buffer,
+            &b_buffer,
+            &scratch_buffer,
+            params,
+            scratch_elements,
+        );
+        let max_batch_limit = gpu_tiny_stress_batch_limit(gpu_intensity).max(1);
+        let mut batch_limit = max_batch_limit;
+        let mut counters = GpuRepeatCounters::default();
+
+        while repeat_should_continue(deadline, cancel) {
+            if let Err(err) = self.check_gpu_canceled(Some(cancel)) {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                return Err(err);
+            }
+
+            let mut encoder =
+                self.device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Tiny matrix stress batch encoder"),
+                    });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Tiny matrix stress batch pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.tiny_stress_pipeline);
+                pass.set_bind_group(0, &dispatch.bind_group, &[]);
+                for _ in 0..batch_limit {
+                    pass.dispatch_workgroups(workgroups, 1, 1);
+                }
+            }
+
+            let batch_start = Instant::now();
+            let submission = self.queue.submit([encoder.finish()]);
+            if let Err(err) = self.wait_for_submission(
+                submission,
+                Some(cancel),
+                "waiting for tiny matrix GPU stress batch",
+            ) {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                return Err(err);
+            }
+
+            let batch_ms = batch_start.elapsed().as_secs_f64() * 1000.0;
+            counters.record_batch(batch_limit as u64, batch_ms);
+            if batch_ms > gpu_hard_batch_backoff_ms(gpu_intensity) {
+                batch_limit = (batch_limit / 2).max(1);
+            } else if batch_ms < gpu_target_low_ms(gpu_intensity) && batch_limit < max_batch_limit {
+                batch_limit = (batch_limit * 2).min(max_batch_limit);
+            }
+            emit(
+                counters.iterations,
+                counters.latest_ms,
+                counters.total_ms,
+                counters.total_compute_ms,
+                counters.compute_count,
+                false,
+                false,
+            );
+            if repeat_should_continue(deadline, cancel)
+                && let Err(err) = pause_between_gpu_submissions(gpu_intensity, Some(cancel))
+            {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                return Err(err);
+            }
+        }
+
+        Ok(emit(
+            counters.iterations,
+            counters.latest_ms,
+            counters.total_ms,
+            counters.total_compute_ms,
+            counters.compute_count,
+            cancel.load(Ordering::Relaxed),
+            true,
+        ))
     }
 
     fn repeat_direct_gpu_compute<F>(
@@ -2151,6 +2311,34 @@ fn gpu_repeat_batch_limit(size: usize, gpu_intensity: GpuIntensity) -> usize {
         (base / 4).max(gpu_dispatch_batch_limit(gpu_intensity))
     } else {
         gpu_dispatch_batch_limit(gpu_intensity)
+    }
+}
+
+fn gpu_tiny_stress_workgroups(gpu_intensity: GpuIntensity) -> u32 {
+    match gpu_intensity {
+        GpuIntensity::Safe => GPU_SAFE_TINY_STRESS_WORKGROUPS,
+        GpuIntensity::Balanced => GPU_BALANCED_TINY_STRESS_WORKGROUPS,
+        GpuIntensity::High => GPU_HIGH_TINY_STRESS_WORKGROUPS,
+    }
+}
+
+fn gpu_tiny_stress_rounds(size: usize, gpu_intensity: GpuIntensity) -> u32 {
+    let base = match gpu_intensity {
+        GpuIntensity::Safe => GPU_SAFE_TINY_STRESS_ROUNDS,
+        GpuIntensity::Balanced => GPU_BALANCED_TINY_STRESS_ROUNDS,
+        GpuIntensity::High => GPU_HIGH_TINY_STRESS_ROUNDS,
+    };
+    let size_scale = GPU_TINY_STRESS_MAX_SIZE
+        .saturating_div(size.max(1))
+        .max(1);
+    base.saturating_mul(size_scale as u32)
+}
+
+fn gpu_tiny_stress_batch_limit(gpu_intensity: GpuIntensity) -> usize {
+    match gpu_intensity {
+        GpuIntensity::Safe => GPU_SAFE_TINY_STRESS_BATCH_DISPATCHES,
+        GpuIntensity::Balanced => GPU_BALANCED_TINY_STRESS_BATCH_DISPATCHES,
+        GpuIntensity::High => GPU_HIGH_TINY_STRESS_BATCH_DISPATCHES,
     }
 }
 
