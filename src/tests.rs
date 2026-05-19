@@ -1188,6 +1188,115 @@ mod tests {
     }
 
     #[test]
+    fn sensor_snapshot_reset_metric_ranges_rebases_current_values() {
+        let mut cpu = SensorReading::ok(SensorKind::Cpu, "CPU", 63.0, "test");
+        let temperature = cpu
+            .metrics
+            .iter_mut()
+            .find(|metric| metric.kind == SensorMetricKind::Temperature)
+            .unwrap();
+        temperature.min = Some(41.0);
+        temperature.max = Some(82.0);
+        cpu.upsert_metric(
+            SensorMetric::new(
+                SensorMetricKind::Utilization,
+                SensorMetricKind::Utilization.default_label(),
+                Some(42.0),
+            )
+            .with_range(Some(5.0), Some(96.0)),
+        );
+        let vram = SensorReading {
+            kind: SensorKind::GpuMemory,
+            label: "VRAM".to_owned(),
+            temperature_c: None,
+            utilization_percent: None,
+            metrics: vec![
+                SensorMetric::new(
+                    SensorMetricKind::MemoryUsage,
+                    SensorMetricKind::MemoryUsage.default_label(),
+                    Some(4.0),
+                )
+                .with_range(Some(1.0), Some(16.0)),
+            ],
+            provider: "test".to_owned(),
+            updated_at: Instant::now(),
+            status: SensorStatus::Ok,
+        };
+        let mut snapshot = SensorSnapshot {
+            cpu: Some(cpu),
+            gpu_memory: Some(vram),
+            ..SensorSnapshot::default()
+        };
+
+        snapshot.reset_metric_ranges();
+
+        let cpu = snapshot.cpu.unwrap();
+        let temperature = cpu
+            .metrics
+            .iter()
+            .find(|metric| metric.kind == SensorMetricKind::Temperature)
+            .unwrap();
+        let utilization = cpu
+            .metrics
+            .iter()
+            .find(|metric| metric.kind == SensorMetricKind::Utilization)
+            .unwrap();
+        let vram = snapshot.gpu_memory.unwrap();
+        let memory_usage = vram
+            .metrics
+            .iter()
+            .find(|metric| metric.kind == SensorMetricKind::MemoryUsage)
+            .unwrap();
+
+        assert_eq!(temperature.min, Some(63.0));
+        assert_eq!(temperature.max, Some(63.0));
+        assert_eq!(utilization.min, Some(42.0));
+        assert_eq!(utilization.max, Some(42.0));
+        assert_eq!(memory_usage.min, Some(4.0));
+        assert_eq!(memory_usage.max, Some(16.0));
+    }
+
+    #[test]
+    fn tracked_metric_ranges_continue_from_reset_values() {
+        let mut previous_cpu = SensorReading::ok(SensorKind::Cpu, "CPU", 60.0, "test");
+        let previous_temperature = previous_cpu
+            .metrics
+            .iter_mut()
+            .find(|metric| metric.kind == SensorMetricKind::Temperature)
+            .unwrap();
+        previous_temperature.min = Some(60.0);
+        previous_temperature.max = Some(60.0);
+        let previous = SensorSnapshot {
+            cpu: Some(previous_cpu),
+            ..SensorSnapshot::default()
+        };
+        let mut next_cpu = SensorReading::ok(SensorKind::Cpu, "CPU", 62.0, "test");
+        let next_temperature = next_cpu
+            .metrics
+            .iter_mut()
+            .find(|metric| metric.kind == SensorMetricKind::Temperature)
+            .unwrap();
+        next_temperature.min = Some(40.0);
+        next_temperature.max = Some(90.0);
+
+        let next = SensorSnapshot {
+            cpu: Some(next_cpu),
+            ..SensorSnapshot::default()
+        }
+        .with_tracked_metric_ranges(Some(&previous));
+        let temperature = next
+            .cpu
+            .unwrap()
+            .metrics
+            .into_iter()
+            .find(|metric| metric.kind == SensorMetricKind::Temperature)
+            .unwrap();
+
+        assert_eq!(temperature.min, Some(60.0));
+        assert_eq!(temperature.max, Some(62.0));
+    }
+
+    #[test]
     fn nvidia_smi_gpu_memory_parser_reads_vram_usage() {
         let reading =
             parse_nvidia_smi_gpu_memory_reading("GeForce RTX Test, 84, 4096, 12288").unwrap();

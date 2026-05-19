@@ -343,6 +343,15 @@ impl BenchScopeApp {
                         if ui.button("Minimize").clicked() {
                             self.sensor_window_minimized = true;
                         }
+                        if ui
+                            .button("Reset Min/Max")
+                            .on_hover_text("Reset sensor minimum and maximum readings to the current values")
+                            .clicked()
+                        {
+                            self.sensors.reset_metric_ranges();
+                            self.status = "Sensor min/max values reset".to_owned();
+                            self.log("Sensor min/max values reset");
+                        }
                     });
                 });
                 ui.separator();

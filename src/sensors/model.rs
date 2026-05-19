@@ -320,6 +320,19 @@ impl SensorSnapshot {
         );
         self
     }
+
+    fn with_reset_metric_ranges(mut self) -> Self {
+        self.reset_metric_ranges();
+        self
+    }
+
+    fn reset_metric_ranges(&mut self) {
+        reset_reading_metric_ranges(&mut self.cpu);
+        reset_reading_metric_ranges(&mut self.gpu);
+        reset_reading_metric_ranges(&mut self.gpu_memory);
+        reset_reading_metric_ranges(&mut self.drive);
+        reset_reading_metric_ranges(&mut self.memory);
+    }
 }
 
 fn track_reading_metric_ranges(
@@ -340,17 +353,34 @@ fn track_reading_metric_ranges(
                 .find(|candidate| sensor_metric_slots_match(candidate, metric))
         });
         metric.min = Some(
-            metric
-                .min
-                .or_else(|| previous_metric.and_then(|metric| metric.min))
+            previous_metric
+                .and_then(|metric| metric.min)
+                .or(metric.min)
                 .map_or(value, |current| current.min(value)),
         );
         metric.max = Some(
-            metric
-                .max
-                .or_else(|| previous_metric.and_then(|metric| metric.max))
+            previous_metric
+                .and_then(|metric| metric.max)
+                .or(metric.max)
                 .map_or(value, |current| current.max(value)),
         );
+    }
+}
+
+fn reset_reading_metric_ranges(reading: &mut Option<SensorReading>) {
+    let Some(reading) = reading else {
+        return;
+    };
+    for metric in &mut reading.metrics {
+        let Some(value) = metric.value else {
+            metric.min = None;
+            metric.max = None;
+            continue;
+        };
+        metric.min = Some(value);
+        if metric.kind != SensorMetricKind::MemoryUsage || metric.max.is_none() {
+            metric.max = Some(value);
+        }
     }
 }
 
@@ -468,6 +498,7 @@ struct SensorManager {
     latest: Arc<RwLock<SensorSnapshot>>,
     target_drive_letter: Arc<RwLock<Option<char>>>,
     target_gpu_uses_shared_cpu_temperature: Arc<AtomicBool>,
+    reset_metric_ranges_requested: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -476,6 +507,7 @@ impl SensorManager {
         let latest = Arc::new(RwLock::new(SensorSnapshot::default()));
         let target_drive_letter = Arc::new(RwLock::new(initial_drive_letter));
         let target_gpu_uses_shared_cpu_temperature = Arc::new(AtomicBool::new(false));
+        let reset_metric_ranges_requested = Arc::new(AtomicBool::new(false));
         let service_enabled = sensor_service_enabled();
         let helper_enabled = sensor_helper_enabled();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -484,6 +516,7 @@ impl SensorManager {
         let thread_target_drive_letter = Arc::clone(&target_drive_letter);
         let thread_target_gpu_uses_shared_cpu_temperature =
             Arc::clone(&target_gpu_uses_shared_cpu_temperature);
+        let thread_reset_metric_ranges_requested = Arc::clone(&reset_metric_ranges_requested);
         let thread_shutdown = Arc::clone(&shutdown);
 
         let _ = thread::Builder::new()
@@ -540,7 +573,12 @@ impl SensorManager {
                         use_shared_gpu_temperature,
                     );
                     if let Ok(mut latest) = thread_latest.write() {
-                        *latest = snapshot.with_tracked_metric_ranges(Some(&*latest));
+                        *latest =
+                            if thread_reset_metric_ranges_requested.swap(false, Ordering::Relaxed) {
+                                snapshot.with_reset_metric_ranges()
+                            } else {
+                                snapshot.with_tracked_metric_ranges(Some(&*latest))
+                            };
                     }
 
                     let sleep_for = Duration::from_millis(SENSOR_POLL_MS);
@@ -558,6 +596,7 @@ impl SensorManager {
             latest,
             target_drive_letter,
             target_gpu_uses_shared_cpu_temperature,
+            reset_metric_ranges_requested,
             shutdown,
         }
     }
@@ -578,6 +617,14 @@ impl SensorManager {
     fn set_target_gpu_uses_shared_cpu_temperature(&self, value: bool) {
         self.target_gpu_uses_shared_cpu_temperature
             .store(value, Ordering::Relaxed);
+    }
+
+    fn reset_metric_ranges(&self) {
+        self.reset_metric_ranges_requested
+            .store(true, Ordering::Relaxed);
+        if let Ok(mut latest) = self.latest.write() {
+            latest.reset_metric_ranges();
+        }
     }
 }
 

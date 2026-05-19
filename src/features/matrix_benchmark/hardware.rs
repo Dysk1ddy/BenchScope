@@ -243,6 +243,47 @@ fn main(
 }
 "#;
 
+const PANEL_STRESS_MATMUL_SHADER: &str = r#"
+const LANES: u32 = 256u;
+
+struct BlockParams {
+    n: u32,
+    rows: u32,
+    cols: u32,
+    rounds: u32,
+}
+
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
+@group(0) @binding(3) var<uniform> params: BlockParams;
+
+@compute @workgroup_size(16, 16, 1)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>
+) {
+    let lane = lid.y * 16u + lid.x;
+    let output_index = wid.x * LANES + lane;
+    let cells = params.rows * params.cols;
+    let cell = output_index % cells;
+    let row = cell / params.cols;
+    let col = cell % params.cols;
+    var total = 0.0;
+
+    for (var round = 0u; round < params.rounds; round = round + 1u) {
+        var sum = 0.0;
+        for (var k = 0u; k < params.n; k = k + 1u) {
+            sum = sum + a[row * params.n + k] * b[k * params.cols + col];
+        }
+        let salt = f32((round & 7u) + 1u) * 0.000001;
+        total = total + sum * (1.0 + salt);
+    }
+
+    c[output_index] = total;
+}
+"#;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Params {

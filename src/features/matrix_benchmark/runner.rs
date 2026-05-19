@@ -325,6 +325,7 @@ struct GpuRunner {
     pipeline: wgpu::ComputePipeline,
     blocked_pipeline: wgpu::ComputePipeline,
     tiny_stress_pipeline: wgpu::ComputePipeline,
+    panel_stress_pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     timestamp_query: bool,
     max_storage_buffer_binding_size: u64,
@@ -370,6 +371,10 @@ impl GpuRunner {
         let tiny_stress_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Tiny matrix stress shader"),
             source: wgpu::ShaderSource::Wgsl(TINY_STRESS_MATMUL_SHADER.into()),
+        });
+        let panel_stress_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Panel matrix stress shader"),
+            source: wgpu::ShaderSource::Wgsl(PANEL_STRESS_MATMUL_SHADER.into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -422,6 +427,15 @@ impl GpuRunner {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
+        let panel_stress_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Panel matrix stress compute pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &panel_stress_shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
 
         let runner = Self {
             device,
@@ -429,6 +443,7 @@ impl GpuRunner {
             pipeline,
             blocked_pipeline,
             tiny_stress_pipeline,
+            panel_stress_pipeline,
             bind_group_layout,
             timestamp_query,
             max_storage_buffer_binding_size: requested_limits.max_storage_buffer_binding_size,
@@ -580,6 +595,89 @@ impl GpuRunner {
                         offset: c_offset,
                         size: Some(c_binding_size),
                     }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        Ok(PanelDispatch {
+            bind_group,
+            rows,
+            cols: panel.cols,
+            _params_buffer: params_buffer,
+        })
+    }
+
+    fn create_panel_stress_dispatch(
+        &self,
+        a_buffer: &wgpu::Buffer,
+        b_buffer: &wgpu::Buffer,
+        scratch_buffer: &wgpu::Buffer,
+        n: u32,
+        size: usize,
+        panel: &ColumnPanel,
+        row_offset: usize,
+        rows: usize,
+        rounds: u32,
+    ) -> Result<PanelDispatch> {
+        let a_elements = rows
+            .checked_mul(size)
+            .ok_or_else(|| anyhow!("A stress panel row size overflow"))?;
+        let a_offset = buffer_len_bytes(
+            row_offset
+                .checked_mul(size)
+                .ok_or_else(|| anyhow!("A stress panel offset overflow"))?,
+        )?;
+        let b_offset = buffer_len_bytes(panel.element_offset)?;
+        let a_bytes = buffer_len_bytes(a_elements)?;
+        let b_bytes = buffer_len_bytes(
+            size.checked_mul(panel.cols)
+                .ok_or_else(|| anyhow!("B stress panel size overflow"))?,
+        )?;
+        let a_binding_size =
+            wgpu::BufferSize::new(a_bytes).ok_or_else(|| anyhow!("empty stress A panel"))?;
+        let b_binding_size =
+            wgpu::BufferSize::new(b_bytes).ok_or_else(|| anyhow!("empty stress B panel"))?;
+        let params = BlockParams {
+            n,
+            rows: u32::try_from(rows).context("stress panel row block exceeds shader limits")?,
+            cols: u32::try_from(panel.cols)
+                .context("stress panel column block exceeds shader limits")?,
+            _pad: rounds.max(1),
+        };
+        let params_buffer =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Persistent panel stress dispatch params"),
+                    contents: bytemuck::bytes_of(&params),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Persistent panel stress bind group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: a_buffer,
+                        offset: a_offset,
+                        size: Some(a_binding_size),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: b_buffer,
+                        offset: b_offset,
+                        size: Some(b_binding_size),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: scratch_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -1340,6 +1438,20 @@ impl GpuRunner {
                 contents: bytemuck::cast_slice(b),
                 usage: wgpu::BufferUsages::STORAGE,
             });
+
+        if n > GPU_TINY_STRESS_MAX_SIZE {
+            return self.repeat_dense_direct_gpu_compute(
+                n,
+                n_u32,
+                &a_buffer,
+                &b_buffer,
+                gpu_intensity,
+                cancel,
+                deadline,
+                emit,
+            );
+        }
+
         let c_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Stress matrix C output"),
             size: byte_len,
@@ -1358,6 +1470,128 @@ impl GpuRunner {
             deadline,
             emit,
         )
+    }
+
+    fn repeat_dense_direct_gpu_compute<F>(
+        &self,
+        n: usize,
+        n_u32: u32,
+        a_buffer: &wgpu::Buffer,
+        b_buffer: &wgpu::Buffer,
+        gpu_intensity: GpuIntensity,
+        cancel: &AtomicBool,
+        deadline: &Option<Instant>,
+        emit: &mut F,
+    ) -> Result<RepeatProgress>
+    where
+        F: FnMut(u64, f64, f64, f64, u64, bool, bool) -> RepeatProgress,
+    {
+        let workgroups = gpu_dense_stress_workgroups(gpu_intensity);
+        let scratch_elements = (workgroups as usize)
+            .checked_mul(GPU_TINY_STRESS_LANES_PER_WORKGROUP)
+            .ok_or_else(|| anyhow!("dense stress scratch buffer size overflow"))?;
+        let scratch_bytes = buffer_len_bytes(scratch_elements)?;
+        self.ensure_block_buffer_fits("Dense stress scratch output", scratch_bytes)?;
+        let scratch_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Dense stress scratch output"),
+            size: scratch_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let params = Params {
+            n: n_u32,
+            row_offset: 0,
+            row_count: gpu_dense_stress_rounds(n, gpu_intensity),
+            _pad2: 0,
+        };
+        let dispatch = self.create_direct_dispatch(
+            a_buffer,
+            b_buffer,
+            &scratch_buffer,
+            params,
+            scratch_elements,
+        );
+        let equivalent_iterations =
+            dense_stress_equivalent_iterations(scratch_elements, n, params.row_count);
+        let max_batch_limit = gpu_dense_stress_batch_limit(gpu_intensity).max(1);
+        let mut batch_limit = max_batch_limit;
+        let mut counters = GpuRepeatCounters::default();
+
+        while repeat_should_continue(deadline, cancel) {
+            if let Err(err) = self.check_gpu_canceled(Some(cancel)) {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                return Err(err);
+            }
+
+            let mut encoder =
+                self.device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Dense matrix stress batch encoder"),
+                    });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Dense matrix stress batch pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.tiny_stress_pipeline);
+                pass.set_bind_group(0, &dispatch.bind_group, &[]);
+                for _ in 0..batch_limit {
+                    pass.dispatch_workgroups(workgroups, 1, 1);
+                }
+            }
+
+            let batch_start = Instant::now();
+            let submission = self.queue.submit([encoder.finish()]);
+            if let Err(err) = self.wait_for_submission(
+                submission,
+                Some(cancel),
+                "waiting for dense matrix GPU stress batch",
+            ) {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                return Err(err);
+            }
+
+            let batch_ms = batch_start.elapsed().as_secs_f64() * 1000.0;
+            let completed_iterations =
+                (batch_limit as u64).saturating_mul(equivalent_iterations);
+            counters.record_batch(completed_iterations, batch_ms);
+            if batch_ms > gpu_hard_batch_backoff_ms(gpu_intensity) {
+                batch_limit = (batch_limit / 2).max(1);
+            } else if batch_ms < gpu_target_low_ms(gpu_intensity) && batch_limit < max_batch_limit {
+                batch_limit = (batch_limit * 2).min(max_batch_limit);
+            }
+            emit(
+                counters.iterations,
+                counters.latest_ms,
+                counters.total_ms,
+                counters.total_compute_ms,
+                counters.compute_count,
+                false,
+                false,
+            );
+            if repeat_should_continue(deadline, cancel)
+                && let Err(err) = pause_between_gpu_submissions(gpu_intensity, Some(cancel))
+            {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                return Err(err);
+            }
+        }
+
+        Ok(emit(
+            counters.iterations,
+            counters.latest_ms,
+            counters.total_ms,
+            counters.total_compute_ms,
+            counters.compute_count,
+            cancel.load(Ordering::Relaxed),
+            true,
+        ))
     }
 
     fn repeat_direct_full_gpu_compute<F>(
@@ -1469,7 +1703,7 @@ impl GpuRunner {
         n_u32: u32,
         a: &[f32],
         b: &[f32],
-        byte_len: u64,
+        _byte_len: u64,
         gpu_intensity: GpuIntensity,
         cancel: &AtomicBool,
         deadline: &Option<Instant>,
@@ -1478,7 +1712,7 @@ impl GpuRunner {
     where
         F: FnMut(u64, f64, f64, f64, u64, bool, bool) -> RepeatProgress,
     {
-        let (row_block, col_block) = self.block_dimensions(n, gpu_intensity)?;
+        let (row_block, col_block) = self.stress_block_dimensions(n, gpu_intensity)?;
         let min_row_block =
             align_block_extent(gpu_min_dispatch_rows(gpu_intensity).min(row_block).max(1));
         let initial_row_block = row_block.max(min_row_block);
@@ -1486,6 +1720,7 @@ impl GpuRunner {
             GpuWorkGovernor::new(initial_row_block, min_row_block, row_block, gpu_intensity);
         let (b_packed, panels) = pack_column_panels(b, n, col_block, Some(cancel))?;
         self.ensure_panelized_offsets_aligned(n, min_row_block, &panels)?;
+        self.ensure_panelized_offsets_aligned(n, row_block, &panels)?;
 
         let a_buffer = self
             .device
@@ -1501,20 +1736,30 @@ impl GpuRunner {
                 contents: bytemuck::cast_slice(&b_packed),
                 usage: wgpu::BufferUsages::STORAGE,
             });
-        let c_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Stress persistent packed matrix C panels"),
-            size: byte_len,
+        let workgroups = gpu_dense_stress_workgroups(gpu_intensity);
+        let scratch_elements = (workgroups as usize)
+            .checked_mul(GPU_TINY_STRESS_LANES_PER_WORKGROUP)
+            .ok_or_else(|| anyhow!("panel stress scratch buffer size overflow"))?;
+        let scratch_bytes = buffer_len_bytes(scratch_elements)?;
+        self.ensure_block_buffer_fits("Panel stress scratch output", scratch_bytes)?;
+        let scratch_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Panel stress scratch output"),
+            size: scratch_bytes,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
+        let rounds = gpu_dense_stress_rounds(n, gpu_intensity);
+        let work_cells_per_dispatch =
+            (scratch_elements as u128).saturating_mul(rounds as u128);
 
         let elements = n
             .checked_mul(n)
             .ok_or_else(|| anyhow!("matrix size overflow"))?;
+        let elements_u128 = elements as u128;
         let mut counters = GpuRepeatCounters::default();
+        let mut completed_work_cells = 0u128;
         let mut panel_index = 0usize;
         let mut row_offset = 0usize;
-        let mut completed_cells = 0usize;
 
         while repeat_should_continue(deadline, cancel) {
             if let Err(err) = self.check_gpu_canceled(Some(cancel)) {
@@ -1524,22 +1769,21 @@ impl GpuRunner {
                 return Err(err);
             }
             let mut dispatches = Vec::new();
-            let mut completed_iterations = 0u64;
-            let batch_limit = gpu_stress_repeat_batch_limit(n, gpu_intensity);
+            let batch_limit = gpu_dense_stress_batch_limit(gpu_intensity);
             while repeat_should_continue(deadline, cancel) && dispatches.len() < batch_limit {
                 let panel = &panels[panel_index];
                 let rows = governor.row_extent(n - row_offset);
-                let dispatch = self.create_panel_dispatch(
+                let dispatch = self.create_panel_stress_dispatch(
                     &a_buffer,
                     &b_buffer,
-                    &c_buffer,
+                    &scratch_buffer,
                     n_u32,
                     n,
                     panel,
                     row_offset,
                     rows,
+                    rounds,
                 )?;
-                completed_cells += rows * panel.cols;
                 dispatches.push(dispatch);
                 row_offset += rows;
                 if row_offset >= n {
@@ -1548,11 +1792,6 @@ impl GpuRunner {
                 }
                 if panel_index >= panels.len() {
                     panel_index = 0;
-                    completed_cells = 0;
-                    completed_iterations += 1;
-                } else if completed_cells >= elements {
-                    completed_cells = 0;
-                    completed_iterations += 1;
                 }
             }
             if dispatches.is_empty() {
@@ -1569,14 +1808,10 @@ impl GpuRunner {
                     label: Some("Matrix stress panel batch pass"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.blocked_pipeline);
+                pass.set_pipeline(&self.panel_stress_pipeline);
                 for dispatch in &dispatches {
                     pass.set_bind_group(0, &dispatch.bind_group, &[]);
-                    pass.dispatch_workgroups(
-                        gpu_column_workgroups(dispatch.cols as u32),
-                        (dispatch.rows as u32).div_ceil(TILE_SIZE),
-                        1,
-                    );
+                    pass.dispatch_workgroups(workgroups, 1, 1);
                 }
             }
 
@@ -1597,6 +1832,11 @@ impl GpuRunner {
             let observed_ms = batch_ms / dispatch_count as f64;
             governor.record_dispatch(observed_ms);
             governor.record_batch(batch_ms);
+            completed_work_cells = completed_work_cells
+                .saturating_add(work_cells_per_dispatch.saturating_mul(dispatch_count as u128));
+            let completed_iterations =
+                (completed_work_cells / elements_u128).min(u64::MAX as u128) as u64;
+            completed_work_cells %= elements_u128;
             counters.record_batch(completed_iterations, batch_ms);
             emit(
                 counters.iterations,
@@ -1985,14 +2225,30 @@ impl GpuRunner {
             .is_ok())
     }
 
+    fn stress_block_dimensions(
+        &self,
+        n: usize,
+        gpu_intensity: GpuIntensity,
+    ) -> Result<(usize, usize)> {
+        self.block_dimensions_with_targets(n, gpu_stress_block_targets(gpu_intensity))
+    }
+
     fn block_dimensions(&self, n: usize, gpu_intensity: GpuIntensity) -> Result<(usize, usize)> {
+        self.block_dimensions_with_targets(n, gpu_block_targets(gpu_intensity))
+    }
+
+    fn block_dimensions_with_targets(
+        &self,
+        n: usize,
+        targets: (usize, usize),
+    ) -> Result<(usize, usize)> {
         let limit_bytes = self
             .max_storage_buffer_binding_size
             .min(self.max_buffer_size)
             .max(std::mem::size_of::<f32>() as u64);
         let limit_floats = (limit_bytes / std::mem::size_of::<f32>() as u64) as usize;
         let max_rows_or_cols = (limit_floats / n).max(1);
-        let (target_rows, target_cols) = gpu_block_targets(gpu_intensity);
+        let (target_rows, target_cols) = targets;
         let rows = align_block_extent(target_rows.min(max_rows_or_cols));
         let cols = align_block_extent(target_cols.min(max_rows_or_cols));
 
@@ -2181,6 +2437,14 @@ fn gpu_block_targets(gpu_intensity: GpuIntensity) -> (usize, usize) {
     }
 }
 
+fn gpu_stress_block_targets(gpu_intensity: GpuIntensity) -> (usize, usize) {
+    match gpu_intensity {
+        GpuIntensity::Safe => (GPU_HIGH_BLOCK_ROWS, GPU_HIGH_BLOCK_COLS),
+        GpuIntensity::Balanced => (GPU_HIGH_BLOCK_ROWS * 2, GPU_HIGH_BLOCK_COLS),
+        GpuIntensity::High => (GPU_HIGH_BLOCK_ROWS * 2, GPU_HIGH_BLOCK_COLS * 2),
+    }
+}
+
 fn gpu_column_workgroups(cols: u32) -> u32 {
     cols.div_ceil(TILE_SIZE * GPU_SHADER_COLS_PER_THREAD)
 }
@@ -2265,6 +2529,47 @@ fn gpu_tiny_stress_rounds(size: usize, gpu_intensity: GpuIntensity) -> u32 {
     };
     let scaled = (u64::from(base) * u64::from(TILE_SIZE)).div_ceil(size.max(1) as u64);
     scaled.clamp(1, u64::from(u32::MAX)) as u32
+}
+
+fn gpu_dense_stress_workgroups(gpu_intensity: GpuIntensity) -> u32 {
+    match gpu_intensity {
+        GpuIntensity::Safe => GPU_SAFE_DENSE_STRESS_WORKGROUPS,
+        GpuIntensity::Balanced => GPU_BALANCED_DENSE_STRESS_WORKGROUPS,
+        GpuIntensity::High => GPU_HIGH_DENSE_STRESS_WORKGROUPS,
+    }
+}
+
+fn gpu_dense_stress_rounds(size: usize, gpu_intensity: GpuIntensity) -> u32 {
+    let target_k = match gpu_intensity {
+        GpuIntensity::Safe => GPU_SAFE_DENSE_STRESS_TARGET_K,
+        GpuIntensity::Balanced => GPU_BALANCED_DENSE_STRESS_TARGET_K,
+        GpuIntensity::High => GPU_HIGH_DENSE_STRESS_TARGET_K,
+    };
+    u64::from(target_k)
+        .div_ceil(size.max(1) as u64)
+        .clamp(1, u64::from(u32::MAX)) as u32
+}
+
+fn dense_stress_equivalent_iterations(
+    scratch_elements: usize,
+    size: usize,
+    rounds: u32,
+) -> u64 {
+    let cells_per_matrix = size
+        .checked_mul(size)
+        .map(|cells| cells.max(1) as u128)
+        .unwrap_or(u128::MAX);
+    let repeated_cells = (scratch_elements as u128).saturating_mul(rounds as u128);
+    let equivalent_iterations = (repeated_cells / cells_per_matrix).max(1);
+    equivalent_iterations.min(u64::MAX as u128) as u64
+}
+
+fn gpu_dense_stress_batch_limit(gpu_intensity: GpuIntensity) -> usize {
+    match gpu_intensity {
+        GpuIntensity::Safe => GPU_SAFE_DENSE_STRESS_BATCH_DISPATCHES,
+        GpuIntensity::Balanced => GPU_BALANCED_DENSE_STRESS_BATCH_DISPATCHES,
+        GpuIntensity::High => GPU_HIGH_DENSE_STRESS_BATCH_DISPATCHES,
+    }
 }
 
 fn tiny_stress_equivalent_iterations(
