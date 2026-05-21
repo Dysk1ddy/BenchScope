@@ -243,8 +243,9 @@ fn main(
 }
 "#;
 
-const REGISTER_TINY_STRESS_MATMUL_SHADER: &str = r#"
+const SMALL_TILE_MATMUL_SHADER: &str = r#"
 const LANES: u32 = 256u;
+const MICRO_TILE: u32 = 4u;
 
 struct Params {
     n: u32,
@@ -263,47 +264,164 @@ fn main(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>
 ) {
-    let matrix_index = wid.x * LANES + lid.x;
-    let lane_salt = f32((matrix_index & 15u) + 1u) * 0.0000001;
-
-    let base_a0 = vec4<f32>(a[0], a[1], a[2], a[3]);
-    let base_a1 = vec4<f32>(a[4], a[5], a[6], a[7]);
-    let base_a2 = vec4<f32>(a[8], a[9], a[10], a[11]);
-    let base_a3 = vec4<f32>(a[12], a[13], a[14], a[15]);
-
-    let base_b0 = vec4<f32>(b[0], b[4], b[8], b[12]);
-    let base_b1 = vec4<f32>(b[1], b[5], b[9], b[13]);
-    let base_b2 = vec4<f32>(b[2], b[6], b[10], b[14]);
-    let base_b3 = vec4<f32>(b[3], b[7], b[11], b[15]);
-
-    var acc0 = vec4<f32>(0.0);
-    var acc1 = vec4<f32>(0.0);
-    var acc2 = vec4<f32>(0.0);
-    var acc3 = vec4<f32>(0.0);
-
-    for (var round = 0u; round < params.row_count; round = round + 1u) {
-        let round_salt = f32(((round + (matrix_index & 31u)) & 31u) + 1u) * 0.000001;
-        let tweak0 = vec4<f32>(round_salt, -round_salt, lane_salt, -lane_salt);
-        let tweak1 = vec4<f32>(lane_salt, round_salt, -round_salt, -lane_salt);
-        let tweak2 = vec4<f32>(-lane_salt, round_salt, lane_salt, -round_salt);
-        let tweak3 = vec4<f32>(round_salt, lane_salt, -lane_salt, -round_salt);
-
-        let a0 = base_a0 + tweak0;
-        let a1 = base_a1 + tweak1;
-        let a2 = base_a2 + tweak2;
-        let a3 = base_a3 + tweak3;
-        let b0 = base_b0 + tweak3;
-        let b1 = base_b1 + tweak2;
-        let b2 = base_b2 + tweak1;
-        let b3 = base_b3 + tweak0;
-
-        acc0 = acc0 + vec4<f32>(dot(a0, b0), dot(a0, b1), dot(a0, b2), dot(a0, b3));
-        acc1 = acc1 + vec4<f32>(dot(a1, b0), dot(a1, b1), dot(a1, b2), dot(a1, b3));
-        acc2 = acc2 + vec4<f32>(dot(a2, b0), dot(a2, b1), dot(a2, b2), dot(a2, b3));
-        acc3 = acc3 + vec4<f32>(dot(a3, b0), dot(a3, b1), dot(a3, b2), dot(a3, b3));
+    let tile_index = wid.x * LANES + lid.x;
+    let tiles_per_row = params.n / MICRO_TILE;
+    let tile_count = tiles_per_row * tiles_per_row;
+    if (tile_index >= tile_count) {
+        return;
     }
 
-    c[matrix_index] = dot(acc0 + acc1 + acc2 + acc3, vec4<f32>(1.0));
+    let row_base = (tile_index / tiles_per_row) * MICRO_TILE;
+    let col_base = (tile_index % tiles_per_row) * MICRO_TILE;
+    var c00 = 0.0;
+    var c01 = 0.0;
+    var c02 = 0.0;
+    var c03 = 0.0;
+    var c10 = 0.0;
+    var c11 = 0.0;
+    var c12 = 0.0;
+    var c13 = 0.0;
+    var c20 = 0.0;
+    var c21 = 0.0;
+    var c22 = 0.0;
+    var c23 = 0.0;
+    var c30 = 0.0;
+    var c31 = 0.0;
+    var c32 = 0.0;
+    var c33 = 0.0;
+
+    for (var k = 0u; k < params.n; k = k + 1u) {
+        let a0 = a[(row_base + 0u) * params.n + k];
+        let a1 = a[(row_base + 1u) * params.n + k];
+        let a2 = a[(row_base + 2u) * params.n + k];
+        let a3 = a[(row_base + 3u) * params.n + k];
+        let b0 = b[k * params.n + col_base + 0u];
+        let b1 = b[k * params.n + col_base + 1u];
+        let b2 = b[k * params.n + col_base + 2u];
+        let b3 = b[k * params.n + col_base + 3u];
+
+        c00 = fma(a0, b0, c00);
+        c01 = fma(a0, b1, c01);
+        c02 = fma(a0, b2, c02);
+        c03 = fma(a0, b3, c03);
+        c10 = fma(a1, b0, c10);
+        c11 = fma(a1, b1, c11);
+        c12 = fma(a1, b2, c12);
+        c13 = fma(a1, b3, c13);
+        c20 = fma(a2, b0, c20);
+        c21 = fma(a2, b1, c21);
+        c22 = fma(a2, b2, c22);
+        c23 = fma(a2, b3, c23);
+        c30 = fma(a3, b0, c30);
+        c31 = fma(a3, b1, c31);
+        c32 = fma(a3, b2, c32);
+        c33 = fma(a3, b3, c33);
+    }
+
+    c[(row_base + 0u) * params.n + col_base + 0u] = c00;
+    c[(row_base + 0u) * params.n + col_base + 1u] = c01;
+    c[(row_base + 0u) * params.n + col_base + 2u] = c02;
+    c[(row_base + 0u) * params.n + col_base + 3u] = c03;
+    c[(row_base + 1u) * params.n + col_base + 0u] = c10;
+    c[(row_base + 1u) * params.n + col_base + 1u] = c11;
+    c[(row_base + 1u) * params.n + col_base + 2u] = c12;
+    c[(row_base + 1u) * params.n + col_base + 3u] = c13;
+    c[(row_base + 2u) * params.n + col_base + 0u] = c20;
+    c[(row_base + 2u) * params.n + col_base + 1u] = c21;
+    c[(row_base + 2u) * params.n + col_base + 2u] = c22;
+    c[(row_base + 2u) * params.n + col_base + 3u] = c23;
+    c[(row_base + 3u) * params.n + col_base + 0u] = c30;
+    c[(row_base + 3u) * params.n + col_base + 1u] = c31;
+    c[(row_base + 3u) * params.n + col_base + 2u] = c32;
+    c[(row_base + 3u) * params.n + col_base + 3u] = c33;
+}
+"#;
+
+const REGISTER_TINY_STRESS_MATMUL_SHADER: &str = r#"
+const LANES: u32 = 256u;
+const MICRO_TILE: u32 = 4u;
+
+struct Params {
+    n: u32,
+    row_offset: u32,
+    row_count: u32,
+    _pad2: u32,
+}
+
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>
+) {
+    let output_index = wid.x * LANES + lid.x;
+    let tiles_per_row = params.n / MICRO_TILE;
+    let tile_count = tiles_per_row * tiles_per_row;
+    let tile_index = output_index % tile_count;
+    let row_base = (tile_index / tiles_per_row) * MICRO_TILE;
+    let col_base = (tile_index % tiles_per_row) * MICRO_TILE;
+    let lane_salt = f32((output_index & 255u) + 1u) * 0.00000003;
+    var total = 0.0;
+
+    for (var round = 0u; round < params.row_count; round = round + 1u) {
+        let round_salt = f32(((round + (output_index & 255u)) & 255u) + 1u) * 0.00000025 + lane_salt;
+        var c00 = 0.0;
+        var c01 = 0.0;
+        var c02 = 0.0;
+        var c03 = 0.0;
+        var c10 = 0.0;
+        var c11 = 0.0;
+        var c12 = 0.0;
+        var c13 = 0.0;
+        var c20 = 0.0;
+        var c21 = 0.0;
+        var c22 = 0.0;
+        var c23 = 0.0;
+        var c30 = 0.0;
+        var c31 = 0.0;
+        var c32 = 0.0;
+        var c33 = 0.0;
+
+        for (var k = 0u; k < params.n; k = k + 1u) {
+            let a0 = a[(row_base + 0u) * params.n + k] + round_salt;
+            let a1 = a[(row_base + 1u) * params.n + k] - round_salt;
+            let a2 = a[(row_base + 2u) * params.n + k] + lane_salt;
+            let a3 = a[(row_base + 3u) * params.n + k] - lane_salt;
+            let b0 = b[k * params.n + col_base + 0u];
+            let b1 = b[k * params.n + col_base + 1u];
+            let b2 = b[k * params.n + col_base + 2u];
+            let b3 = b[k * params.n + col_base + 3u];
+
+            c00 = fma(a0, b0, c00);
+            c01 = fma(a0, b1, c01);
+            c02 = fma(a0, b2, c02);
+            c03 = fma(a0, b3, c03);
+            c10 = fma(a1, b0, c10);
+            c11 = fma(a1, b1, c11);
+            c12 = fma(a1, b2, c12);
+            c13 = fma(a1, b3, c13);
+            c20 = fma(a2, b0, c20);
+            c21 = fma(a2, b1, c21);
+            c22 = fma(a2, b2, c22);
+            c23 = fma(a2, b3, c23);
+            c30 = fma(a3, b0, c30);
+            c31 = fma(a3, b1, c31);
+            c32 = fma(a3, b2, c32);
+            c33 = fma(a3, b3, c33);
+        }
+
+        total = total
+            + c00 + c01 + c02 + c03
+            + c10 + c11 + c12 + c13
+            + c20 + c21 + c22 + c23
+            + c30 + c31 + c32 + c33;
+    }
+
+    c[output_index] = total;
 }
 "#;
 

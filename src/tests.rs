@@ -275,12 +275,24 @@ mod tests {
 
     #[test]
     fn register_tiny_stress_counts_one_full_4x4_per_lane_round() {
-        assert_eq!(register_tiny_stress_equivalent_iterations(256, 8), 2048);
+        assert_eq!(register_tiny_stress_equivalent_iterations(256, 4, 8), 2048);
+        assert_eq!(register_tiny_stress_equivalent_iterations(256, 8, 8), 512);
+        assert_eq!(register_tiny_stress_equivalent_iterations(256, 16, 8), 128);
+        assert_eq!(register_tiny_stress_equivalent_iterations(256, 32, 8), 32);
     }
 
     #[test]
     fn stress_rate_formatter_uses_trillion_units() {
         assert_eq!(format_stress_rate_per_min(1_700_000_000_000, 60.0), "1.70T/min");
+    }
+
+    #[test]
+    fn small_tile_path_covers_small_power_of_two_matrices() {
+        for size in [4, 8, 16, 32] {
+            assert!(uses_small_tile_path(size));
+            assert!(gpu_small_tile_workgroups(size).unwrap() >= 1);
+        }
+        assert!(!uses_small_tile_path(64));
     }
 
     #[test]

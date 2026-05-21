@@ -25,6 +25,7 @@ struct BenchmarkResult {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GpuPath {
     DirectFullBuffer,
+    SmallTile,
     PersistentPanelized,
     StreamingBlocked,
 }
@@ -33,6 +34,7 @@ impl GpuPath {
     fn label(self) -> &'static str {
         match self {
             GpuPath::DirectFullBuffer => "Direct",
+            GpuPath::SmallTile => "Small Tile",
             GpuPath::PersistentPanelized => "Panelized",
             GpuPath::StreamingBlocked => "Streaming",
         }
@@ -125,7 +127,7 @@ impl StressGpuBackend {
     fn description(self) -> &'static str {
         match self {
             StressGpuBackend::Optimized => {
-                "For 4x4, uses CUDA tensor-core equivalent work when available, otherwise a register-heavy WGPU microkernel."
+                "For 4x4 through 32x32, uses CUDA tensor-core equivalent work when available, otherwise a WGPU 4x4-tile microkernel."
             }
             StressGpuBackend::ArchivedWgpu => {
                 "Keeps the previous tiny-matrix WGPU stress shader for comparison."

@@ -349,6 +349,7 @@ struct GpuRunner {
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     blocked_pipeline: wgpu::ComputePipeline,
+    small_tile_pipeline: wgpu::ComputePipeline,
     tiny_stress_pipeline: wgpu::ComputePipeline,
     register_tiny_stress_pipeline: wgpu::ComputePipeline,
     panel_stress_pipeline: wgpu::ComputePipeline,
@@ -393,6 +394,10 @@ impl GpuRunner {
         let blocked_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Blocked matrix multiplication shader"),
             source: wgpu::ShaderSource::Wgsl(BLOCKED_MATMUL_SHADER.into()),
+        });
+        let small_tile_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Small tile matrix multiplication shader"),
+            source: wgpu::ShaderSource::Wgsl(SMALL_TILE_MATMUL_SHADER.into()),
         });
         let tiny_stress_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Tiny matrix stress shader"),
@@ -449,6 +454,15 @@ impl GpuRunner {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
+        let small_tile_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Small tile matrix multiplication compute pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &small_tile_shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
         let tiny_stress_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Tiny matrix stress compute pipeline"),
@@ -482,6 +496,7 @@ impl GpuRunner {
             queue,
             pipeline,
             blocked_pipeline,
+            small_tile_pipeline,
             tiny_stress_pipeline,
             register_tiny_stress_pipeline,
             panel_stress_pipeline,
@@ -735,6 +750,161 @@ impl GpuRunner {
         })
     }
 
+    fn multiply_small_tile(
+        &self,
+        n: usize,
+        n_u32: u32,
+        a: &[f32],
+        b: &[f32],
+        byte_len: u64,
+        use_timestamps: bool,
+        cancel: Option<&AtomicBool>,
+        mut progress: Option<&mut SingleProgressTracker>,
+    ) -> Result<GpuTiming> {
+        let elements = n
+            .checked_mul(n)
+            .ok_or_else(|| anyhow!("matrix size overflow"))?;
+        let total_start = Instant::now();
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.gpu_started = Some(Instant::now());
+            progress.set_phase("GPU small-tile compute and readback", true);
+            progress.set_gpu_progress(0.0, true);
+        }
+
+        let a_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Small tile matrix A"),
+                contents: bytemuck::cast_slice(a),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let b_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Small tile matrix B"),
+                contents: bytemuck::cast_slice(b),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let c_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Small tile matrix C GPU output"),
+            size: byte_len,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Small tile matrix C readback"),
+            size: byte_len,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let params = Params {
+            n: n_u32,
+            row_offset: 0,
+            row_count: 0,
+            _pad2: 0,
+        };
+        let dispatch = self.create_direct_dispatch(&a_buffer, &b_buffer, &c_buffer, params, n);
+        let timestamp_enabled = self.timestamp_query && use_timestamps;
+        let query_set = timestamp_enabled.then(|| {
+            self.device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("Small tile GPU compute timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: 2,
+            })
+        });
+        let timestamp_resolve = timestamp_enabled.then(|| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Small tile timestamp resolve"),
+                size: 16,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        });
+        let timestamp_readback = timestamp_enabled.then(|| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Small tile timestamp readback"),
+                size: 16,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Small tile matrix encoder"),
+            });
+        {
+            let timestamp_writes = query_set
+                .as_ref()
+                .map(|query_set| wgpu::ComputePassTimestampWrites {
+                    query_set,
+                    beginning_of_pass_write_index: Some(0),
+                    end_of_pass_write_index: Some(1),
+                });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Small tile matrix pass"),
+                timestamp_writes,
+            });
+            pass.set_pipeline(&self.small_tile_pipeline);
+            pass.set_bind_group(0, &dispatch.bind_group, &[]);
+            pass.dispatch_workgroups(gpu_small_tile_workgroups(n)?, 1, 1);
+        }
+        if let (Some(query_set), Some(resolve), Some(readback)) =
+            (&query_set, &timestamp_resolve, &timestamp_readback)
+        {
+            encoder.resolve_query_set(query_set, 0..2, resolve, 0);
+            encoder.copy_buffer_to_buffer(resolve, 0, readback, 0, 16);
+        }
+        encoder.copy_buffer_to_buffer(&c_buffer, 0, &readback_buffer, 0, byte_len);
+
+        let dispatch_start = Instant::now();
+        let submission = self.queue.submit([encoder.finish()]);
+        self.wait_for_submission(
+            submission,
+            cancel,
+            "waiting for small-tile GPU matrix pass",
+        )?;
+        let observed_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
+
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.set_phase("GPU small-tile readback", true);
+            progress.set_gpu_progress(0.98, true);
+        }
+        let output = read_f32_buffer_cancelable(&self.device, &readback_buffer, elements, cancel)
+            .context("reading small-tile GPU result buffer")?;
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.set_gpu_progress(1.0, true);
+        }
+
+        let timestamp_pairs = if let Some(readback) = &timestamp_readback {
+            read_timestamps(&self.device, readback, 1, cancel).ok()
+        } else {
+            None
+        };
+        let (compute_ms, dispatch_times_ms) = dispatch_stats_from_timestamps(
+            timestamp_pairs,
+            &[observed_ms],
+            self.queue.get_timestamp_period() as f64,
+        );
+        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+        let transfer_sync_ms = compute_ms.map(|ms| (total_ms - ms).max(0.0));
+        let stats = GpuDispatchStats::new(
+            GpuPath::SmallTile,
+            format!("4x4 tiles over {n}x{n}"),
+            &dispatch_times_ms,
+            0,
+        );
+
+        Ok(GpuTiming {
+            compute_ms,
+            total_ms,
+            transfer_sync_ms,
+            stats,
+            output,
+        })
+    }
+
     fn multiply_cancelable(
         &self,
         n: usize,
@@ -757,6 +927,18 @@ impl GpuRunner {
             .checked_mul(std::mem::size_of::<f32>())
             .ok_or_else(|| anyhow!("matrix byte length overflow"))?
             as wgpu::BufferAddress;
+        if uses_small_tile_path(n) {
+            return self.multiply_small_tile(
+                n,
+                n_u32,
+                a,
+                b,
+                byte_len,
+                use_timestamps,
+                cancel,
+                progress,
+            );
+        }
         if self.needs_blocked_path(byte_len) {
             if self.can_use_panelized_path(n, byte_len, gpu_intensity)? {
                 return self.multiply_panelized(
@@ -1264,8 +1446,9 @@ impl GpuRunner {
         let n_u32 = u32::try_from(n).context("matrix size exceeds GPU shader limits")?;
         let byte_len = buffer_len_bytes(elements)?;
 
-        if n == 4 && stress_gpu_backend == StressGpuBackend::Optimized {
+        if uses_small_tile_path(n) && stress_gpu_backend == StressGpuBackend::Optimized {
             return self.repeat_register_tiny_gpu_compute(
+                n,
                 n_u32,
                 a,
                 b,
@@ -1329,6 +1512,7 @@ impl GpuRunner {
 
     fn repeat_register_tiny_gpu_compute<F>(
         &self,
+        n: usize,
         n_u32: u32,
         a: &[f32],
         b: &[f32],
@@ -1369,7 +1553,7 @@ impl GpuRunner {
         let params = Params {
             n: n_u32,
             row_offset: 0,
-            row_count: gpu_register_tiny_stress_rounds(gpu_intensity),
+            row_count: gpu_register_tiny_stress_rounds(n, gpu_intensity),
             _pad2: 0,
         };
         let dispatch = self.create_direct_dispatch(
@@ -1380,7 +1564,7 @@ impl GpuRunner {
             scratch_elements,
         );
         let equivalent_iterations =
-            register_tiny_stress_equivalent_iterations(scratch_elements, params.row_count);
+            register_tiny_stress_equivalent_iterations(scratch_elements, n, params.row_count);
         let max_batch_limit = gpu_register_tiny_stress_batch_limit(gpu_intensity).max(1);
         let mut batch_limit = max_batch_limit;
         let mut counters = GpuRepeatCounters::default();
@@ -2720,12 +2904,30 @@ fn gpu_tiny_stress_rounds(size: usize, gpu_intensity: GpuIntensity) -> u32 {
     scaled.clamp(1, u64::from(u32::MAX)) as u32
 }
 
+fn uses_small_tile_path(size: usize) -> bool {
+    matches!(size, 4 | 8 | 16 | 32)
+}
+
+fn small_tile_count(size: usize) -> Option<usize> {
+    uses_small_tile_path(size).then(|| {
+        let tiles_per_row = size / 4;
+        tiles_per_row * tiles_per_row
+    })
+}
+
+fn gpu_small_tile_workgroups(size: usize) -> Result<u32> {
+    let tile_count =
+        small_tile_count(size).ok_or_else(|| anyhow!("small-tile path requires 4/8/16/32"))?;
+    let workgroups = tile_count.div_ceil(GPU_TINY_STRESS_LANES_PER_WORKGROUP);
+    u32::try_from(workgroups.max(1)).context("small-tile workgroup count exceeds GPU limits")
+}
+
 fn gpu_register_tiny_stress_workgroups(gpu_intensity: GpuIntensity) -> u32 {
     gpu_tiny_stress_workgroups(gpu_intensity)
 }
 
-fn gpu_register_tiny_stress_rounds(gpu_intensity: GpuIntensity) -> u32 {
-    gpu_tiny_stress_rounds(4, gpu_intensity)
+fn gpu_register_tiny_stress_rounds(size: usize, gpu_intensity: GpuIntensity) -> u32 {
+    gpu_tiny_stress_rounds(size, gpu_intensity)
 }
 
 fn gpu_dense_stress_workgroups(gpu_intensity: GpuIntensity) -> u32 {
@@ -2785,9 +2987,12 @@ fn tiny_stress_equivalent_iterations(
 
 fn register_tiny_stress_equivalent_iterations(
     scratch_elements: usize,
+    size: usize,
     rounds: u32,
 ) -> u64 {
-    let equivalent_iterations = (scratch_elements as u128).saturating_mul(rounds as u128);
+    let tiles_per_matrix = small_tile_count(size).unwrap_or(1).max(1) as u128;
+    let tile_iterations = (scratch_elements as u128).saturating_mul(rounds as u128);
+    let equivalent_iterations = (tile_iterations / tiles_per_matrix).max(1);
     equivalent_iterations.min(u64::MAX as u128) as u64
 }
 
@@ -3900,10 +4105,11 @@ fn run_repeat(
             }
         }
         RepeatMode::Gpu => {
-            if size == 4 && stress_gpu_backend == StressGpuBackend::Optimized {
+            if uses_small_tile_path(size) && stress_gpu_backend == StressGpuBackend::Optimized {
                 let _ = tx.send(WorkerEvent::Log(
-                    "Trying PyTorch CUDA tensor-core equivalent stress backend for 4x4"
-                        .to_owned(),
+                    format!(
+                        "Trying PyTorch CUDA tensor-core equivalent stress backend for {size}x{size}"
+                    ),
                 ));
                 match repeat_pytorch_cuda_tiny_matrix_stress(
                     size,
@@ -3914,15 +4120,17 @@ fn run_repeat(
                 ) {
                     Ok(Some(progress)) => {
                         let _ = tx.send(WorkerEvent::Log(
-                            "4x4 stress used the PyTorch CUDA tensor-core equivalent backend"
-                                .to_owned(),
+                            format!(
+                                "{size}x{size} stress used the PyTorch CUDA tensor-core equivalent backend"
+                            ),
                         ));
                         return Ok(progress);
                     }
                     Ok(None) => {
                         let _ = tx.send(WorkerEvent::Log(
-                            "PyTorch CUDA 4x4 stress backend unavailable; falling back to WGPU register microkernel"
-                                .to_owned(),
+                            format!(
+                                "PyTorch CUDA {size}x{size} stress backend unavailable; falling back to WGPU small-tile microkernel"
+                            ),
                         ));
                     }
                     Err(err) => return Err(err),
@@ -4205,8 +4413,8 @@ try:
     if args.device < 0 or args.device >= count:
         emit("PYTORCH_MATRIX_UNAVAILABLE", "CUDA device {} is not available".format(args.device))
         sys.exit(0)
-    if args.size != 4:
-        emit("PYTORCH_MATRIX_UNAVAILABLE", "tensor-core equivalent stress currently targets 4x4")
+    if args.size not in (4, 8, 16, 32):
+        emit("PYTORCH_MATRIX_UNAVAILABLE", "tensor-core equivalent stress currently targets 4x4, 8x8, 16x16, or 32x32")
         sys.exit(0)
 
     torch.cuda.set_device(args.device)
@@ -4214,7 +4422,7 @@ try:
     props = torch.cuda.get_device_properties(args.device)
     emit("RESULT_GPU_NAME", props.name)
     emit("RESULT_DEVICE_INDEX", args.device)
-    emit("PYTORCH_MATRIX_BACKEND", "torch.mm fp16 tensor-core equivalent 4x4")
+    emit("PYTORCH_MATRIX_BACKEND", "torch.mm fp16 tensor-core equivalent {}x{}".format(args.size, args.size))
 
     try:
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -4278,9 +4486,9 @@ try:
     equivalent_per_mm = max(1, (effective_size ** 3) // (args.size ** 3))
     emit("RESULT_EFFECTIVE_SIZE", effective_size)
     emit("RESULT_DTYPE", "float16")
-    emit("RESULT_EQUIVALENT_4X4_PER_MM", equivalent_per_mm)
+    emit("RESULT_EQUIVALENT_SMALL_MATRIX_PER_MM", equivalent_per_mm)
     if effective_size != desired_size:
-        emit("NOTE", "using {}x{} tensor-core GEMM for equivalent 4x4 accounting".format(effective_size, effective_size))
+        emit("NOTE", "using {}x{} tensor-core GEMM for equivalent {}x{} accounting".format(effective_size, effective_size, args.size, args.size))
 
     warmups = {"safe": 1, "balanced": 2, "high": 3}[args.intensity]
     for _ in range(warmups):
