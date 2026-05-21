@@ -144,6 +144,24 @@ fn format_stress_rate_per_min(iterations: u64, elapsed_s: f64) -> String {
     }
 }
 
+fn format_stress_iterations_per_second(value: Option<f64>) -> String {
+    match value {
+        Some(value) if value >= 1.0e12 => format!("{:.2}T/s", value / 1.0e12),
+        Some(value) if value >= 1.0e9 => format!("{:.2}B/s", value / 1.0e9),
+        Some(value) if value >= 1.0e6 => format!("{:.2}M/s", value / 1.0e6),
+        Some(value) if value >= 1.0e3 => format!("{:.2}K/s", value / 1.0e3),
+        Some(value) if value >= 100.0 => format!("{value:.1}/s"),
+        Some(value) => format!("{value:.2}/s"),
+        None => "N/A".to_owned(),
+    }
+}
+
+fn format_optional_percent_f64(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.1}%"))
+        .unwrap_or_else(|| "N/A".to_owned())
+}
+
 fn format_drive_speed(result: &DriveBenchmarkResult) -> String {
     if result.test.is_read() {
         format_optional_rate(result.read_mbps)

@@ -23,19 +23,34 @@ impl AiTrainingWorkload {
         }
     }
 
-    fn description(self) -> &'static str {
+    fn description_for_backend(self, backend: AiTrainingBackend) -> &'static str {
         match self {
-            AiTrainingWorkload::LinearLayer => {
-                "Forward, weight-gradient, input-gradient, and optimizer-style update GEMMs."
-            }
-            AiTrainingWorkload::Mlp => {
-                "Two dense layers with activation and backward-pass shaped GEMM work."
-            }
-            AiTrainingWorkload::TransformerBlock => {
-                "Attention and MLP GEMM-heavy proxy for transformer block training."
+            AiTrainingWorkload::LinearLayer => match backend {
+                AiTrainingBackend::PyTorchCuda => {
+                    "Single PyTorch linear layer with real forward, loss, backward, and AdamW update."
+                }
+                AiTrainingBackend::PortableWgpu => {
+                    "Portable GEMM proxy: forward, weight-gradient, input-gradient, and SGD-style update kernels."
+                }
+            },
+            AiTrainingWorkload::Mlp => match backend {
+                AiTrainingBackend::PyTorchCuda => {
+                    "PyTorch two-layer MLP with GELU, loss, backward pass, and AdamW update."
+                }
+                AiTrainingBackend::PortableWgpu => {
+                    "Portable GEMM proxy: two dense training-shaped blocks with SGD-style updates."
+                }
+            },
+            AiTrainingWorkload::TransformerBlock => match backend {
+                AiTrainingBackend::PyTorchCuda => {
+                    "PyTorch transformer block with layer norm, attention, MLP, loss, backward pass, and AdamW update."
+                }
+                AiTrainingBackend::PortableWgpu => {
+                    "Portable GEMM proxy for transformer-like projection, attention, and MLP work."
+                }
             }
             AiTrainingWorkload::OptimizerStress => {
-                "Memory-bandwidth heavy parameter update pass over large optimizer state."
+                "Portable memory/update pressure pass over a large optimizer-style parameter set."
             }
         }
     }
@@ -63,24 +78,24 @@ enum AiTrainingBackend {
 
 impl AiTrainingBackend {
     const ALL: [AiTrainingBackend; 2] = [
-        AiTrainingBackend::PortableWgpu,
         AiTrainingBackend::PyTorchCuda,
+        AiTrainingBackend::PortableWgpu,
     ];
 
     fn label(self) -> &'static str {
         match self {
-            AiTrainingBackend::PortableWgpu => "Portable wgpu",
-            AiTrainingBackend::PyTorchCuda => "PyTorch CUDA",
+            AiTrainingBackend::PortableWgpu => "Portable wgpu proxy",
+            AiTrainingBackend::PyTorchCuda => "PyTorch CUDA training",
         }
     }
 
     fn description(self) -> &'static str {
         match self {
             AiTrainingBackend::PortableWgpu => {
-                "Runs BenchScope's portable WGSL training-style kernels."
+                "Cross-vendor fallback for synthetic training-shaped GEMM/update proxies. Use Matrix Stress for raw sustained GEMM."
             }
             AiTrainingBackend::PyTorchCuda => {
-                "Uses a Python/PyTorch CUDA stack for NVIDIA training benchmarks."
+                "Primary AI path. Runs real PyTorch model training steps on a selected NVIDIA CUDA device."
             }
         }
     }
@@ -331,6 +346,13 @@ impl AiTrainingDimensions {
 }
 
 #[derive(Clone, Debug)]
+struct AiTrainingStepTimings {
+    forward_loss_ms: f64,
+    backward_ms: f64,
+    optimizer_ms: f64,
+}
+
+#[derive(Clone, Debug)]
 struct AiTrainingResult {
     backend: AiTrainingBackend,
     workload: AiTrainingWorkload,
@@ -346,6 +368,7 @@ struct AiTrainingResult {
     throughput_label: &'static str,
     avg_step_ms: Option<f64>,
     p95_step_ms: Option<f64>,
+    step_timings: Option<AiTrainingStepTimings>,
     memory_bytes: u64,
     validation: String,
     notes: String,
@@ -385,7 +408,9 @@ enum AiTrainingWorkerEvent {
     Progress(AiTrainingProgress),
     Log(String),
     PyTorchProbeDone(Result<PyTorchCudaEnvironment, String>),
+    PyTorchInstallDone(Result<PyTorchCudaEnvironment, String>),
     Done(Result<AiTrainingResult, String>),
+    BatchDone(Result<Vec<AiTrainingResult>, String>),
 }
 
 struct AiTrainingBenchmarkState {
@@ -412,6 +437,8 @@ struct AiTrainingBenchmarkState {
     pytorch_cuda_device: usize,
     pytorch_probe: Option<PyTorchCudaEnvironment>,
     pytorch_probe_running: bool,
+    pytorch_install_running: bool,
+    pending_pytorch_install: bool,
 }
 
 impl AiTrainingBenchmarkState {
@@ -439,17 +466,24 @@ impl AiTrainingBenchmarkState {
             tx,
             cancel: None,
             running: false,
-            backend: AiTrainingBackend::PortableWgpu,
+            backend: AiTrainingBackend::PyTorchCuda,
             pytorch_python: default_pytorch_python_executable(),
             pytorch_cuda_device: 0,
             pytorch_probe: None,
             pytorch_probe_running: false,
+            pytorch_install_running: false,
+            pending_pytorch_install: false,
         }
     }
 
     fn set_backend(&mut self, backend: AiTrainingBackend) {
         if self.backend != backend {
             self.backend = backend;
+            if backend == AiTrainingBackend::PyTorchCuda && !self.pytorch_cuda_can_run_selection() {
+                self.workload = AiTrainingWorkload::LinearLayer;
+                self.apply_preset();
+                self.log("PyTorch CUDA selected; switched to a supported training workload");
+            }
             self.log(format!("Selected backend: {}", backend.label()));
         }
     }
@@ -524,12 +558,14 @@ impl AiTrainingBenchmarkState {
                     && self.measured_steps > 0
                     && !self.running
                     && !self.pytorch_probe_running
+                    && !self.pytorch_install_running
             }
             AiTrainingBackend::PyTorchCuda => {
                 self.pytorch_cuda_can_run_selection()
                     && self.measured_steps > 0
                     && !self.running
                     && !self.pytorch_probe_running
+                    && !self.pytorch_install_running
                     && !self.pytorch_python.trim().is_empty()
                     && self.pytorch_cuda_ready()
             }
@@ -721,7 +757,7 @@ impl AiTrainingBenchmarkState {
     }
 
     fn start_pytorch_probe(&mut self) {
-        if self.pytorch_probe_running || self.running {
+        if self.pytorch_probe_running || self.pytorch_install_running || self.running {
             return;
         }
 
@@ -750,6 +786,115 @@ impl AiTrainingBenchmarkState {
                 })
                 .and_then(|result| result.map_err(|err| format!("{err:#}")));
             let _ = tx.send(AiTrainingWorkerEvent::PyTorchProbeDone(result));
+        });
+    }
+
+    fn request_pytorch_install(&mut self) {
+        if self.running || self.pytorch_probe_running || self.pytorch_install_running {
+            return;
+        }
+        self.pending_pytorch_install = true;
+    }
+
+    fn start_pytorch_install(&mut self) {
+        if self.running || self.pytorch_probe_running || self.pytorch_install_running {
+            return;
+        }
+        let python = self.pytorch_python.trim().to_owned();
+        if python.is_empty() {
+            self.status = "Python executable is required before installing PyTorch CUDA".to_owned();
+            self.log(self.status.clone());
+            return;
+        }
+
+        let tx = self.tx.clone();
+        self.pending_pytorch_install = false;
+        self.pytorch_install_running = true;
+        self.pytorch_probe_running = true;
+        self.status = "Installing PyTorch CUDA...".to_owned();
+        self.phase = "PyTorch CUDA install".to_owned();
+        self.progress = 0.0;
+        self.eta_text = "Large download in progress".to_owned();
+        self.log(format!(
+            "User approved PyTorch CUDA install via {}",
+            pytorch_cuda_install_command_preview(&python)
+        ));
+
+        thread::spawn(move || {
+            let log_tx = tx.clone();
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                install_pytorch_cuda(&python, |line| {
+                    let _ = log_tx.send(AiTrainingWorkerEvent::Log(format!(
+                        "PyTorch install: {line}"
+                    )));
+                })
+            }))
+            .map_err(|panic| {
+                format!(
+                    "PyTorch CUDA install panicked: {}",
+                    panic_message(&*panic)
+                )
+            })
+            .and_then(|result| result.map_err(|err| format!("{err:#}")));
+            let _ = tx.send(AiTrainingWorkerEvent::PyTorchInstallDone(result));
+        });
+    }
+
+    fn start_precision_sweep(&mut self, adapter: AdapterInfo, gpu_intensity: GpuIntensity) {
+        if self.running || self.backend != AiTrainingBackend::PyTorchCuda {
+            return;
+        }
+        if !self.pytorch_cuda_can_run_selection() {
+            self.status =
+                "PyTorch CUDA precision sweeps support linear, MLP, and transformer training"
+                    .to_owned();
+            self.log(self.status.clone());
+            return;
+        }
+        if !self.pytorch_cuda_ready() {
+            self.status = "Probe PyTorch CUDA before running a precision sweep".to_owned();
+            self.log(self.status.clone());
+            return;
+        }
+
+        let mut base_config = self.config(adapter, gpu_intensity);
+        let mut sizing_notes = Vec::new();
+        if let Some(note) = auto_size_ai_training_config_for_limits(
+            &mut base_config,
+            self.selected_pytorch_cuda_memory_bytes(),
+            None,
+        ) {
+            sizing_notes.push(note);
+        }
+        let tx = self.tx.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        self.cancel = Some(cancel);
+        self.running = true;
+        self.progress = 0.0;
+        self.phase = "Starting precision sweep".to_owned();
+        self.eta_text = "ETA: estimating".to_owned();
+        self.status = "Running PyTorch CUDA precision sweep...".to_owned();
+        self.log(format!(
+            "Starting PyTorch CUDA precision sweep for {} on CUDA device {}",
+            base_config.workload, base_config.pytorch_cuda_device
+        ));
+        for note in &sizing_notes {
+            self.log(note.clone());
+        }
+
+        thread::spawn(move || {
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                run_ai_training_precision_sweep(base_config, worker_cancel, tx.clone())
+            }))
+            .map_err(|panic| {
+                format!(
+                    "AI training precision sweep panicked: {}",
+                    panic_message(&*panic)
+                )
+            })
+            .and_then(|result| result.map_err(|err| format!("{err:#}")));
+            let _ = tx.send(AiTrainingWorkerEvent::BatchDone(result));
         });
     }
 
@@ -824,6 +969,46 @@ impl AiTrainingBenchmarkState {
                         }
                     }
                 }
+                AiTrainingWorkerEvent::PyTorchInstallDone(result) => {
+                    self.pytorch_install_running = false;
+                    self.pytorch_probe_running = false;
+                    self.pending_pytorch_install = false;
+                    self.progress = 1.0;
+                    self.phase = "PyTorch CUDA install complete".to_owned();
+                    self.eta_text.clear();
+                    match result {
+                        Ok(environment) => {
+                            self.pytorch_python = environment.python_executable.clone();
+                            if environment.cuda_available
+                                && !pytorch_cuda_environment_has_device(
+                                    &environment,
+                                    self.pytorch_cuda_device,
+                                )
+                            {
+                                self.pytorch_cuda_device = environment
+                                    .devices
+                                    .first()
+                                    .map(|device| device.index)
+                                    .unwrap_or(0);
+                            }
+                            self.status = format!(
+                                "PyTorch CUDA installed and ready: {} CUDA device(s)",
+                                environment.device_count
+                            );
+                            self.log(self.status.clone());
+                            for line in environment.summary_lines() {
+                                self.log(line);
+                            }
+                            self.pytorch_probe = Some(environment);
+                        }
+                        Err(err) => {
+                            self.progress = 0.0;
+                            self.phase = "PyTorch CUDA install failed".to_owned();
+                            self.status = err.clone();
+                            self.log(err);
+                        }
+                    }
+                }
                 AiTrainingWorkerEvent::Done(result) => {
                     self.running = false;
                     self.cancel = None;
@@ -832,13 +1017,41 @@ impl AiTrainingBenchmarkState {
                         Ok(result) => {
                             self.progress = 1.0;
                             self.phase = "Complete".to_owned();
-                            self.status = format!(
-                                "AI training benchmark complete: {} {}",
-                                format_optional_tflops(result.end_to_end_tflops),
-                                "end-to-end TFLOP/s"
-                            );
+                            self.status = result
+                                .throughput_value
+                                .map(|value| {
+                                    format!(
+                                        "AI training benchmark complete: {value:.1} {}",
+                                        result.throughput_label
+                                    )
+                                })
+                                .unwrap_or_else(|| "AI training benchmark complete".to_owned());
                             self.log(self.status.clone());
                             self.results.push(result);
+                        }
+                        Err(err) => {
+                            if err.to_ascii_lowercase().contains("canceled") {
+                                self.progress = 0.0;
+                                self.eta_text = "ETA: canceled".to_owned();
+                            }
+                            self.phase = "Stopped".to_owned();
+                            self.status = err.clone();
+                            self.log(err);
+                        }
+                    }
+                }
+                AiTrainingWorkerEvent::BatchDone(result) => {
+                    self.running = false;
+                    self.cancel = None;
+                    self.eta_text.clear();
+                    match result {
+                        Ok(results) => {
+                            self.progress = 1.0;
+                            self.phase = "Complete".to_owned();
+                            self.status =
+                                format!("AI precision sweep complete: {} result(s)", results.len());
+                            self.log(self.status.clone());
+                            self.results.extend(results);
                         }
                         Err(err) => {
                             if err.to_ascii_lowercase().contains("canceled") {

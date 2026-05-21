@@ -106,6 +106,33 @@ impl BenchScopeApp {
                     );
                 }
 
+                ui.add_space(6.0);
+                ui.label("PyTorch CUDA");
+                ui.text_edit_singleline(&mut self.pytorch_python);
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(
+                        !self.running && !self.pytorch_probe_running && !self.pytorch_install_running,
+                        |ui| {
+                            if ui.button("Probe").clicked() {
+                                self.start_pytorch_cuda_probe();
+                            }
+                            if ui.button("Install CUDA PyTorch").clicked() {
+                                self.request_pytorch_cuda_install();
+                            }
+                        },
+                    );
+                    if self.pytorch_install_running {
+                        ui.label("Installing...");
+                    } else if self.pytorch_probe_running {
+                        ui.label("Probing...");
+                    }
+                });
+                ui_pytorch_cuda_status(
+                    ui,
+                    self.pytorch_probe.as_ref(),
+                    "NVIDIA adapters use auto-detected PyTorch CUDA before WGPU fallback.",
+                );
+
                 if ui.button("Refresh GPUs").clicked() && !self.running {
                     self.adapters = enumerate_adapters();
                     self.selected_adapter = 0;
@@ -305,6 +332,42 @@ impl BenchScopeApp {
                         if ui.button("Run anyway").clicked() {
                             self.continue_pending_vram_warning();
                         }
+                    });
+                });
+        }
+
+        if self.pending_pytorch_install {
+            egui::Window::new("Install PyTorch CUDA?")
+                .collapsible(false)
+                .resizable(false)
+                .show(&ctx, |ui| {
+                    ui.label("BenchScope can install the CUDA 12.8 PyTorch packages into this Python:");
+                    ui.monospace(self.pytorch_python.trim());
+                    ui.add_space(6.0);
+                    ui.label(format!(
+                        "This downloads {} and may take several minutes.",
+                        PYTORCH_CUDA_INSTALL_DOWNLOAD_NOTE
+                    ));
+                    ui.monospace(pytorch_cuda_install_command_preview(
+                        self.pytorch_python.trim(),
+                    ));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.pending_pytorch_install = false;
+                            self.log("Canceled PyTorch CUDA install prompt");
+                        }
+                        ui.add_enabled_ui(
+                            !self.pytorch_python.trim().is_empty()
+                                && !self.running
+                                && !self.pytorch_probe_running
+                                && !self.pytorch_install_running,
+                            |ui| {
+                                if ui.button("Install").clicked() {
+                                    self.start_pytorch_cuda_install();
+                                }
+                            },
+                        );
                     });
                 });
         }

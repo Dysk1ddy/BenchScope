@@ -66,9 +66,26 @@ fn run_cli(args: &[String]) -> Result<bool> {
     }
 
     if args.iter().any(|arg| arg == "--probe-pytorch-cuda") {
+        let environment = if let Some(python) = arg_value(args, "--python") {
+            probe_pytorch_cuda(&python)?
+        } else {
+            probe_first_pytorch_cuda("")?
+        };
+        print_pytorch_cuda_environment(&environment);
+        return Ok(true);
+    }
+
+    if args.iter().any(|arg| arg == "--install-pytorch-cuda") {
         let python = arg_value(args, "--python")
             .unwrap_or_else(default_pytorch_python_executable);
-        let environment = probe_pytorch_cuda(&python)?;
+        if !args.iter().any(|arg| arg == "--yes") {
+            return Err(anyhow!(
+                "PyTorch CUDA install may download {}; rerun with --yes to confirm: {}",
+                PYTORCH_CUDA_INSTALL_DOWNLOAD_NOTE,
+                pytorch_cuda_install_command_preview(&python)
+            ));
+        }
+        let environment = install_pytorch_cuda(&python, |line| println!("{line}"))?;
         print_pytorch_cuda_environment(&environment);
         return Ok(true);
     }
@@ -156,6 +173,14 @@ fn run_cli(args: &[String]) -> Result<bool> {
         );
         println!("Avg step: {} ms", format_ms(result.avg_step_ms));
         println!("p95 step: {} ms", format_ms(result.p95_step_ms));
+        if let Some(timings) = &result.step_timings {
+            println!(
+                "Step split: forward/loss {} ms, backward {} ms, optimizer {} ms",
+                format_ms(Some(timings.forward_loss_ms)),
+                format_ms(Some(timings.backward_ms)),
+                format_ms(Some(timings.optimizer_ms))
+            );
+        }
         println!("Memory: {}", format_bytes(result.memory_bytes));
         println!("Validation: {}", result.validation);
         println!("Notes: {}", result.notes);

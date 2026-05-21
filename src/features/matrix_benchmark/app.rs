@@ -1,22 +1,32 @@
 impl BenchScopeApp {
     fn selected_size(&self) -> Result<usize> {
-        let size = self
-            .size_text
-            .trim()
-            .parse::<usize>()
-            .context("matrix size must be an integer")?;
-        if size == 0 {
-            return Err(anyhow!("matrix size must be positive"));
-        }
-        let max_size = DEFAULT_SIZES.last().copied().unwrap_or(32_768);
-        if size > max_size {
-            return Err(anyhow!(
-                "matrix size is capped at {max_size} for this version"
-            ));
-        }
-        Ok(size)
+        parse_matrix_size(&self.size_text)
     }
 
+    fn selected_stress_size(&self) -> Result<usize> {
+        parse_matrix_size(&self.stress_size_text)
+    }
+
+}
+
+fn parse_matrix_size(size_text: &str) -> Result<usize> {
+    let size = size_text
+        .trim()
+        .parse::<usize>()
+        .context("matrix size must be an integer")?;
+    if size == 0 {
+        return Err(anyhow!("matrix size must be positive"));
+    }
+    let max_size = DEFAULT_SIZES.last().copied().unwrap_or(32_768);
+    if size > max_size {
+        return Err(anyhow!(
+            "matrix size is capped at {max_size} for this version"
+        ));
+    }
+    Ok(size)
+}
+
+impl BenchScopeApp {
     fn selected_adapter(&self) -> Result<AdapterInfo> {
         self.adapters
             .get(self.selected_adapter)
@@ -102,6 +112,7 @@ impl BenchScopeApp {
                 "exact"
             }
         ));
+        let pytorch_python = self.pytorch_python.trim().to_owned();
         thread::spawn(move || {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 run_single_cancelable(
@@ -110,6 +121,7 @@ impl BenchScopeApp {
                     validate,
                     estimate_cpu_time,
                     gpu_intensity,
+                    pytorch_python,
                     &worker_cancel,
                     Some(tx.clone()),
                 )
@@ -125,7 +137,7 @@ impl BenchScopeApp {
     }
 
     fn start_repeat_checked(&mut self, ignore_vram_warning: bool) {
-        let size = match self.selected_size() {
+        let size = match self.selected_stress_size() {
             Ok(size) => size,
             Err(err) => {
                 self.status = err.to_string();
@@ -187,6 +199,17 @@ impl BenchScopeApp {
         self.running = true;
         self.repeat_running = true;
         self.progress = 0.0;
+        self.repeat_progress = Some(RepeatProgress {
+            mode,
+            size,
+            duration_s: duration.seconds(),
+            elapsed_s: 0.0,
+            iterations: 0,
+            latest_ms: 0.0,
+            average_total_ms: 0.0,
+            average_compute_ms: None,
+            canceled: false,
+        });
         self.eta_text = duration
             .seconds()
             .map(|seconds| format_eta(Some(seconds)))
@@ -199,6 +222,7 @@ impl BenchScopeApp {
             gpu_intensity,
             stress_gpu_backend
         ));
+        let pytorch_python = self.pytorch_python.trim().to_owned();
         thread::spawn(move || {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 run_repeat(
@@ -207,6 +231,7 @@ impl BenchScopeApp {
                     mode,
                     gpu_intensity,
                     stress_gpu_backend,
+                    pytorch_python,
                     worker_cancel,
                     tx.clone(),
                     duration,
@@ -360,6 +385,7 @@ impl BenchScopeApp {
                     }
                 }
                 WorkerEvent::RepeatProgress(progress) => {
+                    self.repeat_progress = Some(progress.clone());
                     if let Some(duration_s) = progress.duration_s {
                         self.progress = (progress.elapsed_s / duration_s).clamp(0.0, 1.0) as f32;
                         self.eta_text =
@@ -387,6 +413,7 @@ impl BenchScopeApp {
                     self.eta_text.clear();
                     match result {
                         Ok(progress) => {
+                            self.repeat_progress = Some(progress.clone());
                             let _ = self.finish_and_log_temperature_run();
                             if !progress.canceled && progress.duration_s.is_some() {
                                 self.progress = 1.0;
@@ -419,9 +446,144 @@ impl BenchScopeApp {
                         }
                     }
                 }
+                WorkerEvent::PyTorchProbeDone(result) => {
+                    self.pytorch_probe_running = false;
+                    self.eta_text.clear();
+                    match result {
+                        Ok(environment) => {
+                            self.status = if environment.cuda_available {
+                                format!(
+                                    "PyTorch CUDA ready: {} CUDA device(s)",
+                                    environment.device_count
+                                )
+                            } else if let Some(error) = &environment.error {
+                                format!("PyTorch CUDA unavailable: {error}")
+                            } else {
+                                "PyTorch imported, but CUDA is unavailable".to_owned()
+                            };
+                            if environment.cuda_available {
+                                self.pytorch_python = environment.python_executable.clone();
+                                self.ai_training.pytorch_python =
+                                    environment.python_executable.clone();
+                                self.ai_training.pytorch_probe = Some(environment.clone());
+                            }
+                            self.log(self.status.clone());
+                            for line in environment.summary_lines() {
+                                self.log(line);
+                            }
+                            self.pytorch_probe = Some(environment);
+                        }
+                        Err(err) => {
+                            self.status = err.clone();
+                            self.log(err);
+                        }
+                    }
+                }
+                WorkerEvent::PyTorchInstallDone(result) => {
+                    self.pytorch_install_running = false;
+                    self.pytorch_probe_running = false;
+                    self.pending_pytorch_install = false;
+                    self.eta_text.clear();
+                    match result {
+                        Ok(environment) => {
+                            self.pytorch_python = environment.python_executable.clone();
+                            self.ai_training.pytorch_python = environment.python_executable.clone();
+                            self.ai_training.pytorch_probe = Some(environment.clone());
+                            self.status = format!(
+                                "PyTorch CUDA installed and ready: {} CUDA device(s)",
+                                environment.device_count
+                            );
+                            self.log(self.status.clone());
+                            for line in environment.summary_lines() {
+                                self.log(line);
+                            }
+                            self.pytorch_probe = Some(environment);
+                        }
+                        Err(err) => {
+                            self.status = err.clone();
+                            self.log(err);
+                        }
+                    }
+                }
                 WorkerEvent::Log(message) => self.log(message),
             }
         }
+    }
+
+    fn start_pytorch_cuda_probe(&mut self) {
+        if self.pytorch_probe_running || self.pytorch_install_running || self.running {
+            return;
+        }
+
+        let preferred_python = self.pytorch_python.trim().to_owned();
+        let tx = self.tx.clone();
+        self.pytorch_probe_running = true;
+        self.status = "Probing PyTorch CUDA environment...".to_owned();
+        self.eta_text = "ETA: estimating".to_owned();
+        if preferred_python.is_empty() {
+            self.log("Probing PyTorch CUDA with auto-discovered Python candidates");
+        } else {
+            self.log(format!(
+                "Probing PyTorch CUDA with {preferred_python} and auto-discovered fallback candidates"
+            ));
+        }
+
+        thread::spawn(move || {
+            let result =
+                panic::catch_unwind(AssertUnwindSafe(|| probe_first_pytorch_cuda(&preferred_python)))
+                    .map_err(|panic| {
+                        format!("PyTorch CUDA probe panicked: {}", panic_message(&*panic))
+                    })
+                    .and_then(|result| result.map_err(|err| format!("{err:#}")));
+            let _ = tx.send(WorkerEvent::PyTorchProbeDone(result));
+        });
+    }
+
+    fn request_pytorch_cuda_install(&mut self) {
+        if self.running || self.pytorch_probe_running || self.pytorch_install_running {
+            return;
+        }
+        self.pending_pytorch_install = true;
+    }
+
+    fn start_pytorch_cuda_install(&mut self) {
+        if self.running || self.pytorch_probe_running || self.pytorch_install_running {
+            return;
+        }
+        let python = self.pytorch_python.trim().to_owned();
+        if python.is_empty() {
+            self.status = "Python executable is required before installing PyTorch CUDA".to_owned();
+            self.log(self.status.clone());
+            return;
+        }
+
+        let tx = self.tx.clone();
+        self.pending_pytorch_install = false;
+        self.pytorch_install_running = true;
+        self.pytorch_probe_running = true;
+        self.status = "Installing PyTorch CUDA...".to_owned();
+        self.eta_text = "Large download in progress".to_owned();
+        self.log(format!(
+            "User approved PyTorch CUDA install via {}",
+            pytorch_cuda_install_command_preview(&python)
+        ));
+
+        thread::spawn(move || {
+            let log_tx = tx.clone();
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                install_pytorch_cuda(&python, |line| {
+                    let _ = log_tx.send(WorkerEvent::Log(format!("PyTorch install: {line}")));
+                })
+            }))
+            .map_err(|panic| {
+                format!(
+                    "PyTorch CUDA install panicked: {}",
+                    panic_message(&*panic)
+                )
+            })
+            .and_then(|result| result.map_err(|err| format!("{err:#}")));
+            let _ = tx.send(WorkerEvent::PyTorchInstallDone(result));
+        });
     }
     fn request_matrix_back_to_menu(&mut self) {
         if self.running {

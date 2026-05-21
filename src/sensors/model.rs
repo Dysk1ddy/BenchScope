@@ -659,12 +659,7 @@ impl SensorManager {
                     let snapshot_now = Instant::now();
                     let needs_fallback = match primary_snapshot.as_ref() {
                         None => true,
-                        Some(snapshot) if sensor_snapshot_has_stale_data(snapshot, snapshot_now) => {
-                            true
-                        }
-                        Some(snapshot) => {
-                            service_snapshot.is_none() && helper_snapshot_has_gaps(snapshot)
-                        }
+                        Some(snapshot) => sensor_snapshot_needs_fallback(snapshot, snapshot_now),
                     };
                     if needs_fallback {
                         fallback_worker.maybe_start(drive_letter, snapshot_now);

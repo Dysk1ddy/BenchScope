@@ -284,6 +284,34 @@ mod tests {
     #[test]
     fn stress_rate_formatter_uses_trillion_units() {
         assert_eq!(format_stress_rate_per_min(1_700_000_000_000, 60.0), "1.70T/min");
+        assert_eq!(
+            format_stress_iterations_per_second(Some(1_700_000_000_000.0)),
+            "1.70T/s"
+        );
+    }
+
+    #[test]
+    fn stress_progress_reports_tflops_and_tensor_core_efficiency() {
+        let progress = RepeatProgress {
+            mode: RepeatMode::Gpu,
+            size: 1000,
+            duration_s: Some(60.0),
+            elapsed_s: 10.0,
+            iterations: 120,
+            latest_ms: 2.0,
+            average_total_ms: 3.0,
+            average_compute_ms: Some(2.0),
+            canceled: false,
+        };
+
+        assert_eq!(progress.iterations_per_second(), Some(12.0));
+        assert!((progress.throughput_tflops().unwrap() - 1.0).abs() < 0.0001);
+        assert!(
+            (progress.fp16_tensor_core_efficiency_percent().unwrap()
+                - (100.0 / MATRIX_STRESS_FP16_TC_FP32_ACCUM_THEORETICAL_TFLOPS))
+                .abs()
+                < 0.0001
+        );
     }
 
     #[test]
@@ -536,6 +564,32 @@ mod tests {
     }
 
     #[test]
+    fn py_launcher_parser_reads_registered_python_paths() {
+        let output = concat!(
+            " -V:3.14 *        C:\\Users\\epicm\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe\n",
+            " -V:3.11          C:\\Users\\epicm\\AppData\\Local\\Programs\\Python\\Python311\\python.exe\n",
+        );
+
+        let paths = parse_py_launcher_python_paths(output);
+
+        assert_eq!(
+            paths,
+            vec![
+                r"C:\Users\epicm\AppData\Local\Python\pythoncore-3.14-64\python.exe",
+                r"C:\Users\epicm\AppData\Local\Programs\Python\Python311\python.exe",
+            ]
+        );
+    }
+
+    #[test]
+    fn preferred_pytorch_python_candidates_are_deduplicated() {
+        let candidates = pytorch_python_candidates_with_preferred("python");
+
+        assert_eq!(candidates.iter().filter(|candidate| *candidate == "python").count(), 1);
+        assert_eq!(candidates.first().map(String::as_str), Some("python"));
+    }
+
+    #[test]
     fn pytorch_cuda_benchmark_parser_reads_timings_and_memory() {
         let output = concat!(
             "PYTHON\t3.13.1\n",
@@ -552,6 +606,9 @@ mod tests {
             "RESULT_MEASURED_STEPS\t2\n",
             "RESULT_GPU_STEP_MS\t1.25\t1.50\n",
             "RESULT_WALL_STEP_MS\t1.75\t2.25\n",
+            "RESULT_FORWARD_LOSS_MS\t0.25\t0.35\n",
+            "RESULT_BACKWARD_MS\t0.75\t0.85\n",
+            "RESULT_OPTIMIZER_MS\t0.10\t0.12\n",
             "RESULT_PEAK_ALLOCATED_BYTES\t1024\n",
             "RESULT_PEAK_RESERVED_BYTES\t2048\n",
             "RESULT_VALIDATION\tPassed: finite loss 0.5\n",
@@ -566,6 +623,9 @@ mod tests {
         assert_eq!(benchmark.measured_steps, 2);
         assert_eq!(benchmark.gpu_step_ms, vec![1.25, 1.50]);
         assert_eq!(benchmark.wall_step_ms, vec![1.75, 2.25]);
+        assert_eq!(benchmark.forward_loss_ms, vec![0.25, 0.35]);
+        assert_eq!(benchmark.backward_ms, vec![0.75, 0.85]);
+        assert_eq!(benchmark.optimizer_ms, vec![0.10, 0.12]);
         assert_eq!(benchmark.peak_allocated_bytes, 1024);
         assert_eq!(benchmark.peak_reserved_bytes, 2048);
         assert_eq!(
@@ -589,6 +649,29 @@ mod tests {
         assert_eq!(progress.total_compute_ms, 38.0);
         assert_eq!(progress.compute_count, 3);
         assert!(parse_pytorch_matrix_stress_progress_line("NOTE\tignored").is_none());
+    }
+
+    #[test]
+    fn pytorch_single_matrix_sample_parser_reads_sample_lines() {
+        let sample = parse_pytorch_single_matrix_sample(&["7", "11", "1.25"]).unwrap();
+
+        assert_eq!(sample.row, 7);
+        assert_eq!(sample.col, 11);
+        assert_eq!(sample.value, 1.25);
+    }
+
+    #[test]
+    fn pytorch_single_matrix_samples_validate_against_generated_inputs() {
+        let (a, b) = generate_matrices(4).unwrap();
+        let samples = vec![ValidationSample {
+            row: 2,
+            col: 3,
+            value: (0..4).map(|k| a[2 * 4 + k] * b[k * 4 + 3]).sum(),
+        }];
+
+        let validation = validate_samples(&a, &b, &samples, 4, None).unwrap();
+
+        assert!(validation.starts_with("Sampled mixed-precision pass"));
     }
 
     #[test]
@@ -738,6 +821,7 @@ mod tests {
             RepeatMode::Cpu,
             GpuIntensity::Safe,
             StressGpuBackend::Optimized,
+            String::new(),
             cancel_worker,
             tx,
             RepeatDuration::Infinite,

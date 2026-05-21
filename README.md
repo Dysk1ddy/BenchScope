@@ -119,7 +119,7 @@ Choose the GPU submission intensity used by self-test:
 - Cancelable single benchmark runs.
 - Matrix stress test tool with cancelable 1-minute, 5-minute, or infinite CPU/GPU repeat runs.
 - GPU Memory Bandwidth tool with separate internal read/write, GPU buffer copy, CPU-to-GPU upload, GPU-to-CPU readback, and optional round-trip transfer tests.
-- AI Training GPU Benchmark tool with linear-layer, MLP, transformer-proxy, and optimizer-stress workloads reporting FLOPs, throughput, latency, estimated tensor memory, timestamp-query compute timing, and smoke-test validation for the linear reference path.
+- AI Training GPU Benchmark tool focused on PyTorch CUDA training workloads with linear-layer, MLP, and transformer runs reporting training throughput, average/p95 step latency, precision, step timing split, FLOPs, and CUDA memory, plus a clearly labeled portable WGPU proxy path for cross-vendor synthetic fallback and optimizer/update pressure.
 - Separate CPU and GPU progress bars with roughly 5Hz progress sampling and an estimated time remaining during single benchmark runs.
 - Large GPU runs report real chunk/block progress so the progress bar keeps moving through long matrix computations.
 - GPU matrices that exceed an adapter's storage-buffer binding limit use intensity-controlled legal row/column blocks instead of binding the whole matrix at once.

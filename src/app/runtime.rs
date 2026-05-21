@@ -16,6 +16,7 @@ impl BenchScopeApp {
         self.network.poll_worker_events();
         self.device_info.poll_worker_events();
         self.ai_training.poll_worker_events();
+        self.sync_pytorch_cuda_from_ai_training();
         self.observe_temperature_run();
         if drive_was_running && !self.drive.running {
             if let Some(report) = self.finish_and_log_temperature_run() {
@@ -72,6 +73,27 @@ impl BenchScopeApp {
             AppView::MatrixStressTest => self.ui_matrix_stress_test(ui),
             AppView::MatrixBenchmark => self.ui_matrix_benchmark(ui, &ctx),
         }
+    }
+
+    fn sync_pytorch_cuda_from_ai_training(&mut self) {
+        let Some(environment) = self.ai_training.pytorch_probe.as_ref() else {
+            return;
+        };
+        if !environment.cuda_available {
+            return;
+        }
+        let already_synced = self
+            .pytorch_probe
+            .as_ref()
+            .is_some_and(|probe| {
+                probe.cuda_available && probe.python_executable == environment.python_executable
+            });
+        if already_synced {
+            return;
+        }
+
+        self.pytorch_python = environment.python_executable.clone();
+        self.pytorch_probe = Some(environment.clone());
     }
 }
 

@@ -112,6 +112,38 @@ impl BenchScopeApp {
                     });
                 });
                 ui.small(self.stress_gpu_backend.description());
+                if self.repeat_mode == RepeatMode::Gpu
+                    && self.stress_gpu_backend == StressGpuBackend::Optimized
+                {
+                    ui.add_space(6.0);
+                    ui.label("PyTorch CUDA");
+                    ui.text_edit_singleline(&mut self.pytorch_python);
+                    ui.horizontal(|ui| {
+                        ui.add_enabled_ui(
+                            !self.running
+                                && !self.pytorch_probe_running
+                                && !self.pytorch_install_running,
+                            |ui| {
+                                if ui.button("Probe").clicked() {
+                                    self.start_pytorch_cuda_probe();
+                                }
+                                if ui.button("Install CUDA PyTorch").clicked() {
+                                    self.request_pytorch_cuda_install();
+                                }
+                            },
+                        );
+                        if self.pytorch_install_running {
+                            ui.label("Installing...");
+                        } else if self.pytorch_probe_running {
+                            ui.label("Probing...");
+                        }
+                    });
+                    ui_pytorch_cuda_status(
+                        ui,
+                        self.pytorch_probe.as_ref(),
+                        "Stress runs auto-detect PyTorch CUDA before falling back to WGPU.",
+                    );
+                }
 
                 if ui.button("Refresh GPUs").clicked() && !self.running {
                     self.adapters = enumerate_adapters();
@@ -123,15 +155,19 @@ impl BenchScopeApp {
                 ui.separator();
                 ui.label("Matrix size");
                 egui::ComboBox::from_id_salt("stress_size_combo")
-                    .selected_text(self.size_text.clone())
+                    .selected_text(self.stress_size_text.clone())
                     .show_ui(ui, |ui| {
                         for size in DEFAULT_SIZES {
-                            ui.selectable_value(&mut self.size_text, size.to_string(), size.to_string());
+                            ui.selectable_value(
+                                &mut self.stress_size_text,
+                                size.to_string(),
+                                size.to_string(),
+                            );
                         }
                     });
-                ui.text_edit_singleline(&mut self.size_text);
+                ui.text_edit_singleline(&mut self.stress_size_text);
 
-                if let Ok(size) = self.selected_size() {
+                if let Ok(size) = self.selected_stress_size() {
                     if let (Some(matrix_bytes), Some(gpu_bytes)) =
                         (matrix_buffers_bytes(size, 3), gpu_working_set_bytes(size))
                     {
@@ -214,26 +250,100 @@ impl BenchScopeApp {
             let (summary_height, log_height) =
                 panel_content_log_heights(available_height, 0.35, 220.0);
 
-            ui.heading("Stress Test");
+            ui.heading("Stress Readout");
             ui.add_space(6.0);
             ui.allocate_ui_with_layout(
                 egui::vec2(ui.available_width(), summary_height),
                 egui::Layout::top_down(egui::Align::LEFT),
                 |ui| {
-                    ui.label(format!("Mode: {}", self.repeat_mode));
-                    if self.repeat_mode == RepeatMode::Gpu {
-                        ui.label(format!("GPU backend: {}", self.stress_gpu_backend));
-                    }
-                    ui.label(format!("Duration: {}", self.repeat_duration));
-                    if self.repeat_duration.is_infinite() {
-                        ui.label("Progress: runs until canceled");
-                    } else {
-                        ui.label(format!("Progress: {:.0}%", self.progress * 100.0));
-                    }
-                    if !self.eta_text.is_empty() {
-                        ui.label(&self.eta_text);
-                    }
-                    ui.label(&self.status);
+                    egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            egui::Grid::new("stress_readout_grid")
+                                .striped(true)
+                                .num_columns(12)
+                                .show(ui, |ui| {
+                                    result_header(ui, "Mode");
+                                    result_header(ui, "Size");
+                                    result_header(ui, "Duration");
+                                    result_header(ui, "Elapsed");
+                                    result_header(ui, "Iterations");
+                                    result_header(ui, "Iterations/s");
+                                    result_header(ui, "Latest ms");
+                                    result_header(ui, "Avg total ms");
+                                    result_header(ui, "Avg compute ms");
+                                    result_header(ui, "Compute TFLOP/s");
+                                    result_header(ui, "FP16 TC FP32 acc TFLOP/s");
+                                    result_header(ui, "Efficiency %");
+                                    ui.end_row();
+
+                                    if let Some(progress) = &self.repeat_progress {
+                                        let latest_ms = (progress.iterations > 0)
+                                            .then_some(progress.latest_ms);
+                                        let average_total_ms = (progress.iterations > 0)
+                                            .then_some(progress.average_total_ms);
+                                        result_cell(ui, progress.mode.to_string());
+                                        result_cell(ui, format!("{}x{}", progress.size, progress.size));
+                                        result_cell(
+                                            ui,
+                                            progress
+                                                .duration_s
+                                                .map(format_elapsed)
+                                                .unwrap_or_else(|| "Infinite".to_owned()),
+                                        );
+                                        result_cell(ui, format_elapsed(progress.elapsed_s));
+                                        result_cell(ui, progress.iterations.to_string());
+                                        result_cell(
+                                            ui,
+                                            format_stress_iterations_per_second(
+                                                progress.iterations_per_second(),
+                                            ),
+                                        );
+                                        result_cell(ui, format_ms(latest_ms));
+                                        result_cell(ui, format_ms(average_total_ms));
+                                        result_cell(ui, format_ms(progress.average_compute_ms));
+                                        result_cell(ui, format_optional_tflops(progress.throughput_tflops()));
+                                        result_cell(
+                                            ui,
+                                            format!(
+                                                "{:.1}",
+                                                MATRIX_STRESS_FP16_TC_FP32_ACCUM_THEORETICAL_TFLOPS
+                                            ),
+                                        );
+                                        result_cell(
+                                            ui,
+                                            format_optional_percent_f64(
+                                                progress.fp16_tensor_core_efficiency_percent(),
+                                            ),
+                                        );
+                                    } else {
+                                        result_cell(ui, self.repeat_mode.to_string());
+                                        result_cell(
+                                            ui,
+                                            self.selected_stress_size()
+                                                .map(|size| format!("{size}x{size}"))
+                                                .unwrap_or_else(|_| "N/A".to_owned()),
+                                        );
+                                        result_cell(ui, self.repeat_duration.to_string());
+                                        result_cell(ui, "N/A");
+                                        result_cell(ui, "N/A");
+                                        result_cell(ui, "N/A");
+                                        result_cell(ui, "N/A");
+                                        result_cell(ui, "N/A");
+                                        result_cell(ui, "N/A");
+                                        result_cell(ui, "N/A");
+                                        result_cell(
+                                            ui,
+                                            format!(
+                                                "{:.1}",
+                                                MATRIX_STRESS_FP16_TC_FP32_ACCUM_THEORETICAL_TFLOPS
+                                            ),
+                                        );
+                                        result_cell(ui, "N/A");
+                                    }
+                                    ui.end_row();
+                                });
+                        });
                 },
             );
 
@@ -281,6 +391,42 @@ impl BenchScopeApp {
                         if ui.button("Run anyway").clicked() {
                             self.continue_pending_vram_warning();
                         }
+                    });
+                });
+        }
+
+        if self.pending_pytorch_install {
+            egui::Window::new("Install PyTorch CUDA?")
+                .collapsible(false)
+                .resizable(false)
+                .show(&ctx, |ui| {
+                    ui.label("BenchScope can install the CUDA 12.8 PyTorch packages into this Python:");
+                    ui.monospace(self.pytorch_python.trim());
+                    ui.add_space(6.0);
+                    ui.label(format!(
+                        "This downloads {} and may take several minutes.",
+                        PYTORCH_CUDA_INSTALL_DOWNLOAD_NOTE
+                    ));
+                    ui.monospace(pytorch_cuda_install_command_preview(
+                        self.pytorch_python.trim(),
+                    ));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.pending_pytorch_install = false;
+                            self.log("Canceled PyTorch CUDA install prompt");
+                        }
+                        ui.add_enabled_ui(
+                            !self.pytorch_python.trim().is_empty()
+                                && !self.running
+                                && !self.pytorch_probe_running
+                                && !self.pytorch_install_running,
+                            |ui| {
+                                if ui.button("Install").clicked() {
+                                    self.start_pytorch_cuda_install();
+                                }
+                            },
+                        );
                     });
                 });
         }

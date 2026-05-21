@@ -67,14 +67,20 @@ impl BenchScopeApp {
                                     ui.horizontal(|ui| {
                                         ui.add_enabled_ui(
                                             !self.ai_training.pytorch_probe_running
+                                                && !self.ai_training.pytorch_install_running
                                                 && !self.ai_training.running,
                                             |ui| {
                                                 if ui.button("Probe PyTorch CUDA").clicked() {
                                                     self.ai_training.start_pytorch_probe();
                                                 }
+                                                if ui.button("Install CUDA PyTorch").clicked() {
+                                                    self.ai_training.request_pytorch_install();
+                                                }
                                             },
                                         );
-                                        if self.ai_training.pytorch_probe_running {
+                                        if self.ai_training.pytorch_install_running {
+                                            ui.label("Installing...");
+                                        } else if self.ai_training.pytorch_probe_running {
                                             ui.label("Probing...");
                                         }
                                     });
@@ -82,44 +88,46 @@ impl BenchScopeApp {
                                     ui_pytorch_cuda_device_selector(ui, &mut self.ai_training);
                                 }
 
-                                ui.add_space(8.0);
-                                ui.label("GPU adapter");
-                                egui::ComboBox::from_id_salt("ai_training_adapter_combo")
-                                    .selected_text(
-                                        self.adapters
-                                            .get(self.selected_adapter)
-                                            .map(AdapterInfo::label)
-                                            .unwrap_or_else(|| "No adapters found".to_owned()),
-                                    )
-                                    .show_ui(ui, |ui| {
-                                        for (index, adapter) in self.adapters.iter().enumerate() {
-                                            ui.selectable_value(
-                                                &mut self.selected_adapter,
-                                                index,
-                                                adapter.label(),
-                                            );
-                                        }
-                                    });
+                                if self.ai_training.backend == AiTrainingBackend::PortableWgpu {
+                                    ui.add_space(8.0);
+                                    ui.label("Portable WGPU adapter");
+                                    egui::ComboBox::from_id_salt("ai_training_adapter_combo")
+                                        .selected_text(
+                                            self.adapters
+                                                .get(self.selected_adapter)
+                                                .map(AdapterInfo::label)
+                                                .unwrap_or_else(|| "No adapters found".to_owned()),
+                                        )
+                                        .show_ui(ui, |ui| {
+                                            for (index, adapter) in self.adapters.iter().enumerate() {
+                                                ui.selectable_value(
+                                                    &mut self.selected_adapter,
+                                                    index,
+                                                    adapter.label(),
+                                                );
+                                            }
+                                        });
 
-                                if let Some(adapter) = self.adapters.get(self.selected_adapter) {
-                                    ui.small(format!(
-                                        "Vendor {:04X}, device {:04X}, driver {}, timestamp queries {}",
-                                        adapter.vendor,
-                                        adapter.device,
-                                        empty_to_unknown(&adapter.driver),
-                                        if adapter.timestamp_query {
-                                            "supported"
-                                        } else {
-                                            "unavailable"
-                                        }
-                                    ));
-                                    if let Some((limit, label)) = adapter_memory_limit_bytes(adapter) {
+                                    if let Some(adapter) = self.adapters.get(self.selected_adapter) {
                                         ui.small(format!(
-                                            "Memory limit estimate: {} ({label})",
-                                            format_bytes(limit)
+                                            "Vendor {:04X}, device {:04X}, driver {}, timestamp queries {}",
+                                            adapter.vendor,
+                                            adapter.device,
+                                            empty_to_unknown(&adapter.driver),
+                                            if adapter.timestamp_query {
+                                                "supported"
+                                            } else {
+                                                "unavailable"
+                                            }
                                         ));
-                                    } else {
-                                        ui.small("Memory limit estimate: unavailable for this adapter/backend");
+                                        if let Some((limit, label)) = adapter_memory_limit_bytes(adapter) {
+                                            ui.small(format!(
+                                                "Memory limit estimate: {} ({label})",
+                                                format_bytes(limit)
+                                            ));
+                                        } else {
+                                            ui.small("Memory limit estimate: unavailable for this adapter/backend");
+                                        }
                                     }
                                 }
 
@@ -130,11 +138,20 @@ impl BenchScopeApp {
                                     .selected_text(workload.label())
                                     .show_ui(ui, |ui| {
                                         for item in AiTrainingWorkload::ALL {
-                                            ui.selectable_value(&mut workload, item, item.label());
+                                            let enabled = self.ai_training.backend
+                                                != AiTrainingBackend::PyTorchCuda
+                                                || item != AiTrainingWorkload::OptimizerStress;
+                                            ui.add_enabled_ui(enabled, |ui| {
+                                                ui.selectable_value(&mut workload, item, item.label());
+                                            });
                                         }
                                     });
                                 self.ai_training.set_workload(workload);
-                                ui.small(self.ai_training.workload.description());
+                                ui.small(
+                                    self.ai_training
+                                        .workload
+                                        .description_for_backend(self.ai_training.backend),
+                                );
 
                                 ui.add_space(8.0);
                                 ui.label("Preset");
@@ -241,8 +258,21 @@ impl BenchScopeApp {
                         }
                     }
                 });
+                let can_sweep = self.ai_training.backend == AiTrainingBackend::PyTorchCuda
+                    && self.ai_training.can_run()
+                    && !self.adapters.is_empty();
+                ui.add_enabled_ui(can_sweep, |ui| {
+                    if ui_start_action_button(ui, "Run precision sweep").clicked() {
+                        if let Some(adapter) = self.adapters.get(self.selected_adapter).cloned() {
+                            self.ai_training
+                                .start_precision_sweep(adapter, self.gpu_intensity);
+                        }
+                    }
+                });
                 let can_smoke = !self.ai_training.running
                     && !self.adapters.is_empty()
+                    && !self.ai_training.pytorch_install_running
+                    && !self.ai_training.pytorch_probe_running
                     && (self.ai_training.backend != AiTrainingBackend::PyTorchCuda
                         || (self.ai_training.pytorch_cuda_can_run_selection()
                             && !self.ai_training.pytorch_python.trim().is_empty()));
@@ -315,6 +345,42 @@ impl BenchScopeApp {
         });
 
         self.ui_sensor_window(&ctx);
+
+        if self.ai_training.pending_pytorch_install {
+            egui::Window::new("Install PyTorch CUDA?")
+                .collapsible(false)
+                .resizable(false)
+                .show(&ctx, |ui| {
+                    ui.label("BenchScope can install the CUDA 12.8 PyTorch packages into this Python:");
+                    ui.monospace(self.ai_training.pytorch_python.trim());
+                    ui.add_space(6.0);
+                    ui.label(format!(
+                        "This downloads {} and may take several minutes.",
+                        PYTORCH_CUDA_INSTALL_DOWNLOAD_NOTE
+                    ));
+                    ui.monospace(pytorch_cuda_install_command_preview(
+                        self.ai_training.pytorch_python.trim(),
+                    ));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.ai_training.pending_pytorch_install = false;
+                            self.ai_training.log("Canceled PyTorch CUDA install prompt");
+                        }
+                        ui.add_enabled_ui(
+                            !self.ai_training.pytorch_python.trim().is_empty()
+                                && !self.ai_training.running
+                                && !self.ai_training.pytorch_probe_running
+                                && !self.ai_training.pytorch_install_running,
+                            |ui| {
+                                if ui.button("Install").clicked() {
+                                    self.ai_training.start_pytorch_install();
+                                }
+                            },
+                        );
+                    });
+                });
+        }
 
         if self.ai_training_back_confirm {
             egui::Window::new("Return to main menu?")
@@ -448,21 +514,21 @@ fn ui_ai_training_usize_control(
 
 fn ui_pytorch_cuda_probe_summary(ui: &mut egui::Ui, state: &AiTrainingBenchmarkState) {
     let Some(environment) = &state.pytorch_probe else {
-        ui.small("Probe PyTorch CUDA to detect torch, CUDA runtime, cuDNN, NCCL, and CUDA devices.");
+        ui_pytorch_cuda_status(
+            ui,
+            None,
+            "Probe PyTorch CUDA to detect torch, CUDA runtime, cuDNN, NCCL, and CUDA devices.",
+        );
         return;
     };
 
+    ui_pytorch_cuda_status(ui, Some(environment), "");
     if environment.cuda_available {
         ui.small(format!(
-            "Ready: {} CUDA device(s), torch {}, CUDA {}",
-            environment.device_count,
+            "torch {}, CUDA {}",
             environment.torch_version.as_deref().unwrap_or("unknown"),
             environment.torch_cuda_version.as_deref().unwrap_or("unknown")
         ));
-    } else if let Some(error) = &environment.error {
-        ui.small(format!("Unavailable: {error}"));
-    } else {
-        ui.small("PyTorch imported, but CUDA is unavailable.");
     }
 
     for device in &environment.devices {
@@ -580,37 +646,31 @@ fn ui_ai_training_results_table(ui: &mut egui::Ui, results: &[AiTrainingResult])
 
     egui::Grid::new("ai_training_results_grid")
         .striped(true)
-        .num_columns(16)
+        .num_columns(17)
         .show(ui, |ui| {
-            result_header(ui, "Workload");
-            result_header(ui, "Backend");
-            result_header(ui, "Preset");
-            result_header(ui, "Precision");
-            result_header(ui, "Shape");
-            result_header(ui, "GPU(s)");
-            result_header(ui, "Steps");
-            result_header(ui, "FLOPs/step");
-            result_header(ui, "Compute TFLOP/s");
-            result_header(ui, "E2E TFLOP/s");
-            result_header(ui, "Throughput");
-            result_header(ui, "Avg step");
-            result_header(ui, "p95 step");
-            result_header(ui, "Memory");
-            result_header(ui, "Validation");
-            result_header(ui, "Notes");
+            result_header_info(ui, "Workload", AI_RESULT_HELP_WORKLOAD);
+            result_header_info(ui, "Backend", AI_RESULT_HELP_BACKEND);
+            result_header_info(ui, "Precision", AI_RESULT_HELP_PRECISION);
+            result_header_info(ui, "Throughput", AI_RESULT_HELP_THROUGHPUT);
+            result_header_info(ui, "Avg step", AI_RESULT_HELP_AVG_STEP);
+            result_header_info(ui, "p95 step", AI_RESULT_HELP_P95_STEP);
+            result_header_info(ui, "Step split", AI_RESULT_HELP_STEP_SPLIT);
+            result_header_info(ui, "Memory", AI_RESULT_HELP_MEMORY);
+            result_header_info(ui, "Steps", AI_RESULT_HELP_STEPS);
+            result_header_info(ui, "Shape", AI_RESULT_HELP_SHAPE);
+            result_header_info(ui, "GPU(s)", AI_RESULT_HELP_GPU);
+            result_header_info(ui, "E2E TFLOP/s", AI_RESULT_HELP_E2E_TFLOPS);
+            result_header_info(ui, "Compute TFLOP/s", AI_RESULT_HELP_COMPUTE_TFLOPS);
+            result_header_info(ui, "FLOPs/step", AI_RESULT_HELP_FLOPS_STEP);
+            result_header_info(ui, "Preset", AI_RESULT_HELP_PRESET);
+            result_header_info(ui, "Validation", AI_RESULT_HELP_VALIDATION);
+            result_header_info(ui, "Notes", AI_RESULT_HELP_NOTES);
             ui.end_row();
 
             for result in results {
                 result_cell(ui, result.workload.label());
                 result_cell(ui, result.backend.label());
-                result_cell(ui, result.preset.label());
                 result_cell(ui, result.precision.label());
-                result_cell(ui, result.shape.clone());
-                result_cell(ui, result.gpu_names.join(", "));
-                result_cell(ui, result.measured_steps.to_string());
-                result_cell(ui, format_flops_per_step(result.flops_per_step));
-                result_cell(ui, format_optional_tflops(result.compute_tflops));
-                result_cell(ui, format_optional_tflops(result.end_to_end_tflops));
                 result_cell(
                     ui,
                     result
@@ -620,10 +680,68 @@ fn ui_ai_training_results_table(ui: &mut egui::Ui, results: &[AiTrainingResult])
                 );
                 result_cell(ui, format_ms(result.avg_step_ms));
                 result_cell(ui, format_ms(result.p95_step_ms));
+                let step_timings = format_ai_step_timings(result.step_timings.as_ref());
+                result_cell_hover(ui, step_timings.clone(), step_timings);
                 result_cell(ui, format_bytes(result.memory_bytes));
-                result_cell(ui, result.validation.clone());
-                result_cell(ui, result.notes.clone());
+                result_cell(ui, result.measured_steps.to_string());
+                result_cell_hover(ui, result.shape.clone(), result.shape.clone());
+                let gpu_names = result.gpu_names.join(", ");
+                result_cell_hover(ui, gpu_names.clone(), gpu_names);
+                result_cell(ui, format_optional_tflops(result.end_to_end_tflops));
+                result_cell(ui, format_optional_tflops(result.compute_tflops));
+                result_cell(ui, format_flops_per_step(result.flops_per_step));
+                result_cell(ui, result.preset.label());
+                result_cell_hover(ui, result.validation.clone(), result.validation.clone());
+                result_cell_hover(ui, result.notes.clone(), result.notes.clone());
                 ui.end_row();
             }
         });
+}
+
+const AI_RESULT_HELP_WORKLOAD: &str =
+    "The training workload shape. PyTorch CUDA workloads run real model steps; Portable WGPU workloads are synthetic proxies.";
+const AI_RESULT_HELP_BACKEND: &str =
+    "PyTorch CUDA training is the primary path for real training behavior. Portable WGPU proxy is a cross-vendor fallback for synthetic GEMM/update work.";
+const AI_RESULT_HELP_PRECISION: &str =
+    "Tensor data type used by the backend. PyTorch CUDA supports f32, bf16, and f16 when the CUDA device supports them. Portable WGPU currently reports f32 proxy runs.";
+const AI_RESULT_HELP_THROUGHPUT: &str =
+    "Training-oriented throughput: samples/s for linear and MLP, tokens/s for transformer, parameters/s for optimizer pressure. This is usually the first number to compare for AI workloads.";
+const AI_RESULT_HELP_AVG_STEP: &str =
+    "Average wall-clock time for one measured training step after warmup. Lower is better.";
+const AI_RESULT_HELP_P95_STEP: &str =
+    "95th percentile measured step latency. This helps reveal stutter or occasional slow training steps that the average can hide.";
+const AI_RESULT_HELP_STEP_SPLIT: &str =
+    "PyTorch CUDA timing split for an average measured step: forward/loss, backward, and optimizer update. N/A means the backend does not expose a component split yet.";
+const AI_RESULT_HELP_MEMORY: &str =
+    "Estimated tensor memory for portable runs, or the larger of PyTorch peak allocated/reserved CUDA memory and the static estimate for PyTorch runs.";
+const AI_RESULT_HELP_STEPS: &str =
+    "Number of measured steps included in the result. Warmup steps are run first and excluded from the metrics.";
+const AI_RESULT_HELP_SHAPE: &str =
+    "The workload dimensions: batch/input/output for linear, batch/hidden/expansion for MLP, batch/sequence/hidden/heads for transformer, or parameter count for optimizer pressure.";
+const AI_RESULT_HELP_GPU: &str =
+    "The adapter or CUDA device that produced the result.";
+const AI_RESULT_HELP_E2E_TFLOPS: &str =
+    "Effective FLOP/s based on full measured step wall time. This includes launch, synchronization, framework overhead, and optimizer work.";
+const AI_RESULT_HELP_COMPUTE_TFLOPS: &str =
+    "Effective FLOP/s from GPU-side timing where available: CUDA events for PyTorch, timestamp queries for WGPU. This excludes more host-side overhead than E2E TFLOP/s.";
+const AI_RESULT_HELP_FLOPS_STEP: &str =
+    "Estimated floating-point operations per training step for the configured workload. For proxies, some model operations may be accounted rather than explicitly executed.";
+const AI_RESULT_HELP_PRESET: &str =
+    "The size preset used before any automatic memory-limit sizing. Custom means at least one dimension was edited.";
+const AI_RESULT_HELP_VALIDATION: &str =
+    "Sanity check result. PyTorch validates that training completed with finite loss. Small WGPU linear runs can compare against a CPU reference.";
+const AI_RESULT_HELP_NOTES: &str =
+    "Important context such as proxy status, CUDA versions, memory resizing, time limits, timestamp availability, and backend caveats.";
+
+fn format_ai_step_timings(timings: Option<&AiTrainingStepTimings>) -> String {
+    timings
+        .map(|timings| {
+            format!(
+                "F/L {}, B {}, O {}",
+                format_ms(Some(timings.forward_loss_ms)),
+                format_ms(Some(timings.backward_ms)),
+                format_ms(Some(timings.optimizer_ms))
+            )
+        })
+        .unwrap_or_else(|| "N/A".to_owned())
 }

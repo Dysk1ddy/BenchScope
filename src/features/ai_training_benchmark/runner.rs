@@ -413,6 +413,10 @@ impl AiGpuRunner {
         if config.smoke_test {
             run_notes.push("Smoke test run.".to_owned());
         }
+        run_notes.push(
+            "Portable WGPU proxy path: synthetic GEMM/update work, not a framework training stack."
+                .to_owned(),
+        );
         let notes = run_notes.join(" ");
 
         let _ = tx.send(AiTrainingWorkerEvent::Log(format!(
@@ -439,6 +443,7 @@ impl AiGpuRunner {
             throughput_label: config.workload.throughput_label(),
             avg_step_ms: Some(avg_step_ms),
             p95_step_ms: Some(p95_step_ms),
+            step_timings: None,
             memory_bytes: config_memory_bytes(&config),
             validation,
             notes,
@@ -722,6 +727,10 @@ impl AiGpuRunner {
         } else {
             "Adapter does not expose timestamp queries; using CPU-observed step latency.".to_owned()
         });
+        run_notes.push(
+            "Portable WGPU proxy path: synthetic GEMM/update work, not a framework training stack."
+                .to_owned(),
+        );
 
         let _ = tx.send(AiTrainingWorkerEvent::Log(format!(
             "Completed {} measured step(s): {:.2} end-to-end TFLOP/s, {:.1} {}, avg step {} ms",
@@ -747,6 +756,7 @@ impl AiGpuRunner {
             throughput_label: config.workload.throughput_label(),
             avg_step_ms: Some(avg_step_ms),
             p95_step_ms: Some(p95_step_ms),
+            step_timings: None,
             memory_bytes: config_memory_bytes(&config),
             validation,
             notes: run_notes.join(" "),
@@ -950,6 +960,10 @@ impl AiGpuRunner {
         } else {
             "Adapter does not expose timestamp queries; using CPU-observed step latency.".to_owned()
         });
+        run_notes.push(
+            "Portable optimizer stress path: isolates update/memory pressure, not full model training."
+                .to_owned(),
+        );
 
         let _ = tx.send(AiTrainingWorkerEvent::Log(format!(
             "Completed {} measured optimizer step(s): {:.2} end-to-end TFLOP/s, {:.1} {}, avg step {} ms",
@@ -975,6 +989,7 @@ impl AiGpuRunner {
             throughput_label: config.workload.throughput_label(),
             avg_step_ms: Some(avg_step_ms),
             p95_step_ms: Some(p95_step_ms),
+            step_timings: None,
             memory_bytes: config_memory_bytes(&config),
             validation: "Skipped: optimizer stress validates dispatch completion only".to_owned(),
             notes: run_notes.join(" "),
@@ -1604,6 +1619,55 @@ fn run_ai_training_benchmark(
             runner.run_transformer_proxy_training(config, &cancel, &tx)
         }
         AiTrainingWorkload::OptimizerStress => runner.run_optimizer_stress(config, &cancel, &tx),
+    }
+}
+
+fn run_ai_training_precision_sweep(
+    base_config: AiTrainingConfig,
+    cancel: Arc<AtomicBool>,
+    tx: Sender<AiTrainingWorkerEvent>,
+) -> Result<Vec<AiTrainingResult>> {
+    if base_config.backend != AiTrainingBackend::PyTorchCuda {
+        return Err(anyhow!("precision sweep requires the PyTorch CUDA training backend"));
+    }
+
+    let mut results = Vec::new();
+    let mut errors = Vec::new();
+    for precision in AiTrainingPrecision::ALL {
+        check_canceled_with(Some(cancel.as_ref()), "AI precision sweep canceled")?;
+        let mut config = base_config.clone();
+        config.precision = precision;
+        let _ = tx.send(AiTrainingWorkerEvent::Log(format!(
+            "Precision sweep: running {}",
+            precision.label()
+        )));
+
+        match run_ai_training_benchmark(config, Arc::clone(&cancel), tx.clone()) {
+            Ok(result) => results.push(result),
+            Err(err) if cancel.load(Ordering::Relaxed) => return Err(err),
+            Err(err) => {
+                let message = format!("{} failed: {err:#}", precision.label());
+                let _ = tx.send(AiTrainingWorkerEvent::Log(format!(
+                    "Precision sweep: {message}"
+                )));
+                errors.push(message);
+            }
+        }
+    }
+
+    if results.is_empty() {
+        Err(anyhow!(
+            "precision sweep produced no successful results: {}",
+            errors.join("; ")
+        ))
+    } else {
+        if !errors.is_empty() {
+            let _ = tx.send(AiTrainingWorkerEvent::Log(format!(
+                "Precision sweep completed with skipped/failed precision(s): {}",
+                errors.join("; ")
+            )));
+        }
+        Ok(results)
     }
 }
 

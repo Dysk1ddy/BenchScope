@@ -26,6 +26,7 @@ struct BenchmarkResult {
 enum GpuPath {
     DirectFullBuffer,
     SmallTile,
+    PyTorchCuda,
     PersistentPanelized,
     StreamingBlocked,
 }
@@ -35,6 +36,7 @@ impl GpuPath {
         match self {
             GpuPath::DirectFullBuffer => "Direct",
             GpuPath::SmallTile => "Small Tile",
+            GpuPath::PyTorchCuda => "PyTorch CUDA",
             GpuPath::PersistentPanelized => "Panelized",
             GpuPath::StreamingBlocked => "Streaming",
         }
@@ -105,6 +107,32 @@ struct RepeatProgress {
     canceled: bool,
 }
 
+const MATRIX_STRESS_FP16_TC_FP32_ACCUM_THEORETICAL_TFLOPS: f64 = 209.5;
+
+impl RepeatProgress {
+    fn iterations_per_second(&self) -> Option<f64> {
+        (self.elapsed_s > 0.0).then_some(self.iterations as f64 / self.elapsed_s)
+    }
+
+    fn throughput_tflops(&self) -> Option<f64> {
+        let average_ms = self
+            .average_compute_ms
+            .unwrap_or(self.average_total_ms);
+        if self.iterations == 0 || average_ms <= 0.0 {
+            return None;
+        }
+
+        let n = self.size as f64;
+        let flops_per_iteration = 2.0 * n * n * n;
+        Some(flops_per_iteration / (average_ms / 1000.0) / 1.0e12)
+    }
+
+    fn fp16_tensor_core_efficiency_percent(&self) -> Option<f64> {
+        self.throughput_tflops()
+            .map(|tflops| tflops / MATRIX_STRESS_FP16_TC_FP32_ACCUM_THEORETICAL_TFLOPS * 100.0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StressGpuBackend {
     Optimized,
@@ -127,7 +155,7 @@ impl StressGpuBackend {
     fn description(self) -> &'static str {
         match self {
             StressGpuBackend::Optimized => {
-                "For 4x4 through 32x32, uses CUDA tensor-core equivalent work when available, otherwise a WGPU 4x4-tile microkernel."
+                "Uses PyTorch CUDA/cuBLAS when available for every preset size, otherwise falls back to the optimized WGPU kernels."
             }
             StressGpuBackend::ArchivedWgpu => {
                 "Keeps the previous tiny-matrix WGPU stress shader for comparison."

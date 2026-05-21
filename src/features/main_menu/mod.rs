@@ -282,7 +282,7 @@ fn main_menu_tool_items() -> [MainMenuItem; 10] {
         MainMenuItem {
             title: "AI Training GPU Benchmark",
             description:
-                "Plan training-style GPU workloads with FLOPs, throughput, and latency metrics.",
+                "Run PyTorch training workloads with throughput, latency, precision, and memory metrics.",
             view: AppView::AiTrainingBenchmark,
             accent: egui::Color32::from_rgb(109, 180, 238),
             categories: &[MenuCategory::Gpu],
