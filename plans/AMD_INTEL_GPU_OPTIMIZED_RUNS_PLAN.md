@@ -1,5 +1,28 @@
 # AMD And Intel Optimized GPU Runs Plan
 
+## Implementation Status
+
+Implemented in the matrix benchmark and matrix stress test:
+
+- Adapter vendor detection for NVIDIA, AMD, Intel, and unknown adapters.
+- `Auto optimized`, `Optimized WGPU`, and `Archived WGPU` stress backend choices.
+- Adapter-correct auto routing:
+  - NVIDIA tries PyTorch CUDA, then optimized WGPU.
+  - AMD tries PyTorch ROCm, then optimized WGPU.
+  - Intel tries PyTorch XPU, then optimized WGPU.
+  - Unknown adapters use optimized WGPU.
+- Normal matrix benchmark native probes for AMD ROCm and Intel XPU before WGPU fallback.
+- Matrix stress native probes for AMD ROCm and Intel XPU before WGPU fallback.
+- UI copy that names CUDA, ROCm, XPU, and optimized WGPU accurately.
+- Unit coverage for vendor detection and backend routing.
+
+Still future work:
+
+- Persistent on-disk shader autotune cache.
+- AMD/Intel theoretical baseline tables.
+- Native oneAPI/oneMKL bridge beyond PyTorch XPU.
+- Explicit ROCm/XPU install helpers inside the app.
+
 ## Purpose
 
 Add optimized AMD and Intel GPU runs for the matrix benchmark and matrix stress test while keeping BenchScope honest about which backend is being measured.

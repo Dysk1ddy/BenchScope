@@ -510,6 +510,37 @@ impl AdapterInfo {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GpuVendor {
+    Nvidia,
+    Amd,
+    Intel,
+    Other,
+}
+
+fn adapter_vendor(adapter: &AdapterInfo) -> GpuVendor {
+    let name = adapter.name.to_ascii_lowercase();
+    match adapter.vendor {
+        0x10DE => GpuVendor::Nvidia,
+        0x1002 | 0x1022 => GpuVendor::Amd,
+        0x8086 => GpuVendor::Intel,
+        _ if name.contains("nvidia") || name.contains("geforce") || name.contains("quadro") => {
+            GpuVendor::Nvidia
+        }
+        _ if name.contains("amd") || name.contains("radeon") || name.contains("firepro") => {
+            GpuVendor::Amd
+        }
+        _ if name.contains("intel")
+            || name.contains("arc")
+            || name.contains("iris")
+            || name.contains("uhd graphics") =>
+        {
+            GpuVendor::Intel
+        }
+        _ => GpuVendor::Other,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct DxgiMemoryInfo {
     name: String,

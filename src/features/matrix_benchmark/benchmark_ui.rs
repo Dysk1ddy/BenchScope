@@ -107,31 +107,57 @@ impl BenchScopeApp {
                 }
 
                 ui.add_space(6.0);
-                ui.label("PyTorch CUDA");
-                ui.text_edit_singleline(&mut self.pytorch_python);
-                ui.horizontal(|ui| {
-                    ui.add_enabled_ui(
-                        !self.running && !self.pytorch_probe_running && !self.pytorch_install_running,
-                        |ui| {
-                            if ui.button("Probe").clicked() {
-                                self.start_pytorch_cuda_probe();
-                            }
-                            if ui.button("Install CUDA PyTorch").clicked() {
-                                self.request_pytorch_cuda_install();
-                            }
-                        },
-                    );
-                    if self.pytorch_install_running {
-                        ui.label("Installing...");
-                    } else if self.pytorch_probe_running {
-                        ui.label("Probing...");
+                if let Some(adapter) = self.adapters.get(self.selected_adapter) {
+                    match adapter_vendor(adapter) {
+                        GpuVendor::Nvidia => {
+                            ui.label("PyTorch CUDA");
+                            ui.text_edit_singleline(&mut self.pytorch_python);
+                            ui.horizontal(|ui| {
+                                ui.add_enabled_ui(
+                                    !self.running
+                                        && !self.pytorch_probe_running
+                                        && !self.pytorch_install_running,
+                                    |ui| {
+                                        if ui.button("Probe").clicked() {
+                                            self.start_pytorch_cuda_probe();
+                                        }
+                                        if ui.button("Install CUDA PyTorch").clicked() {
+                                            self.request_pytorch_cuda_install();
+                                        }
+                                    },
+                                );
+                                if self.pytorch_install_running {
+                                    ui.label("Installing...");
+                                } else if self.pytorch_probe_running {
+                                    ui.label("Probing...");
+                                }
+                            });
+                            ui_pytorch_cuda_status(
+                                ui,
+                                self.pytorch_probe.as_ref(),
+                                "NVIDIA adapters try auto-detected PyTorch CUDA before WGPU fallback.",
+                            );
+                        }
+                        GpuVendor::Amd => {
+                            ui.label("PyTorch ROCm");
+                            ui.text_edit_singleline(&mut self.pytorch_python);
+                            ui.small(
+                                "AMD adapters try PyTorch ROCm from this Python before optimized WGPU fallback.",
+                            );
+                        }
+                        GpuVendor::Intel => {
+                            ui.label("PyTorch XPU");
+                            ui.text_edit_singleline(&mut self.pytorch_python);
+                            ui.small(
+                                "Intel adapters try PyTorch XPU from this Python before optimized WGPU fallback.",
+                            );
+                        }
+                        GpuVendor::Other => {
+                            ui.label("Optimized WGPU");
+                            ui.small("This adapter uses the cross-vendor WGPU path.");
+                        }
                     }
-                });
-                ui_pytorch_cuda_status(
-                    ui,
-                    self.pytorch_probe.as_ref(),
-                    "NVIDIA adapters use auto-detected PyTorch CUDA before WGPU fallback.",
-                );
+                }
 
                 if ui.button("Refresh GPUs").clicked() && !self.running {
                     self.adapters = enumerate_adapters();

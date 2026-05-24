@@ -125,36 +125,60 @@ impl BenchScopeApp {
                 });
                 ui.small(self.stress_gpu_backend.description());
                 if self.repeat_mode == RepeatMode::Gpu
-                    && self.stress_gpu_backend == StressGpuBackend::Optimized
+                    && self.stress_gpu_backend == StressGpuBackend::AutoOptimized
                 {
                     ui.add_space(6.0);
-                    ui.label("PyTorch CUDA");
-                    ui.text_edit_singleline(&mut self.pytorch_python);
-                    ui.horizontal(|ui| {
-                        ui.add_enabled_ui(
-                            !self.running
-                                && !self.pytorch_probe_running
-                                && !self.pytorch_install_running,
-                            |ui| {
-                                if ui.button("Probe").clicked() {
-                                    self.start_pytorch_cuda_probe();
-                                }
-                                if ui.button("Install CUDA PyTorch").clicked() {
-                                    self.request_pytorch_cuda_install();
-                                }
-                            },
-                        );
-                        if self.pytorch_install_running {
-                            ui.label("Installing...");
-                        } else if self.pytorch_probe_running {
-                            ui.label("Probing...");
+                    if let Some(adapter) = self.adapters.get(self.selected_adapter) {
+                        match adapter_vendor(adapter) {
+                            GpuVendor::Nvidia => {
+                                ui.label("PyTorch CUDA");
+                                ui.text_edit_singleline(&mut self.pytorch_python);
+                                ui.horizontal(|ui| {
+                                    ui.add_enabled_ui(
+                                        !self.running
+                                            && !self.pytorch_probe_running
+                                            && !self.pytorch_install_running,
+                                        |ui| {
+                                            if ui.button("Probe").clicked() {
+                                                self.start_pytorch_cuda_probe();
+                                            }
+                                            if ui.button("Install CUDA PyTorch").clicked() {
+                                                self.request_pytorch_cuda_install();
+                                            }
+                                        },
+                                    );
+                                    if self.pytorch_install_running {
+                                        ui.label("Installing...");
+                                    } else if self.pytorch_probe_running {
+                                        ui.label("Probing...");
+                                    }
+                                });
+                                ui_pytorch_cuda_status(
+                                    ui,
+                                    self.pytorch_probe.as_ref(),
+                                    "NVIDIA auto mode tries PyTorch CUDA before optimized WGPU.",
+                                );
+                            }
+                            GpuVendor::Amd => {
+                                ui.label("PyTorch ROCm");
+                                ui.text_edit_singleline(&mut self.pytorch_python);
+                                ui.small(
+                                    "AMD auto mode probes this Python for PyTorch ROCm, then falls back to optimized WGPU.",
+                                );
+                            }
+                            GpuVendor::Intel => {
+                                ui.label("PyTorch XPU");
+                                ui.text_edit_singleline(&mut self.pytorch_python);
+                                ui.small(
+                                    "Intel auto mode probes this Python for PyTorch XPU, then falls back to optimized WGPU.",
+                                );
+                            }
+                            GpuVendor::Other => {
+                                ui.label("Optimized WGPU");
+                                ui.small("No native PyTorch backend is mapped for this adapter.");
+                            }
                         }
-                    });
-                    ui_pytorch_cuda_status(
-                        ui,
-                        self.pytorch_probe.as_ref(),
-                        "Stress runs auto-detect PyTorch CUDA before falling back to WGPU.",
-                    );
+                    }
                 }
 
                 if ui.button("Refresh GPUs").clicked() && !self.running {

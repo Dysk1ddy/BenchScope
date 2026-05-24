@@ -268,9 +268,19 @@ mod tests {
 
     #[test]
     fn stress_gpu_backend_keeps_archived_option() {
-        assert_eq!(StressGpuBackend::Optimized.label(), "Optimized");
+        assert_eq!(StressGpuBackend::AutoOptimized.label(), "Auto optimized");
+        assert_eq!(StressGpuBackend::OptimizedWgpu.label(), "Optimized WGPU");
         assert_eq!(StressGpuBackend::ArchivedWgpu.label(), "Archived WGPU");
+        assert!(StressGpuBackend::ALL.contains(&StressGpuBackend::AutoOptimized));
+        assert!(StressGpuBackend::ALL.contains(&StressGpuBackend::OptimizedWgpu));
         assert!(StressGpuBackend::ALL.contains(&StressGpuBackend::ArchivedWgpu));
+        assert!(StressGpuBackend::AutoOptimized.can_try_native_pytorch());
+        assert!(StressGpuBackend::OptimizedWgpu.uses_optimized_wgpu());
+        assert!(!StressGpuBackend::ArchivedWgpu.uses_optimized_wgpu());
+        assert_eq!(GpuPath::PyTorchRocm.label(), "PyTorch ROCm");
+        assert_eq!(GpuPath::PyTorchXpu.label(), "PyTorch XPU");
+        assert_eq!(GpuPath::OptimizedWgpu.label(), "Optimized WGPU");
+        assert_eq!(GpuPath::ArchivedWgpu.label(), "Archived WGPU");
     }
 
     #[test]
@@ -347,6 +357,52 @@ mod tests {
             Some("GeForce RTX 3050 Laptop GPU")
         );
         assert_eq!(theoretical_gpu_model_name_for_adapter("AMD Radeon"), None);
+    }
+
+    #[test]
+    fn adapter_vendor_routes_native_pytorch_backends() {
+        let mut adapter = AdapterInfo {
+            index: 0,
+            name: "NVIDIA GeForce RTX 5090".to_owned(),
+            backend: wgpu::Backend::Dx12,
+            device_type: wgpu::DeviceType::DiscreteGpu,
+            vendor: 0x10DE,
+            device: 0,
+            driver: String::new(),
+            timestamp_query: true,
+            dedicated_vram_bytes: None,
+            dedicated_system_memory_bytes: None,
+            shared_system_memory_bytes: None,
+        };
+
+        assert_eq!(adapter_vendor(&adapter), GpuVendor::Nvidia);
+        assert_eq!(
+            native_pytorch_backend_for_adapter(&adapter),
+            Some(PyTorchMatrixBackend::Cuda)
+        );
+
+        adapter.name = "AMD Radeon RX 7900 XTX".to_owned();
+        adapter.vendor = 0x1002;
+        assert_eq!(adapter_vendor(&adapter), GpuVendor::Amd);
+        assert_eq!(
+            native_pytorch_backend_for_adapter(&adapter),
+            Some(PyTorchMatrixBackend::Rocm)
+        );
+        assert!(!adapter_prefers_pytorch_cuda(&adapter));
+
+        adapter.name = "Intel(R) Arc(TM) A770 Graphics".to_owned();
+        adapter.vendor = 0x8086;
+        assert_eq!(adapter_vendor(&adapter), GpuVendor::Intel);
+        assert_eq!(
+            native_pytorch_backend_for_adapter(&adapter),
+            Some(PyTorchMatrixBackend::Xpu)
+        );
+        assert!(!adapter_prefers_pytorch_cuda(&adapter));
+
+        adapter.name = "Microsoft Basic Render Driver".to_owned();
+        adapter.vendor = 0;
+        assert_eq!(adapter_vendor(&adapter), GpuVendor::Other);
+        assert_eq!(native_pytorch_backend_for_adapter(&adapter), None);
     }
 
     #[test]
@@ -855,7 +911,7 @@ mod tests {
             adapter,
             RepeatMode::Cpu,
             GpuIntensity::Safe,
-            StressGpuBackend::Optimized,
+            StressGpuBackend::OptimizedWgpu,
             String::new(),
             cancel_worker,
             tx,

@@ -27,6 +27,10 @@ enum GpuPath {
     DirectFullBuffer,
     SmallTile,
     PyTorchCuda,
+    PyTorchRocm,
+    PyTorchXpu,
+    OptimizedWgpu,
+    ArchivedWgpu,
     PersistentPanelized,
     StreamingBlocked,
 }
@@ -37,6 +41,10 @@ impl GpuPath {
             GpuPath::DirectFullBuffer => "Direct",
             GpuPath::SmallTile => "Small Tile",
             GpuPath::PyTorchCuda => "PyTorch CUDA",
+            GpuPath::PyTorchRocm => "PyTorch ROCm",
+            GpuPath::PyTorchXpu => "PyTorch XPU",
+            GpuPath::OptimizedWgpu => "Optimized WGPU",
+            GpuPath::ArchivedWgpu => "Archived WGPU",
             GpuPath::PersistentPanelized => "Panelized",
             GpuPath::StreamingBlocked => "Streaming",
         }
@@ -138,32 +146,49 @@ impl RepeatProgress {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StressGpuBackend {
-    Optimized,
+    AutoOptimized,
+    OptimizedWgpu,
     ArchivedWgpu,
 }
 
 impl StressGpuBackend {
-    const ALL: [StressGpuBackend; 2] = [
-        StressGpuBackend::Optimized,
+    const ALL: [StressGpuBackend; 3] = [
+        StressGpuBackend::AutoOptimized,
+        StressGpuBackend::OptimizedWgpu,
         StressGpuBackend::ArchivedWgpu,
     ];
 
     fn label(self) -> &'static str {
         match self {
-            StressGpuBackend::Optimized => "Optimized",
+            StressGpuBackend::AutoOptimized => "Auto optimized",
+            StressGpuBackend::OptimizedWgpu => "Optimized WGPU",
             StressGpuBackend::ArchivedWgpu => "Archived WGPU",
         }
     }
 
     fn description(self) -> &'static str {
         match self {
-            StressGpuBackend::Optimized => {
-                "Uses PyTorch CUDA/cuBLAS when available for every preset size, otherwise falls back to the optimized WGPU kernels."
+            StressGpuBackend::AutoOptimized => {
+                "Uses the selected adapter's native PyTorch backend when available (CUDA, ROCm, or XPU), otherwise falls back to optimized WGPU kernels."
+            }
+            StressGpuBackend::OptimizedWgpu => {
+                "Uses BenchScope's optimized cross-vendor WGPU kernels on the selected adapter without Python or vendor ML runtimes."
             }
             StressGpuBackend::ArchivedWgpu => {
                 "Keeps the previous tiny-matrix WGPU stress shader for comparison."
             }
         }
+    }
+
+    fn uses_optimized_wgpu(self) -> bool {
+        matches!(
+            self,
+            StressGpuBackend::AutoOptimized | StressGpuBackend::OptimizedWgpu
+        )
+    }
+
+    fn can_try_native_pytorch(self) -> bool {
+        self == StressGpuBackend::AutoOptimized
     }
 }
 
