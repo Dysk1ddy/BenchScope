@@ -124,9 +124,6 @@ impl BenchScopeApp {
         ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut self.timeline.show_temperatures, "Temp");
             ui.checkbox(&mut self.timeline.show_utilization, "Util");
-            ui.checkbox(&mut self.timeline.show_clocks, "Clock");
-            ui.checkbox(&mut self.timeline.show_power, "Power");
-            ui.checkbox(&mut self.timeline.show_throughput, "Throughput");
             ui.separator();
             ui.checkbox(&mut self.timeline.show_cpu, "CPU");
             ui.checkbox(&mut self.timeline.show_gpu, "GPU");
@@ -174,7 +171,7 @@ fn ui_timeline_graph(ui: &mut egui::Ui, timeline: &RunTimeline, state: &Timeline
         return;
     }
 
-    let desired_size = egui::vec2(ui.available_width().max(360.0), 260.0);
+    let desired_size = egui::vec2(ui.available_width().max(360.0), 280.0);
     let (rect, _) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, egui::CornerRadius::same(6), egui::Color32::from_rgb(18, 21, 26));
@@ -185,7 +182,10 @@ fn ui_timeline_graph(ui: &mut egui::Ui, timeline: &RunTimeline, state: &Timeline
         egui::StrokeKind::Inside,
     );
 
-    let plot = rect.shrink2(egui::vec2(12.0, 28.0));
+    let plot = egui::Rect::from_min_max(
+        rect.min + egui::vec2(52.0, 28.0),
+        rect.max - egui::vec2(12.0, 42.0),
+    );
     let max_x = timeline
         .samples
         .last()
@@ -199,11 +199,18 @@ fn ui_timeline_graph(ui: &mut egui::Ui, timeline: &RunTimeline, state: &Timeline
             egui::Stroke::new(0.7, egui::Color32::from_rgb(35, 40, 48)),
         );
     }
-    for i in 0..=3 {
-        let y = plot.top() + plot.height() * i as f32 / 3.0;
+    for i in 0..=4 {
+        let y = plot.bottom() - plot.height() * i as f32 / 4.0;
         painter.line_segment(
             [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
             egui::Stroke::new(0.7, egui::Color32::from_rgb(35, 40, 48)),
+        );
+        painter.text(
+            egui::pos2(plot.left() - 8.0, y),
+            egui::Align2::RIGHT_CENTER,
+            format!("{}", i * 25),
+            egui::FontId::proportional(12.0),
+            egui::Color32::from_rgb(170, 178, 190),
         );
     }
 
@@ -225,6 +232,14 @@ fn ui_timeline_graph(ui: &mut egui::Ui, timeline: &RunTimeline, state: &Timeline
         }
     }
 
+    painter.line_segment(
+        [plot.left_bottom(), plot.right_bottom()],
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(76, 84, 96)),
+    );
+    painter.line_segment(
+        [plot.left_bottom(), plot.left_top()],
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(76, 84, 96)),
+    );
     painter.text(
         egui::pos2(plot.left(), plot.bottom() + 6.0),
         egui::Align2::LEFT_TOP,
@@ -239,6 +254,20 @@ fn ui_timeline_graph(ui: &mut egui::Ui, timeline: &RunTimeline, state: &Timeline
         egui::FontId::proportional(12.0),
         egui::Color32::from_rgb(170, 178, 190),
     );
+    painter.text(
+        egui::pos2(plot.center().x, rect.bottom() - 16.0),
+        egui::Align2::CENTER_CENTER,
+        "Elapsed time",
+        egui::FontId::proportional(12.0),
+        egui::Color32::from_rgb(190, 198, 210),
+    );
+    painter.text(
+        egui::pos2(rect.left() + 10.0, plot.center().y),
+        egui::Align2::LEFT_CENTER,
+        "Temp C / Util %",
+        egui::FontId::proportional(12.0),
+        egui::Color32::from_rgb(190, 198, 210),
+    );
 }
 
 fn draw_timeline_series(
@@ -250,23 +279,12 @@ fn draw_timeline_series(
     if series.values.len() < 2 {
         return;
     }
-    let min_y = series
-        .values
-        .iter()
-        .map(|(_, value)| *value)
-        .fold(f64::INFINITY, f64::min);
-    let max_y = series
-        .values
-        .iter()
-        .map(|(_, value)| *value)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let span = (max_y - min_y).max(1.0);
     let points = series
         .values
         .iter()
         .map(|(x, y)| {
             let x = plot.left() + ((*x / max_x).clamp(0.0, 1.0) as f32) * plot.width();
-            let normalized_y = ((*y - min_y) / span).clamp(0.0, 1.0) as f32;
+            let normalized_y = (*y / 100.0).clamp(0.0, 1.0) as f32;
             let y = plot.bottom() - normalized_y * plot.height();
             egui::pos2(x, y)
         })
@@ -307,15 +325,6 @@ fn timeline_graph_series(timeline: &RunTimeline, state: &TimelineState) -> Vec<T
             state.show_vram,
             |sample| sample.sensor.gpu_memory_temp_c.map(f64::from),
         );
-        push_timeline_series(
-            &mut series,
-            "SSD temp",
-            "C",
-            egui::Color32::from_rgb(111, 203, 166),
-            timeline,
-            state.show_drive,
-            |sample| sample.sensor.drive_temp_c.map(f64::from),
-        );
     }
     if state.show_utilization {
         push_timeline_series(
@@ -353,61 +362,6 @@ fn timeline_graph_series(timeline: &RunTimeline, state: &TimelineState) -> Vec<T
             timeline,
             state.show_memory,
             |sample| sample.sensor.memory_util_percent.map(f64::from),
-        );
-    }
-    if state.show_clocks {
-        push_timeline_series(
-            &mut series,
-            "CPU clock",
-            "MHz",
-            egui::Color32::from_rgb(96, 201, 177),
-            timeline,
-            state.show_cpu,
-            |sample| sample.sensor.cpu_clock_mhz.map(f64::from),
-        );
-        push_timeline_series(
-            &mut series,
-            "GPU clock",
-            "MHz",
-            egui::Color32::from_rgb(222, 147, 216),
-            timeline,
-            state.show_gpu,
-            |sample| sample.sensor.gpu_clock_mhz.map(f64::from),
-        );
-    }
-    if state.show_power {
-        push_timeline_series(
-            &mut series,
-            "CPU power",
-            "W",
-            egui::Color32::from_rgb(224, 118, 122),
-            timeline,
-            state.show_cpu,
-            |sample| sample.sensor.cpu_power_w.map(f64::from),
-        );
-        push_timeline_series(
-            &mut series,
-            "GPU power",
-            "W",
-            egui::Color32::from_rgb(224, 176, 105),
-            timeline,
-            state.show_gpu,
-            |sample| sample.sensor.gpu_power_w.map(f64::from),
-        );
-    }
-    if state.show_throughput {
-        push_timeline_series(
-            &mut series,
-            "Throughput",
-            timeline
-                .samples
-                .iter()
-                .find_map(|sample| sample.throughput.as_ref().map(|value| value.unit.as_str()))
-                .unwrap_or("rate"),
-            egui::Color32::from_rgb(145, 214, 111),
-            timeline,
-            true,
-            |sample| sample.throughput.as_ref().map(|value| value.value),
         );
     }
     series

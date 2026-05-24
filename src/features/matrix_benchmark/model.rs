@@ -29,8 +29,6 @@ enum GpuPath {
     PyTorchCuda,
     PyTorchRocm,
     PyTorchXpu,
-    OptimizedWgpu,
-    ArchivedWgpu,
     PersistentPanelized,
     StreamingBlocked,
 }
@@ -43,8 +41,6 @@ impl GpuPath {
             GpuPath::PyTorchCuda => "PyTorch CUDA",
             GpuPath::PyTorchRocm => "PyTorch ROCm",
             GpuPath::PyTorchXpu => "PyTorch XPU",
-            GpuPath::OptimizedWgpu => "Optimized WGPU",
-            GpuPath::ArchivedWgpu => "Archived WGPU",
             GpuPath::PersistentPanelized => "Panelized",
             GpuPath::StreamingBlocked => "Streaming",
         }

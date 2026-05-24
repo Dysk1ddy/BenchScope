@@ -209,6 +209,7 @@ impl BenchScopeApp {
             "thermal-timeline-summary.md".to_owned(),
             render_timeline_report(&self.timeline.completed),
         ));
+        reports.push(("crashlogs.md".to_owned(), render_crashlog_report()));
 
         let session_log = self.combined_session_log();
         match export_support_bundle(&mut self.history, reports, &session_log) {

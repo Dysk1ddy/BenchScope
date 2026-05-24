@@ -27,6 +27,7 @@ use wgpu::util::DeviceExt;
 #[cfg(windows)]
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
+include!("crashlog.rs");
 include!("constants.rs");
 include!("features/matrix_benchmark/mod.rs");
 include!("features/ai_training_benchmark/mod.rs");
@@ -46,6 +47,8 @@ include!("app/mod.rs");
 include!("cli.rs");
 
 fn main() -> eframe::Result<()> {
+    install_crash_logger();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run_cli(&args) {
         Ok(true) => return Ok(()),

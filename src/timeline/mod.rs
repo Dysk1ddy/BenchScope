@@ -104,9 +104,6 @@ struct TimelineState {
     completed: Vec<CompletedTimeline>,
     show_temperatures: bool,
     show_utilization: bool,
-    show_clocks: bool,
-    show_power: bool,
-    show_throughput: bool,
     show_cpu: bool,
     show_gpu: bool,
     show_vram: bool,
@@ -121,9 +118,6 @@ impl TimelineState {
             completed: Vec::new(),
             show_temperatures: true,
             show_utilization: true,
-            show_clocks: true,
-            show_power: false,
-            show_throughput: true,
             show_cpu: true,
             show_gpu: true,
             show_vram: true,
@@ -569,6 +563,28 @@ fn render_timeline_report(records: &[CompletedTimeline]) -> String {
             format_temperature_value(summary.peak_drive_temp_c),
             format_temperature_value(summary.peak_memory_temp_c)
         ));
+        let peak_cpu_clock_mhz =
+            peak_timeline_value(record.timeline.samples.iter().map(|sample| sample.sensor.cpu_clock_mhz));
+        let peak_gpu_clock_mhz =
+            peak_timeline_value(record.timeline.samples.iter().map(|sample| sample.sensor.gpu_clock_mhz));
+        let peak_cpu_power_w =
+            peak_timeline_value(record.timeline.samples.iter().map(|sample| sample.sensor.cpu_power_w));
+        let peak_gpu_power_w =
+            peak_timeline_value(record.timeline.samples.iter().map(|sample| sample.sensor.gpu_power_w));
+        if peak_cpu_clock_mhz.is_some() || peak_gpu_clock_mhz.is_some() {
+            report.push_str(&format!(
+                "- Peak CPU/GPU clocks: {} / {}\n",
+                format_optional_mhz(peak_cpu_clock_mhz),
+                format_optional_mhz(peak_gpu_clock_mhz)
+            ));
+        }
+        if peak_cpu_power_w.is_some() || peak_gpu_power_w.is_some() {
+            report.push_str(&format!(
+                "- Peak CPU/GPU power: {} / {}\n",
+                format_timeline_optional_watts(peak_cpu_power_w),
+                format_timeline_optional_watts(peak_gpu_power_w)
+            ));
+        }
         if let Some(drop) = summary.throughput_drop_percent {
             report.push_str(&format!("- Throughput drop: {drop:.1}%\n"));
         }
@@ -607,6 +623,18 @@ fn render_timeline_report(records: &[CompletedTimeline]) -> String {
         report.push('\n');
     }
     report
+}
+
+fn format_optional_mhz(value: Option<f32>) -> String {
+    value
+        .map(|value| format!("{value:.0} MHz"))
+        .unwrap_or_else(|| "N/A".to_owned())
+}
+
+fn format_timeline_optional_watts(value: Option<f32>) -> String {
+    value
+        .map(|value| format!("{value:.1} W"))
+        .unwrap_or_else(|| "N/A".to_owned())
 }
 
 fn timeline_system_time_unix_seconds(time: SystemTime) -> u64 {

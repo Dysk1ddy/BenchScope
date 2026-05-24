@@ -284,7 +284,13 @@ impl BenchScopeApp {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let available_height = ui.available_height();
             let (summary_height, log_height) =
-                panel_content_log_heights(available_height, 0.35, 220.0);
+                resizable_panel_content_log_heights(
+                    ui,
+                    "matrix_stress_log",
+                    available_height,
+                    0.35,
+                    220.0,
+                );
 
             ui.heading("Stress Readout");
             ui.add_space(6.0);
@@ -389,7 +395,13 @@ impl BenchScopeApp {
                 },
             );
 
-            ui.separator();
+            ui_log_resize_handle(
+                ui,
+                "matrix_stress_log",
+                available_height,
+                log_height,
+                220.0,
+            );
             ui.heading("Log");
             egui::ScrollArea::vertical()
                 .stick_to_bottom(true)

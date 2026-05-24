@@ -1490,6 +1490,7 @@ impl GpuRunner {
         b: &[f32],
         gpu_intensity: GpuIntensity,
         stress_gpu_backend: StressGpuBackend,
+        conservative_tiny_stress: bool,
         cancel: &AtomicBool,
         deadline: &Option<Instant>,
         emit: &mut F,
@@ -1513,6 +1514,7 @@ impl GpuRunner {
                 a,
                 b,
                 gpu_intensity,
+                conservative_tiny_stress,
                 cancel,
                 deadline,
                 emit,
@@ -1526,6 +1528,7 @@ impl GpuRunner {
                 a,
                 b,
                 gpu_intensity,
+                conservative_tiny_stress,
                 cancel,
                 deadline,
                 emit,
@@ -1577,6 +1580,7 @@ impl GpuRunner {
         a: &[f32],
         b: &[f32],
         gpu_intensity: GpuIntensity,
+        conservative_tiny_stress: bool,
         cancel: &AtomicBool,
         deadline: &Option<Instant>,
         emit: &mut F,
@@ -1598,7 +1602,8 @@ impl GpuRunner {
                 contents: bytemuck::cast_slice(b),
                 usage: wgpu::BufferUsages::STORAGE,
             });
-        let workgroups = gpu_register_tiny_stress_workgroups(gpu_intensity);
+        let workgroups =
+            gpu_register_tiny_stress_workgroups(gpu_intensity, conservative_tiny_stress);
         let scratch_elements = (workgroups as usize)
             .checked_mul(GPU_TINY_STRESS_LANES_PER_WORKGROUP)
             .ok_or_else(|| anyhow!("register tiny stress scratch buffer size overflow"))?;
@@ -1613,7 +1618,11 @@ impl GpuRunner {
         let params = Params {
             n: n_u32,
             row_offset: 0,
-            row_count: gpu_register_tiny_stress_rounds(n, gpu_intensity),
+            row_count: gpu_register_tiny_stress_rounds(
+                n,
+                gpu_intensity,
+                conservative_tiny_stress,
+            ),
             _pad2: 0,
         };
         let dispatch = self.create_direct_dispatch(
@@ -1625,7 +1634,8 @@ impl GpuRunner {
         );
         let equivalent_iterations =
             register_tiny_stress_equivalent_iterations(scratch_elements, n, params.row_count);
-        let max_batch_limit = gpu_register_tiny_stress_batch_limit(gpu_intensity).max(1);
+        let max_batch_limit =
+            gpu_register_tiny_stress_batch_limit(gpu_intensity, conservative_tiny_stress).max(1);
         let mut batch_limit = max_batch_limit;
         let mut counters = GpuRepeatCounters::default();
 
@@ -1713,6 +1723,7 @@ impl GpuRunner {
         a: &[f32],
         b: &[f32],
         gpu_intensity: GpuIntensity,
+        conservative_tiny_stress: bool,
         cancel: &AtomicBool,
         deadline: &Option<Instant>,
         emit: &mut F,
@@ -1734,7 +1745,7 @@ impl GpuRunner {
                 contents: bytemuck::cast_slice(b),
                 usage: wgpu::BufferUsages::STORAGE,
             });
-        let workgroups = gpu_tiny_stress_workgroups(gpu_intensity);
+        let workgroups = gpu_tiny_stress_workgroups(gpu_intensity, conservative_tiny_stress);
         let scratch_elements = (workgroups as usize)
             .checked_mul(GPU_TINY_STRESS_LANES_PER_WORKGROUP)
             .ok_or_else(|| anyhow!("tiny stress scratch buffer size overflow"))?;
@@ -1749,7 +1760,7 @@ impl GpuRunner {
         let params = Params {
             n: n_u32,
             row_offset: 0,
-            row_count: gpu_tiny_stress_rounds(n, gpu_intensity),
+            row_count: gpu_tiny_stress_rounds(n, gpu_intensity, conservative_tiny_stress),
             _pad2: 0,
         };
         let dispatch = self.create_direct_dispatch(
@@ -1761,7 +1772,8 @@ impl GpuRunner {
         );
         let equivalent_iterations =
             tiny_stress_equivalent_iterations(scratch_elements, n, params.row_count);
-        let max_batch_limit = gpu_tiny_stress_batch_limit(gpu_intensity).max(1);
+        let max_batch_limit =
+            gpu_tiny_stress_batch_limit(gpu_intensity, conservative_tiny_stress).max(1);
         let mut batch_limit = max_batch_limit;
         let mut counters = GpuRepeatCounters::default();
 
@@ -2947,22 +2959,43 @@ fn gpu_stress_repeat_batch_limit(size: usize, gpu_intensity: GpuIntensity) -> us
     }
 }
 
-fn gpu_tiny_stress_workgroups(gpu_intensity: GpuIntensity) -> u32 {
-    match gpu_intensity {
-        GpuIntensity::Safe => GPU_SAFE_TINY_STRESS_WORKGROUPS,
-        GpuIntensity::Balanced => GPU_BALANCED_TINY_STRESS_WORKGROUPS,
-        GpuIntensity::High => GPU_HIGH_TINY_STRESS_WORKGROUPS,
+fn gpu_tiny_stress_workgroups(gpu_intensity: GpuIntensity, conservative: bool) -> u32 {
+    if conservative {
+        match gpu_intensity {
+            GpuIntensity::Safe => 64,
+            GpuIntensity::Balanced => 128,
+            GpuIntensity::High => 256,
+        }
+    } else {
+        match gpu_intensity {
+            GpuIntensity::Safe => GPU_SAFE_TINY_STRESS_WORKGROUPS,
+            GpuIntensity::Balanced => GPU_BALANCED_TINY_STRESS_WORKGROUPS,
+            GpuIntensity::High => GPU_HIGH_TINY_STRESS_WORKGROUPS,
+        }
     }
 }
 
-fn gpu_tiny_stress_rounds(size: usize, gpu_intensity: GpuIntensity) -> u32 {
-    let base = match gpu_intensity {
-        GpuIntensity::Safe => GPU_SAFE_TINY_STRESS_ROUNDS,
-        GpuIntensity::Balanced => GPU_BALANCED_TINY_STRESS_ROUNDS,
-        GpuIntensity::High => GPU_HIGH_TINY_STRESS_ROUNDS,
+fn gpu_tiny_stress_rounds(size: usize, gpu_intensity: GpuIntensity, conservative: bool) -> u32 {
+    let base = if conservative {
+        match gpu_intensity {
+            GpuIntensity::Safe => 64,
+            GpuIntensity::Balanced => 128,
+            GpuIntensity::High => 256,
+        }
+    } else {
+        match gpu_intensity {
+            GpuIntensity::Safe => GPU_SAFE_TINY_STRESS_ROUNDS,
+            GpuIntensity::Balanced => GPU_BALANCED_TINY_STRESS_ROUNDS,
+            GpuIntensity::High => GPU_HIGH_TINY_STRESS_ROUNDS,
+        }
     };
     let scaled = (u64::from(base) * u64::from(TILE_SIZE)).div_ceil(size.max(1) as u64);
     scaled.clamp(1, u64::from(u32::MAX)) as u32
+}
+
+fn adapter_uses_conservative_tiny_stress(adapter: &AdapterInfo) -> bool {
+    adapter_vendor(adapter) == GpuVendor::Intel
+        || matches!(adapter.device_type, wgpu::DeviceType::IntegratedGpu)
 }
 
 fn uses_small_tile_path(size: usize) -> bool {
@@ -2983,12 +3016,16 @@ fn gpu_small_tile_workgroups(size: usize) -> Result<u32> {
     u32::try_from(workgroups.max(1)).context("small-tile workgroup count exceeds GPU limits")
 }
 
-fn gpu_register_tiny_stress_workgroups(gpu_intensity: GpuIntensity) -> u32 {
-    gpu_tiny_stress_workgroups(gpu_intensity)
+fn gpu_register_tiny_stress_workgroups(gpu_intensity: GpuIntensity, conservative: bool) -> u32 {
+    gpu_tiny_stress_workgroups(gpu_intensity, conservative)
 }
 
-fn gpu_register_tiny_stress_rounds(size: usize, gpu_intensity: GpuIntensity) -> u32 {
-    gpu_tiny_stress_rounds(size, gpu_intensity)
+fn gpu_register_tiny_stress_rounds(
+    size: usize,
+    gpu_intensity: GpuIntensity,
+    conservative: bool,
+) -> u32 {
+    gpu_tiny_stress_rounds(size, gpu_intensity, conservative)
 }
 
 fn gpu_dense_stress_workgroups(gpu_intensity: GpuIntensity) -> u32 {
@@ -3057,15 +3094,22 @@ fn register_tiny_stress_equivalent_iterations(
     equivalent_iterations.min(u64::MAX as u128) as u64
 }
 
-fn gpu_tiny_stress_batch_limit(gpu_intensity: GpuIntensity) -> usize {
-    match gpu_intensity {
-        GpuIntensity::Safe => GPU_SAFE_TINY_STRESS_BATCH_DISPATCHES,
-        GpuIntensity::Balanced => GPU_BALANCED_TINY_STRESS_BATCH_DISPATCHES,
-        GpuIntensity::High => GPU_HIGH_TINY_STRESS_BATCH_DISPATCHES,
+fn gpu_tiny_stress_batch_limit(gpu_intensity: GpuIntensity, conservative: bool) -> usize {
+    if conservative {
+        1
+    } else {
+        match gpu_intensity {
+            GpuIntensity::Safe => GPU_SAFE_TINY_STRESS_BATCH_DISPATCHES,
+            GpuIntensity::Balanced => GPU_BALANCED_TINY_STRESS_BATCH_DISPATCHES,
+            GpuIntensity::High => GPU_HIGH_TINY_STRESS_BATCH_DISPATCHES,
+        }
     }
 }
 
-fn gpu_register_tiny_stress_batch_limit(_gpu_intensity: GpuIntensity) -> usize {
+fn gpu_register_tiny_stress_batch_limit(
+    _gpu_intensity: GpuIntensity,
+    _conservative: bool,
+) -> usize {
     1
 }
 
@@ -4475,12 +4519,20 @@ fn run_repeat(
             ensure_matrix_host_memory_available(size, 3, "WGPU GPU matrix stress fallback")?;
             let (a, b) = generate_matrices_cancelable(size, Some(&cancel))?;
             let runner = GpuRunner::new(adapter.index)?;
+            let conservative_tiny_stress = adapter_uses_conservative_tiny_stress(&adapter);
+            if conservative_tiny_stress && size <= GPU_TINY_STRESS_MAX_SIZE {
+                let _ = tx.send(WorkerEvent::Log(format!(
+                    "Using conservative tiny WGPU stress dispatches for {} to avoid long single-dispatch driver timeouts",
+                    adapter.name
+                )));
+            }
             return runner.repeat_gpu_compute(
                 size,
                 &a,
                 &b,
                 gpu_intensity,
                 stress_gpu_backend,
+                conservative_tiny_stress,
                 &cancel,
                 &deadline,
                 &mut emit,

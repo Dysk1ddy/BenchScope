@@ -83,8 +83,14 @@ impl BenchScopeApp {
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let available_height = ui.available_height();
-            let log_height = (available_height * 0.20).clamp(110.0, 180.0);
-            let content_height = (available_height - log_height - 18.0).max(140.0);
+            let (content_height, log_height) =
+                resizable_panel_content_log_heights(
+                    ui,
+                    "device_info_log",
+                    available_height,
+                    0.20,
+                    180.0,
+                );
 
             ui.allocate_ui_with_layout(
                 egui::vec2(ui.available_width(), content_height),
@@ -121,7 +127,13 @@ impl BenchScopeApp {
                 },
             );
 
-            ui.separator();
+            ui_log_resize_handle(
+                ui,
+                "device_info_log",
+                available_height,
+                log_height,
+                180.0,
+            );
             ui.heading("Log");
             egui::ScrollArea::vertical()
                 .stick_to_bottom(true)

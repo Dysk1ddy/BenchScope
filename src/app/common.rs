@@ -14,8 +14,9 @@ impl BenchScopeRoot {
                     }
                     Err(panic) => {
                         let _ = worker_tx.send(StartupEvent::Failed(format!(
-                            "Startup failed: {}",
-                            panic_message(&*panic)
+                            "Startup failed: {}. {}",
+                            panic_message(&*panic),
+                            crashlog_hint()
                         )));
                     }
                 }

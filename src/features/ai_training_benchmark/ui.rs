@@ -335,7 +335,13 @@ impl BenchScopeApp {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let available_height = ui.available_height();
             let (content_height, log_height) =
-                panel_content_log_heights(available_height, 0.24, 210.0);
+                resizable_panel_content_log_heights(
+                    ui,
+                    "ai_training_log",
+                    available_height,
+                    0.24,
+                    210.0,
+                );
 
             ui.allocate_ui_with_layout(
                 egui::vec2(ui.available_width(), content_height),
@@ -358,7 +364,13 @@ impl BenchScopeApp {
                 },
             );
 
-            ui.separator();
+            ui_log_resize_handle(
+                ui,
+                "ai_training_log",
+                available_height,
+                log_height,
+                210.0,
+            );
             ui.heading("Log");
             egui::ScrollArea::vertical()
                 .stick_to_bottom(true)

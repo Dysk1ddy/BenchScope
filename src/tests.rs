@@ -279,8 +279,8 @@ mod tests {
         assert!(!StressGpuBackend::ArchivedWgpu.uses_optimized_wgpu());
         assert_eq!(GpuPath::PyTorchRocm.label(), "PyTorch ROCm");
         assert_eq!(GpuPath::PyTorchXpu.label(), "PyTorch XPU");
-        assert_eq!(GpuPath::OptimizedWgpu.label(), "Optimized WGPU");
-        assert_eq!(GpuPath::ArchivedWgpu.label(), "Archived WGPU");
+        assert_eq!(GpuPath::PersistentPanelized.label(), "Panelized");
+        assert_eq!(GpuPath::StreamingBlocked.label(), "Streaming");
     }
 
     #[test]
@@ -289,6 +289,22 @@ mod tests {
         assert_eq!(register_tiny_stress_equivalent_iterations(256, 8, 8), 512);
         assert_eq!(register_tiny_stress_equivalent_iterations(256, 16, 8), 128);
         assert_eq!(register_tiny_stress_equivalent_iterations(256, 32, 8), 32);
+    }
+
+    #[test]
+    fn conservative_tiny_stress_profile_limits_single_dispatch_size() {
+        assert!(
+            gpu_tiny_stress_workgroups(GpuIntensity::Safe, true)
+                < gpu_tiny_stress_workgroups(GpuIntensity::Safe, false)
+        );
+        assert!(
+            gpu_register_tiny_stress_rounds(4, GpuIntensity::Safe, true)
+                < gpu_register_tiny_stress_rounds(4, GpuIntensity::Safe, false)
+        );
+        assert_eq!(
+            gpu_register_tiny_stress_batch_limit(GpuIntensity::High, true),
+            1
+        );
     }
 
     #[test]
@@ -398,11 +414,15 @@ mod tests {
             Some(PyTorchMatrixBackend::Xpu)
         );
         assert!(!adapter_prefers_pytorch_cuda(&adapter));
+        assert!(adapter_uses_conservative_tiny_stress(&adapter));
 
         adapter.name = "Microsoft Basic Render Driver".to_owned();
         adapter.vendor = 0;
         assert_eq!(adapter_vendor(&adapter), GpuVendor::Other);
         assert_eq!(native_pytorch_backend_for_adapter(&adapter), None);
+
+        adapter.device_type = wgpu::DeviceType::IntegratedGpu;
+        assert!(adapter_uses_conservative_tiny_stress(&adapter));
     }
 
     #[test]
@@ -2015,6 +2035,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn panel_log_resize_bounds_stay_ordered() {
+        for usable_height in [80.0, 180.0, 640.0] {
+            let (min_log, max_log) = panel_log_resize_bounds(usable_height, 150.0);
+            assert!(min_log <= max_log);
+            assert!(min_log >= 32.0);
+            assert!(max_log <= 150.0);
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn drive_device_name_parser_reads_tab_separated_names() {
@@ -2511,5 +2541,36 @@ mod tests {
         assert!(timeline.samples.len() <= timeline.max_samples);
         assert_eq!(timeline.samples.first().unwrap().elapsed_ms, 0);
         assert_eq!(timeline.samples.last().unwrap().elapsed_ms, 24_000);
+    }
+
+    #[test]
+    fn timeline_graph_excludes_ssd_temperature_and_throughput() {
+        let mut samples = Vec::new();
+        for second in 0..3 {
+            samples.push(TimelineSample {
+                elapsed_ms: second * 1_000,
+                sensor: TimelineSensorSample {
+                    cpu_temp_c: Some(50.0 + second as f32),
+                    gpu_temp_c: Some(60.0 + second as f32),
+                    gpu_memory_temp_c: Some(70.0 + second as f32),
+                    drive_temp_c: Some(40.0 + second as f32),
+                    drive_util_percent: Some(20.0 + second as f32),
+                    ..TimelineSensorSample::default()
+                },
+                throughput: Some(timeline_throughput("Compute throughput", 10.0, "TFLOP/s")),
+                phase: "test".to_owned(),
+            });
+        }
+        let timeline = make_test_timeline(TimelineScope::MatrixStress, samples);
+        let state = TimelineState::new();
+        let labels = timeline_graph_series(&timeline, &state)
+            .into_iter()
+            .map(|series| series.label)
+            .collect::<Vec<_>>();
+
+        assert!(labels.contains(&"CPU temp".to_owned()));
+        assert!(labels.contains(&"SSD util".to_owned()));
+        assert!(!labels.contains(&"SSD temp".to_owned()));
+        assert!(!labels.contains(&"Throughput".to_owned()));
     }
 }

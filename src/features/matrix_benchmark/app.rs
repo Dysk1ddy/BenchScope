@@ -116,24 +116,48 @@ impl BenchScopeApp {
                 "exact"
             }
         ));
+        let _ = crashlog_write_operation(
+            "Matrix benchmark started",
+            &format!(
+                "Size: {size}x{size}\nAdapter: {}\nVendor: {:04X}\nDevice: {:04X}\nBackend: {:?}\nDeviceType: {:?}\nIntensity: {}\nValidateOutput: {}\nEstimateCpuTime: {}",
+                adapter.name,
+                adapter.vendor,
+                adapter.device,
+                adapter.backend,
+                adapter.device_type,
+                gpu_intensity,
+                validate,
+                estimate_cpu_time
+            ),
+        );
         let pytorch_python = self.pytorch_python.trim().to_owned();
-        thread::spawn(move || {
-            let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                run_single_cancelable(
-                    size,
-                    adapter,
-                    validate,
-                    estimate_cpu_time,
-                    gpu_intensity,
-                    pytorch_python,
-                    &worker_cancel,
-                    Some(tx.clone()),
-                )
-            }))
-            .map_err(|panic| format!("Benchmark panicked: {}", panic_message(&*panic)))
-            .and_then(|result| result.map_err(|err| format!("{err:#}")));
-            let _ = tx.send(WorkerEvent::SingleDone(result));
-        });
+        if let Err(err) = thread::Builder::new()
+            .name("benchscope-matrix-single".to_owned())
+            .spawn(move || {
+                let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                    run_single_cancelable(
+                        size,
+                        adapter,
+                        validate,
+                        estimate_cpu_time,
+                        gpu_intensity,
+                        pytorch_python,
+                        &worker_cancel,
+                        Some(tx.clone()),
+                    )
+                }))
+                .map_err(|panic| {
+                    format!("Benchmark panicked: {}. {}", panic_message(&*panic), crashlog_hint())
+                })
+                .and_then(|result| result.map_err(|err| format!("{err:#}")));
+                let _ = tx.send(WorkerEvent::SingleDone(result));
+            })
+        {
+            self.running = false;
+            self.cancel = None;
+            self.status = format!("Could not start benchmark worker: {err}");
+            self.log(self.status.clone());
+        }
     }
 
     fn start_repeat(&mut self) {
@@ -232,25 +256,54 @@ impl BenchScopeApp {
             gpu_intensity,
             stress_gpu_backend
         ));
+        let _ = crashlog_write_operation(
+            "Matrix stress started",
+            &format!(
+                "Mode: {mode}\nDuration: {}\nSize: {size}x{size}\nAdapter: {}\nVendor: {:04X}\nDevice: {:04X}\nBackend: {:?}\nDeviceType: {:?}\nIntensity: {}\nStressBackend: {}",
+                duration.run_label(),
+                adapter.name,
+                adapter.vendor,
+                adapter.device,
+                adapter.backend,
+                adapter.device_type,
+                gpu_intensity,
+                stress_gpu_backend
+            ),
+        );
         let pytorch_python = self.pytorch_python.trim().to_owned();
-        thread::spawn(move || {
-            let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                run_repeat(
-                    size,
-                    adapter,
-                    mode,
-                    gpu_intensity,
-                    stress_gpu_backend,
-                    pytorch_python,
-                    worker_cancel,
-                    tx.clone(),
-                    duration,
-                )
-            }))
-            .map_err(|panic| format!("Repeat test panicked: {}", panic_message(&*panic)))
-            .and_then(|result| result.map_err(|err| format!("{err:#}")));
-            let _ = tx.send(WorkerEvent::RepeatDone(result));
-        });
+        if let Err(err) = thread::Builder::new()
+            .name("benchscope-matrix-repeat".to_owned())
+            .spawn(move || {
+                let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                    run_repeat(
+                        size,
+                        adapter,
+                        mode,
+                        gpu_intensity,
+                        stress_gpu_backend,
+                        pytorch_python,
+                        worker_cancel,
+                        tx.clone(),
+                        duration,
+                    )
+                }))
+                .map_err(|panic| {
+                    format!(
+                        "Repeat test panicked: {}. {}",
+                        panic_message(&*panic),
+                        crashlog_hint()
+                    )
+                })
+                .and_then(|result| result.map_err(|err| format!("{err:#}")));
+                let _ = tx.send(WorkerEvent::RepeatDone(result));
+            })
+        {
+            self.running = false;
+            self.repeat_running = false;
+            self.cancel = None;
+            self.status = format!("Could not start stress worker: {err}");
+            self.log(self.status.clone());
+        }
     }
 
     fn vram_warning_for(
@@ -397,6 +450,9 @@ impl BenchScopeApp {
                                 None,
                                 err.clone(),
                             );
+                            if !err.to_ascii_lowercase().contains("canceled") {
+                                let _ = crashlog_write_error_report("Matrix benchmark error", &err);
+                            }
                             if err.to_ascii_lowercase().contains("canceled") {
                                 self.progress = 0.0;
                                 self.eta_text = "ETA: canceled".to_owned();
@@ -472,6 +528,9 @@ impl BenchScopeApp {
                         Err(err) => {
                             let _ = self.finish_and_log_temperature_run();
                             self.finish_timeline_run(TimelineScope::MatrixStress, None, err.clone());
+                            if !err.to_ascii_lowercase().contains("canceled") {
+                                let _ = crashlog_write_error_report("Matrix stress error", &err);
+                            }
                             self.status = err.clone();
                             self.log(err);
                         }

@@ -116,7 +116,13 @@ impl BenchScopeApp {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let available_height = ui.available_height();
             let (results_height, log_height) =
-                panel_content_log_heights(available_height, 0.22, 190.0);
+                resizable_panel_content_log_heights(
+                    ui,
+                    "ram_tester_log",
+                    available_height,
+                    0.22,
+                    190.0,
+                );
 
             ui.heading("RAM Results");
             ui.add_space(6.0);
@@ -172,7 +178,13 @@ impl BenchScopeApp {
                 },
             );
 
-            ui.separator();
+            ui_log_resize_handle(
+                ui,
+                "ram_tester_log",
+                available_height,
+                log_height,
+                190.0,
+            );
             ui.heading("Log");
             egui::ScrollArea::vertical()
                 .stick_to_bottom(true)
