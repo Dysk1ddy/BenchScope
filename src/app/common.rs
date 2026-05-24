@@ -141,6 +141,7 @@ impl BenchScopeApp {
             gpu_memory,
         } = data;
         let (tx, rx) = mpsc::channel();
+        let history = HistoryState::new();
         let selected_adapter = adapters
             .iter()
             .position(|adapter| adapter.device_type != wgpu::DeviceType::Cpu)
@@ -198,6 +199,7 @@ impl BenchScopeApp {
             ram,
             battery,
             network,
+            history,
             sensors,
             temperature_run: None,
             sensor_window_minimized: false,
@@ -227,6 +229,7 @@ impl BenchScopeApp {
                 }
             }
         }
+        app.capture_app_environment_history();
         app
     }
 
@@ -346,7 +349,7 @@ fn sensor_rows_for_view<'a>(
     view: AppView,
     snapshot: &'a SensorSnapshot,
 ) -> Option<Vec<(&'static str, Option<&'a SensorReading>)>> {
-    if view == AppView::MainMenu {
+    if matches!(view, AppView::MainMenu | AppView::HistoryReports) {
         return None;
     }
 

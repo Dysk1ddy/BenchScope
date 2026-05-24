@@ -2398,7 +2398,11 @@ mod tests {
         );
         assert_eq!(
             main_menu_views_for_category(MenuCategory::Drivers),
-            vec![AppView::NetworkDiagnostic, AppView::DeviceInfo]
+            vec![
+                AppView::NetworkDiagnostic,
+                AppView::DeviceInfo,
+                AppView::HistoryReports,
+            ]
         );
         assert_eq!(
             main_menu_views_for_category(MenuCategory::Io),
@@ -2407,11 +2411,16 @@ mod tests {
                 AppView::StorageHealth,
                 AppView::NetworkDiagnostic,
                 AppView::DeviceInfo,
+                AppView::HistoryReports,
             ]
         );
         assert_eq!(
             main_menu_views_for_category(MenuCategory::Misc),
-            vec![AppView::BatteryHealthDiagnostic, AppView::DeviceInfo]
+            vec![
+                AppView::BatteryHealthDiagnostic,
+                AppView::DeviceInfo,
+                AppView::HistoryReports,
+            ]
         );
     }
 }

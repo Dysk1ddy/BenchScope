@@ -11,5 +11,6 @@ enum AppView {
     BatteryHealthDiagnostic,
     NetworkDiagnostic,
     DeviceInfo,
+    HistoryReports,
 }
 

@@ -256,7 +256,7 @@ fn main_menu_category_items() -> [MainMenuCategoryItem; 7] {
     })
 }
 
-fn main_menu_tool_items() -> [MainMenuItem; 10] {
+fn main_menu_tool_items() -> [MainMenuItem; 11] {
     [
         MainMenuItem {
             title: "Matrix CPU/GPU Benchmark",
@@ -336,6 +336,13 @@ fn main_menu_tool_items() -> [MainMenuItem; 10] {
                 MenuCategory::Io,
                 MenuCategory::Misc,
             ],
+        },
+        MainMenuItem {
+            title: "History & Reports",
+            description: "Compare saved runs, pin baselines, and export support bundles.",
+            view: AppView::HistoryReports,
+            accent: egui::Color32::from_rgb(238, 188, 87),
+            categories: &[MenuCategory::Drivers, MenuCategory::Io, MenuCategory::Misc],
         },
     ]
 }

@@ -80,6 +80,7 @@ struct BenchScopeApp {
     network: NetworkDiagnosticState,
     ai_training: AiTrainingBenchmarkState,
     gpu_memory: GpuMemoryBenchmarkState,
+    history: HistoryState,
     sensors: SensorManager,
     temperature_run: Option<TemperatureRunTracker>,
     sensor_window_minimized: bool,
@@ -90,3 +91,4 @@ include!("view.rs");
 include!("common.rs");
 include!("window.rs");
 include!("runtime.rs");
+include!("history_reports.rs");

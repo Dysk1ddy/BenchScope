@@ -3,8 +3,19 @@ impl BenchScopeApp {
         let ctx = ui.ctx().clone();
         self.handle_global_shortcuts(&ctx);
         self.sync_sensor_state();
+        let matrix_result_count_before = self.results.len();
+        let ram_result_count_before = self.ram.results.len();
+        let ai_training_result_count_before = self.ai_training.results.len();
         let drive_was_running = self.drive.running;
         let drive_result_count_before = self.drive.results.len();
+        let storage_health_was_running = self.storage_health.running;
+        let storage_health_snapshot_before = self.storage_health.snapshot.is_some();
+        let storage_health_scan_before = self.storage_health.scan_result.is_some();
+        let storage_health_benchmark_count_before = self.storage_health.benchmark_results.len();
+        let battery_was_scanning = self.battery.scanning;
+        let network_was_active =
+            self.network.running || self.network.monitoring || self.network.adapter_refresh_running;
+        let device_info_was_running = self.device_info.running;
         let gpu_memory_was_running = self.gpu_memory.running;
         let gpu_memory_result_count_before = self.gpu_memory.results.len();
         self.poll_worker_events();
@@ -42,6 +53,20 @@ impl BenchScopeApp {
                 }
             }
         }
+        self.capture_history_after_poll(
+            matrix_result_count_before,
+            drive_result_count_before,
+            gpu_memory_result_count_before,
+            ram_result_count_before,
+            ai_training_result_count_before,
+            storage_health_was_running,
+            storage_health_snapshot_before,
+            storage_health_scan_before,
+            storage_health_benchmark_count_before,
+            battery_was_scanning,
+            network_was_active,
+            device_info_was_running,
+        );
         self.sync_sensor_state();
         if self.running
             || self.gpu_memory.running
@@ -68,6 +93,7 @@ impl BenchScopeApp {
             AppView::BatteryHealthDiagnostic => self.ui_battery_health_diagnostic(ui),
             AppView::NetworkDiagnostic => self.ui_network_diagnostic(ui),
             AppView::DeviceInfo => self.ui_device_info(ui),
+            AppView::HistoryReports => self.ui_history_reports(ui),
             AppView::AiTrainingBenchmark => self.ui_ai_training_benchmark(ui),
             AppView::GpuMemoryBenchmark => self.ui_gpu_memory_benchmark(ui),
             AppView::MatrixStressTest => self.ui_matrix_stress_test(ui),
