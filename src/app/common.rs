@@ -142,6 +142,7 @@ impl BenchScopeApp {
         } = data;
         let (tx, rx) = mpsc::channel();
         let history = HistoryState::new();
+        let timeline = TimelineState::new();
         let selected_adapter = adapters
             .iter()
             .position(|adapter| adapter.device_type != wgpu::DeviceType::Cpu)
@@ -200,6 +201,7 @@ impl BenchScopeApp {
             battery,
             network,
             history,
+            timeline,
             sensors,
             temperature_run: None,
             sensor_window_minimized: false,

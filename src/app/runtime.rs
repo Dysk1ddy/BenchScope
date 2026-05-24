@@ -16,6 +16,7 @@ impl BenchScopeApp {
         let network_was_active =
             self.network.running || self.network.monitoring || self.network.adapter_refresh_running;
         let device_info_was_running = self.device_info.running;
+        let ai_training_was_running = self.ai_training.running;
         let gpu_memory_was_running = self.gpu_memory.running;
         let gpu_memory_result_count_before = self.gpu_memory.results.len();
         self.poll_worker_events();
@@ -29,6 +30,7 @@ impl BenchScopeApp {
         self.ai_training.poll_worker_events();
         self.sync_pytorch_cuda_from_ai_training();
         self.observe_temperature_run();
+        self.observe_timeline_run(false);
         if drive_was_running && !self.drive.running {
             if let Some(report) = self.finish_and_log_temperature_run() {
                 for result in self
@@ -40,6 +42,18 @@ impl BenchScopeApp {
                     result.ssd_temperature = report.drive;
                 }
             }
+            let final_throughput = self
+                .drive
+                .results
+                .iter()
+                .skip(drive_result_count_before)
+                .last()
+                .and_then(drive_result_timeline_throughput);
+            self.finish_timeline_run(
+                TimelineScope::DriveBenchmark,
+                final_throughput,
+                self.drive.status.clone(),
+            );
         }
         if gpu_memory_was_running && !self.gpu_memory.running {
             if let Some(report) = self.finish_and_log_temperature_run() {
@@ -52,6 +66,32 @@ impl BenchScopeApp {
                     result.gpu_temperature = report.gpu;
                 }
             }
+            let final_throughput = self
+                .gpu_memory
+                .results
+                .iter()
+                .skip(gpu_memory_result_count_before)
+                .last()
+                .map(gpu_memory_result_timeline_throughput);
+            self.finish_timeline_run(
+                TimelineScope::GpuMemory,
+                final_throughput,
+                self.gpu_memory.status.clone(),
+            );
+        }
+        if ai_training_was_running && !self.ai_training.running {
+            let final_throughput = self
+                .ai_training
+                .results
+                .iter()
+                .skip(ai_training_result_count_before)
+                .last()
+                .and_then(ai_training_result_timeline_throughput);
+            self.finish_timeline_run(
+                TimelineScope::AiTraining,
+                final_throughput,
+                self.ai_training.status.clone(),
+            );
         }
         self.capture_history_after_poll(
             matrix_result_count_before,

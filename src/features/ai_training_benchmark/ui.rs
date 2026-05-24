@@ -254,7 +254,17 @@ impl BenchScopeApp {
                 ui.add_enabled_ui(can_run, |ui| {
                     if ui_start_action_button(ui, "Run training benchmark").clicked() {
                         if let Some(adapter) = self.adapters.get(self.selected_adapter).cloned() {
+                            let was_running = self.ai_training.running;
                             self.ai_training.start(adapter, self.gpu_intensity);
+                            if !was_running && self.ai_training.running {
+                                self.start_timeline(
+                                    TimelineScope::AiTraining,
+                                    format!(
+                                        "AI training {} {}",
+                                        self.ai_training.backend, self.ai_training.workload
+                                    ),
+                                );
+                            }
                         }
                     }
                 });
@@ -264,8 +274,15 @@ impl BenchScopeApp {
                 ui.add_enabled_ui(can_sweep, |ui| {
                     if ui_start_action_button(ui, "Run precision sweep").clicked() {
                         if let Some(adapter) = self.adapters.get(self.selected_adapter).cloned() {
+                            let was_running = self.ai_training.running;
                             self.ai_training
                                 .start_precision_sweep(adapter, self.gpu_intensity);
+                            if !was_running && self.ai_training.running {
+                                self.start_timeline(
+                                    TimelineScope::AiTraining,
+                                    format!("AI precision sweep {}", self.ai_training.workload),
+                                );
+                            }
                         }
                     }
                 });
@@ -279,8 +296,15 @@ impl BenchScopeApp {
                 ui.add_enabled_ui(can_smoke, |ui| {
                     if ui_start_action_button(ui, "Run smoke test").clicked() {
                         if let Some(adapter) = self.adapters.get(self.selected_adapter).cloned() {
+                            let was_running = self.ai_training.running;
                             self.ai_training
                                 .start_smoke_test(adapter, self.gpu_intensity);
+                            if !was_running && self.ai_training.running {
+                                self.start_timeline(
+                                    TimelineScope::AiTraining,
+                                    format!("AI smoke test {}", self.ai_training.workload),
+                                );
+                            }
                         }
                     }
                 });
@@ -328,6 +352,8 @@ impl BenchScopeApp {
                             ui.heading("Results");
                             ui.add_space(6.0);
                             ui_ai_training_results_table(ui, &self.ai_training.results);
+                            ui.separator();
+                            self.ui_timeline_panel(ui, TimelineScope::AiTraining);
                         });
                 },
             );

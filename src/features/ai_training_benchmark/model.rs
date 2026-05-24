@@ -429,6 +429,9 @@ struct AiTrainingBenchmarkState {
     progress: f32,
     phase: String,
     eta_text: String,
+    timeline_elapsed_s: f64,
+    timeline_completed_steps: usize,
+    timeline_total_steps: usize,
     rx: Receiver<AiTrainingWorkerEvent>,
     tx: Sender<AiTrainingWorkerEvent>,
     cancel: Option<Arc<AtomicBool>>,
@@ -462,6 +465,9 @@ impl AiTrainingBenchmarkState {
             progress: 0.0,
             phase: "Not running".to_owned(),
             eta_text: String::new(),
+            timeline_elapsed_s: 0.0,
+            timeline_completed_steps: 0,
+            timeline_total_steps: 0,
             rx,
             tx,
             cancel: None,
@@ -644,6 +650,9 @@ impl AiTrainingBenchmarkState {
         self.progress = 0.0;
         self.phase = "Starting AI training benchmark".to_owned();
         self.eta_text = "ETA: estimating".to_owned();
+        self.timeline_elapsed_s = 0.0;
+        self.timeline_completed_steps = 0;
+        self.timeline_total_steps = config.measured_steps;
         self.status = "Running AI training benchmark...".to_owned();
         let target_label = if config.backend == AiTrainingBackend::PyTorchCuda {
             format!("CUDA device {}", config.pytorch_cuda_device)
@@ -725,6 +734,9 @@ impl AiTrainingBenchmarkState {
         self.progress = 0.0;
         self.phase = "Starting AI training smoke test".to_owned();
         self.eta_text = "ETA: estimating".to_owned();
+        self.timeline_elapsed_s = 0.0;
+        self.timeline_completed_steps = 0;
+        self.timeline_total_steps = config.measured_steps;
         self.status = "Running AI training smoke test...".to_owned();
         let target_label = if config.backend == AiTrainingBackend::PyTorchCuda {
             format!("CUDA device {}", config.pytorch_cuda_device)
@@ -874,6 +886,9 @@ impl AiTrainingBenchmarkState {
         self.progress = 0.0;
         self.phase = "Starting precision sweep".to_owned();
         self.eta_text = "ETA: estimating".to_owned();
+        self.timeline_elapsed_s = 0.0;
+        self.timeline_completed_steps = 0;
+        self.timeline_total_steps = base_config.measured_steps * 3;
         self.status = "Running PyTorch CUDA precision sweep...".to_owned();
         self.log(format!(
             "Starting PyTorch CUDA precision sweep for {} on CUDA device {}",
@@ -913,6 +928,9 @@ impl AiTrainingBenchmarkState {
                     self.progress = progress.progress;
                     self.phase = progress.phase.clone();
                     self.eta_text = format_eta(progress.eta_s);
+                    self.timeline_elapsed_s = progress.elapsed_s;
+                    self.timeline_completed_steps = progress.completed_steps;
+                    self.timeline_total_steps = progress.total_steps;
                     self.status = format!(
                         "{} - step {}/{} elapsed {}",
                         progress.phase,

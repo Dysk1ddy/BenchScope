@@ -160,6 +160,10 @@ impl BenchScopeApp {
                         self.drive.start();
                         if !was_running && self.drive.running {
                             self.begin_temperature_run(TemperatureScope::Drive);
+                            self.start_timeline(
+                                TimelineScope::DriveBenchmark,
+                                format!("Drive benchmark {}", self.drive.selected_drive_label()),
+                            );
                         }
                     }
                 });
@@ -230,6 +234,8 @@ impl BenchScopeApp {
                                         ui.end_row();
                                     }
                                 });
+                            ui.separator();
+                            self.ui_timeline_panel(ui, TimelineScope::DriveBenchmark);
                         });
                 },
             );

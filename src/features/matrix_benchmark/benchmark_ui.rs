@@ -310,6 +310,8 @@ impl BenchScopeApp {
                                         ui.end_row();
                                     }
                                 });
+                            ui.separator();
+                            self.ui_timeline_panel(ui, TimelineScope::MatrixBenchmark);
                         });
                 },
             );

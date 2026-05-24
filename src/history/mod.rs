@@ -342,7 +342,7 @@ struct HistoryCategory {
     label: &'static str,
 }
 
-fn history_categories() -> [HistoryCategory; 12] {
+fn history_categories() -> [HistoryCategory; 13] {
     [
         HistoryCategory {
             id: "all",
@@ -391,6 +391,10 @@ fn history_categories() -> [HistoryCategory; 12] {
         HistoryCategory {
             id: "sensor_snapshot",
             label: "Sensors",
+        },
+        HistoryCategory {
+            id: "thermal_timeline",
+            label: "Thermal timeline",
         },
     ]
 }
@@ -1234,6 +1238,75 @@ fn history_event_from_sensor_snapshot(snapshot: &SensorSnapshot) -> HistoryEvent
     }
     if let Some(elevated) = snapshot.helper_elevated {
         event.details.push(history_pair("Sensor helper elevated", elevated.to_string()));
+    }
+    event
+}
+
+fn history_event_from_timeline_summary(summary: &TimelineSummary) -> HistoryEvent {
+    let mut event = history_base_event(
+        "thermal_timeline",
+        format!("{} thermal timeline", summary.scope.label()),
+        format!("scope={} title={}", summary.scope.label(), summary.title),
+    );
+    event.summary = format!(
+        "{} samples, confidence {}, {}",
+        summary.sample_count,
+        summary.confidence,
+        summary
+            .throughput_drop_percent
+            .map(|drop| format!("{drop:.1}% throughput drop"))
+            .unwrap_or_else(|| "no throughput drop estimate".to_owned())
+    );
+    event.metrics.push(history_metric(
+        "Samples",
+        summary.sample_count as f64,
+        summary.sample_count.to_string(),
+        "count",
+        HISTORY_BETTER_NEUTRAL,
+    ));
+    if let Some(drop) = summary.throughput_drop_percent {
+        event.metrics.push(history_metric(
+            "Throughput drop",
+            drop,
+            format!("{drop:.1}%"),
+            "%",
+            HISTORY_BETTER_LOWER,
+        ));
+    }
+    for (name, value) in [
+        ("Peak CPU temp", summary.peak_cpu_temp_c),
+        ("Peak GPU temp", summary.peak_gpu_temp_c),
+        ("Peak VRAM temp", summary.peak_gpu_memory_temp_c),
+        ("Peak SSD temp", summary.peak_drive_temp_c),
+        ("Peak RAM temp", summary.peak_memory_temp_c),
+    ] {
+        if let Some(value) = value {
+            event.metrics.push(history_metric(
+                name,
+                f64::from(value),
+                format_temperature_value(Some(value)),
+                "C",
+                HISTORY_BETTER_LOWER,
+            ));
+        }
+    }
+    event.details.push(history_pair("Run ID", &summary.run_id));
+    event.details.push(history_pair("Scope", summary.scope.label()));
+    event.details.push(history_pair(
+        "Duration",
+        format_elapsed(summary.duration_ms as f64 / 1000.0),
+    ));
+    event.details.push(history_pair("Confidence", &summary.confidence));
+    if let Some(throughput) = &summary.final_throughput {
+        event.details.push(history_pair(
+            "Final throughput",
+            format!("{:.2} {}", throughput.value, throughput.unit),
+        ));
+    }
+    for finding in &summary.findings {
+        event
+            .warnings
+            .push(format!("{}: {}", finding.severity, finding.message));
     }
     event
 }

@@ -40,6 +40,7 @@ include!("features/network_diagnostic/mod.rs");
 include!("features/device_info/mod.rs");
 include!("sensors/mod.rs");
 include!("ui/mod.rs");
+include!("timeline/mod.rs");
 include!("history/mod.rs");
 include!("app/mod.rs");
 include!("cli.rs");

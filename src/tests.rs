@@ -2423,4 +2423,93 @@ mod tests {
             ]
         );
     }
+
+    fn make_test_timeline(scope: TimelineScope, samples: Vec<TimelineSample>) -> RunTimeline {
+        RunTimeline {
+            run_id: "test-timeline".to_owned(),
+            title: "Test timeline".to_owned(),
+            scope,
+            started_at: SystemTime::UNIX_EPOCH,
+            started_instant: Instant::now(),
+            last_sample_at: None,
+            samples,
+            max_samples: TIMELINE_MAX_SAMPLES,
+        }
+    }
+
+    fn timeline_test_sample(second: u64, gpu_temp_c: f32, throughput: f64) -> TimelineSample {
+        TimelineSample {
+            elapsed_ms: second * 1_000,
+            sensor: TimelineSensorSample {
+                gpu_temp_c: Some(gpu_temp_c),
+                gpu_util_percent: Some(98.0),
+                gpu_clock_mhz: Some(2_100.0),
+                ..TimelineSensorSample::default()
+            },
+            throughput: Some(timeline_throughput(
+                "Compute throughput",
+                throughput,
+                "TFLOP/s",
+            )),
+            phase: format!("sample {second}"),
+        }
+    }
+
+    #[test]
+    fn timeline_analysis_detects_heat_correlated_drop() {
+        let samples = (0..12)
+            .map(|index| {
+                let temp = 58.0 + index as f32 * 2.0;
+                let throughput = if index < 5 { 10.0 } else { 6.8 };
+                timeline_test_sample(index, temp, throughput)
+            })
+            .collect();
+        let timeline = make_test_timeline(TimelineScope::MatrixStress, samples);
+
+        let summary = analyze_timeline(&timeline);
+
+        assert!(summary.throughput_drop_percent.unwrap_or_default() >= 30.0);
+        assert_eq!(summary.confidence, "High");
+        assert!(summary.findings.iter().any(|finding| {
+            finding.message.contains("Throughput dropped")
+                || finding.message.contains("Temperature rose")
+        }));
+    }
+
+    #[test]
+    fn timeline_analysis_marks_performance_drop_low_without_heat() {
+        let samples = (0..12)
+            .map(|index| {
+                let throughput = if index < 5 { 10.0 } else { 8.5 };
+                timeline_test_sample(index, 58.0, throughput)
+            })
+            .collect();
+        let timeline = make_test_timeline(TimelineScope::MatrixStress, samples);
+
+        let summary = analyze_timeline(&timeline);
+
+        assert!(summary.throughput_drop_percent.unwrap_or_default() >= 10.0);
+        assert_eq!(summary.confidence, "Low");
+        assert!(!summary
+            .findings
+            .iter()
+            .any(|finding| finding.message.contains("Temperature rose")));
+    }
+
+    #[test]
+    fn timeline_downsampling_respects_sample_limit() {
+        let mut timeline = make_test_timeline(
+            TimelineScope::MatrixStress,
+            (0..25)
+                .map(|index| timeline_test_sample(index, 60.0 + index as f32, 10.0))
+                .collect(),
+        );
+        timeline.max_samples = 12;
+
+        downsample_timeline_samples(&mut timeline);
+
+        assert!(timeline.samples.len() <= timeline.max_samples);
+        assert_eq!(timeline.samples.first().unwrap().elapsed_ms, 0);
+        assert_eq!(timeline.samples.last().unwrap().elapsed_ms, 24_000);
+    }
 }

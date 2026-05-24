@@ -197,6 +197,9 @@ struct GpuMemoryBenchmarkState {
     current_progress: f32,
     suite_progress: f32,
     eta_text: String,
+    timeline_current_test: String,
+    timeline_elapsed_s: f64,
+    timeline_bytes_processed: u64,
     rx: Receiver<GpuMemoryWorkerEvent>,
     tx: Sender<GpuMemoryWorkerEvent>,
     cancel: Option<Arc<AtomicBool>>,
@@ -220,6 +223,9 @@ impl GpuMemoryBenchmarkState {
             current_progress: 0.0,
             suite_progress: 0.0,
             eta_text: String::new(),
+            timeline_current_test: String::new(),
+            timeline_elapsed_s: 0.0,
+            timeline_bytes_processed: 0,
             rx,
             tx,
             cancel: None,
@@ -284,6 +290,9 @@ impl GpuMemoryBenchmarkState {
         self.current_progress = 0.0;
         self.suite_progress = 0.0;
         self.eta_text = "ETA: estimating".to_owned();
+        self.timeline_current_test.clear();
+        self.timeline_elapsed_s = 0.0;
+        self.timeline_bytes_processed = 0;
         self.status = "Running GPU memory benchmark...".to_owned();
         self.log(format!(
             "Starting GPU memory benchmark on {} with requested buffer {}, {} iteration(s)",
@@ -317,6 +326,9 @@ impl GpuMemoryBenchmarkState {
                     self.current_progress = progress.current_progress;
                     self.suite_progress = progress.suite_progress;
                     self.eta_text = format_eta(progress.eta_s);
+                    self.timeline_current_test = progress.current_test.clone();
+                    self.timeline_elapsed_s = progress.elapsed_s;
+                    self.timeline_bytes_processed = progress.bytes_processed;
                     self.status = format!(
                         "{} - {}, elapsed {}",
                         progress.current_test,

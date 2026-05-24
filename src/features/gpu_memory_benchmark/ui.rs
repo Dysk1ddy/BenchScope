@@ -20,6 +20,10 @@ impl BenchScopeApp {
         self.gpu_memory.start(adapter);
         if !was_running && self.gpu_memory.running {
             self.begin_temperature_run(TemperatureScope::Matrix);
+            self.start_timeline(
+                TimelineScope::GpuMemory,
+                format!("GPU memory benchmark {}", self.gpu_memory.status),
+            );
         }
     }
 
@@ -285,6 +289,8 @@ impl BenchScopeApp {
                                         ui.end_row();
                                     }
                                 });
+                            ui.separator();
+                            self.ui_timeline_panel(ui, TimelineScope::GpuMemory);
                         });
                 },
             );
