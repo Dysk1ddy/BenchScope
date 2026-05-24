@@ -767,7 +767,12 @@ fn collect_sensor_snapshot(drive_letter: Option<char>) -> SensorSnapshot {
         let gpu_memory = scope.spawn(query_gpu_memory_sensor);
         let drive = scope.spawn(|| {
             let mut drive = query_drive_temperature(drive_letter);
-            drive.utilization_percent = query_drive_utilization(drive_letter);
+            attach_utilization(
+                &mut drive,
+                query_drive_utilization(drive_letter),
+                "Windows disk counter",
+                "SSD temperature unavailable; utilization is live",
+            );
             drive
         });
         let memory = scope.spawn(query_memory_sensor);

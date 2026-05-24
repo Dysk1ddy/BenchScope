@@ -1,5 +1,6 @@
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
+    [switch]$InstallRust,
     [switch]$InstallCore,
     [switch]$InstallHelperTools,
     [switch]$InstallDriverTools,
@@ -48,6 +49,34 @@ function Test-CommandPresent {
     return $null -ne (Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
+function Get-UserCargoBinPath {
+    if (-not $env:USERPROFILE) {
+        return ""
+    }
+
+    return Join-Path $env:USERPROFILE ".cargo\bin"
+}
+
+function Add-UserCargoBinToPath {
+    $cargoBin = Get-UserCargoBinPath
+    if (-not $cargoBin -or -not (Test-Path -LiteralPath $cargoBin)) {
+        return
+    }
+
+    $pathEntries = @($env:PATH -split ";" | Where-Object { $_ })
+    $alreadyPresent = $false
+    foreach ($entry in $pathEntries) {
+        if ($entry.Equals($cargoBin, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $alreadyPresent = $true
+            break
+        }
+    }
+
+    if (-not $alreadyPresent) {
+        $env:PATH = "$cargoBin;$env:PATH"
+    }
+}
+
 function Get-CommandText {
     param([Parameter(Mandatory = $true)][string]$Name)
 
@@ -56,7 +85,80 @@ function Get-CommandText {
         return $command.Source
     }
 
+    if ($Name -in @("cargo", "cargo.exe", "rustc", "rustc.exe", "rustup", "rustup.exe")) {
+        $cargoBin = Get-UserCargoBinPath
+        if ($cargoBin) {
+            $fileName = $Name
+            if (-not $fileName.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)) {
+                $fileName = "$fileName.exe"
+            }
+
+            $candidate = Join-Path $cargoBin $fileName
+            if (Test-Path -LiteralPath $candidate) {
+                return $candidate
+            }
+        }
+    }
+
     return ""
+}
+
+function Get-ToolVersion {
+    param([Parameter(Mandatory = $true)][string]$CommandPath)
+
+    $output = @(& $CommandPath --version 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        return [pscustomobject]@{
+            Success = $false
+            Text = (($output | Out-String).Trim())
+        }
+    }
+
+    return [pscustomobject]@{
+        Success = $true
+        Text = (($output | Out-String).Trim())
+    }
+}
+
+function Get-RustToolchainState {
+    Add-UserCargoBinToPath
+
+    $cargo = Get-CommandText "cargo.exe"
+    $rustc = Get-CommandText "rustc.exe"
+    if (-not $cargo -or -not $rustc) {
+        return [pscustomobject]@{
+            Found = $false
+            Cargo = $cargo
+            Rustc = $rustc
+            Detail = "cargo.exe or rustc.exe was not found."
+        }
+    }
+
+    $cargoVersion = Get-ToolVersion -CommandPath $cargo
+    $rustcVersion = Get-ToolVersion -CommandPath $rustc
+    if ($cargoVersion.Success -and $rustcVersion.Success) {
+        return [pscustomobject]@{
+            Found = $true
+            Cargo = $cargo
+            Rustc = $rustc
+            Detail = "$($cargoVersion.Text); $($rustcVersion.Text)"
+        }
+    }
+
+    $detail = "cargo.exe or rustc.exe was found, but the version check failed."
+    if ($cargoVersion.Text) {
+        $detail = "$detail cargo: $($cargoVersion.Text)"
+    }
+    if ($rustcVersion.Text) {
+        $detail = "$detail rustc: $($rustcVersion.Text)"
+    }
+
+    return [pscustomobject]@{
+        Found = $false
+        Cargo = $cargo
+        Rustc = $rustc
+        Detail = $detail
+    }
 }
 
 function Get-VsInstallations {
@@ -246,6 +348,45 @@ function Invoke-WingetInstall {
     }
 }
 
+function Invoke-RustupDefaultStable {
+    $rustup = Get-CommandText "rustup.exe"
+    if (-not $rustup) {
+        return
+    }
+
+    if ($PSCmdlet.ShouldProcess("stable Rust toolchain", "rustup default")) {
+        & $rustup default stable
+        if ($LASTEXITCODE -ne 0) {
+            throw "rustup default stable failed with exit code $LASTEXITCODE."
+        }
+    }
+}
+
+function Install-RustToolchainIfMissing {
+    $rust = Get-RustToolchainState
+    if ($rust.Found) {
+        Write-Host "Rust toolchain already present. $($rust.Detail)"
+        return
+    }
+
+    $rustup = Get-CommandText "rustup.exe"
+    if (-not $rustup) {
+        Write-Host "Rust toolchain not found. Installing Rustup through winget..."
+        Invoke-WingetInstall -PackageId "Rustlang.Rustup" -Silent
+        Add-UserCargoBinToPath
+    } else {
+        Write-Host "Rustup found, but no usable Rust toolchain is active. Installing the stable toolchain..."
+    }
+
+    Invoke-RustupDefaultStable
+
+    $rust = Get-RustToolchainState
+    if (-not $rust.Found -and -not $WhatIfPreference) {
+        $cargoBin = Get-UserCargoBinPath
+        throw "Rust installation completed, but cargo.exe and rustc.exe were still not available. Open a new terminal or add $cargoBin to PATH, then rerun."
+    }
+}
+
 function Convert-Cell {
     param([AllowNull()][object]$Value)
     if ($null -eq $Value) {
@@ -279,8 +420,11 @@ function Convert-ChecksToMarkdown {
     return ($lines -join [Environment]::NewLine)
 }
 
+if ($InstallRust -or $InstallCore) {
+    Install-RustToolchainIfMissing
+}
+
 if ($InstallCore) {
-    Invoke-WingetInstall -PackageId "Rustlang.Rustup" -Silent
     Invoke-WingetInstall -PackageId "Microsoft.VisualStudio.2022.BuildTools" -Override "--passive --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --includeRecommended"
     Invoke-WingetInstall -PackageId "Microsoft.WindowsSDK.10.0.26100"
 }
@@ -295,14 +439,11 @@ if ($InstallDriverTools) {
     Invoke-WingetInstall -PackageId "Microsoft.WindowsWDK.10.0.26100"
 }
 
-$cargo = Get-CommandText "cargo.exe"
-$rustc = Get-CommandText "rustc.exe"
-if ($cargo -and $rustc) {
-    $cargoVersion = (& $cargo --version 2>$null | Out-String).Trim()
-    $rustcVersion = (& $rustc --version 2>$null | Out-String).Trim()
-    Add-Check -Status Pass -Name "Rust toolchain" -Detail "$cargoVersion; $rustcVersion"
+$rust = Get-RustToolchainState
+if ($rust.Found) {
+    Add-Check -Status Pass -Name "Rust toolchain" -Detail $rust.Detail
 } else {
-    Add-Check -Status Fail -Name "Rust toolchain" -Detail "cargo.exe or rustc.exe was not found." -Links @("https://www.rust-lang.org/tools/install")
+    Add-Check -Status Fail -Name "Rust toolchain" -Detail $rust.Detail -Links @("https://www.rust-lang.org/tools/install")
 }
 
 $cl = Find-MsvcToolPath -FileName "cl.exe"

@@ -105,6 +105,8 @@ impl BenchScopeApp {
                 });
         });
 
+        self.ui_sensor_window(&ctx);
+
         if self.battery_back_confirm {
             egui::Window::new("Return to main menu?")
                 .collapsible(false)

@@ -4,7 +4,26 @@ cd /d "%REPO_ROOT%"
 for %%I in ("%REPO_ROOT%\..\.cargo-target\BenchScope") do set "TARGET_ROOT=%%~fI"
 set "BENCHSCOPE_EXE=%TARGET_ROOT%\release\BenchScope.exe"
 set "CARGO=%USERPROFILE%\.cargo\bin\cargo.exe"
-if not exist "%CARGO%" set "CARGO=cargo"
+if exist "%CARGO%" goto Build
+where cargo.exe >nul 2>nul
+if not errorlevel 1 (
+    set "CARGO=cargo.exe"
+    goto Build
+)
+echo Rust/Cargo was not found. Installing Rust toolchain...
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%REPO_ROOT%\scripts\Bootstrap-Developer.ps1" -InstallRust
+if errorlevel 1 exit /b %errorlevel%
+set "CARGO=%USERPROFILE%\.cargo\bin\cargo.exe"
+if exist "%CARGO%" goto Build
+where cargo.exe >nul 2>nul
+if not errorlevel 1 (
+    set "CARGO=cargo.exe"
+    goto Build
+)
+echo cargo.exe is still unavailable after the Rust install. Open a new terminal and rerun this launcher.
+exit /b 1
+
+:Build
 "%CARGO%" build --release
 if errorlevel 1 (
     if exist "%BENCHSCOPE_EXE%" (

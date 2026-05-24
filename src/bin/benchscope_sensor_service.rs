@@ -233,7 +233,7 @@ impl BridgeReading {
         };
         reading.upsert_metric(BridgeMetric::new(
             BridgeMetricKind::Utilization,
-            "Memory",
+            BridgeMetricKind::Utilization.default_label(),
             reading.utilization_percent,
         ));
         reading

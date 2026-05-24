@@ -398,6 +398,8 @@ impl BenchScopeApp {
                 });
         });
 
+        self.ui_sensor_window(&ctx);
+
         if self.network_back_confirm {
             egui::Window::new("Return to main menu?")
                 .collapsible(false)

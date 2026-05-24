@@ -1578,6 +1578,52 @@ mod tests {
     }
 
     #[test]
+    fn sensor_service_snapshot_parser_reads_ram_utilization() {
+        let line = r#"{"timestampUtc":"unix-ms:1770000000000","isElevated":true,"source":"BenchScopeSensorService","memory":{"label":"System RAM","temperatureC":null,"utilizationPercent":47.2,"provider":"Windows memory status","status":"ok","metrics":[{"kind":"utilization","label":"Utilization","value":47.2,"min":null,"max":null}]}}"#;
+
+        let snapshot = parse_helper_snapshot(line).unwrap();
+        let memory = snapshot.memory.unwrap();
+        let utilization = memory
+            .metrics
+            .iter()
+            .find(|metric| metric.kind == SensorMetricKind::Utilization)
+            .unwrap();
+
+        assert_eq!(memory.label, "System RAM");
+        assert_eq!(memory.utilization_percent, Some(47.2));
+        assert!(memory.has_utilization());
+        assert_eq!(format_sensor_metric_value(utilization.kind, utilization.value), "47%");
+    }
+
+    #[test]
+    fn sensor_rows_for_feature_views_include_all_devices() {
+        let snapshot = SensorSnapshot::default();
+        let expected = vec!["CPU", "GPU", "VRAM", "SSD", "RAM"];
+
+        for view in [
+            AppView::MatrixBenchmark,
+            AppView::MatrixStressTest,
+            AppView::GpuMemoryBenchmark,
+            AppView::AiTrainingBenchmark,
+            AppView::DriveBenchmark,
+            AppView::StorageHealth,
+            AppView::RamTester,
+            AppView::BatteryHealthDiagnostic,
+            AppView::NetworkDiagnostic,
+            AppView::DeviceInfo,
+        ] {
+            let labels = sensor_rows_for_view(view, &snapshot)
+                .unwrap()
+                .into_iter()
+                .map(|(label, _)| label)
+                .collect::<Vec<_>>();
+            assert_eq!(labels, expected);
+        }
+
+        assert!(sensor_rows_for_view(AppView::MainMenu, &snapshot).is_none());
+    }
+
+    #[test]
     fn helper_snapshot_requests_elevation_when_non_elevated_sensor_is_hidden() {
         let line = r#"{"timestampUtc":"2026-05-16T03:36:28Z","isElevated":false,"cpu":{"label":"CPU","provider":"LibreHardwareMonitor","status":"unsupported","message":"No CPU temperature sensor found"}}"#;
         let snapshot = parse_helper_snapshot(line).unwrap();

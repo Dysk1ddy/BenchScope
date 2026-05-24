@@ -279,33 +279,7 @@ impl BenchScopeApp {
         &self,
         snapshot: &'a SensorSnapshot,
     ) -> Option<Vec<(&'static str, Option<&'a SensorReading>)>> {
-        let rows = match self.view {
-            AppView::MatrixBenchmark
-            | AppView::MatrixStressTest
-            | AppView::AiTrainingBenchmark => {
-                vec![
-                    ("CPU", snapshot.cpu.as_ref()),
-                    ("GPU", snapshot.gpu.as_ref()),
-                ]
-            }
-            AppView::GpuMemoryBenchmark => vec![
-                ("GPU", snapshot.gpu.as_ref()),
-                ("VRAM", snapshot.gpu_memory.as_ref()),
-                ("CPU", snapshot.cpu.as_ref()),
-            ],
-            AppView::DriveBenchmark | AppView::StorageHealth => {
-                vec![("SSD", snapshot.drive.as_ref())]
-            }
-            AppView::RamTester => vec![
-                ("CPU", snapshot.cpu.as_ref()),
-                ("RAM", snapshot.memory.as_ref()),
-            ],
-            AppView::BatteryHealthDiagnostic
-            | AppView::NetworkDiagnostic
-            | AppView::DeviceInfo
-            | AppView::MainMenu => return None,
-        };
-        Some(rows)
+        sensor_rows_for_view(self.view, snapshot)
     }
 
     fn ui_sensor_window(&mut self, ctx: &egui::Context) {
@@ -366,6 +340,23 @@ impl BenchScopeApp {
                 ui_sensor_table(ui, &rows);
             });
     }
+}
+
+fn sensor_rows_for_view<'a>(
+    view: AppView,
+    snapshot: &'a SensorSnapshot,
+) -> Option<Vec<(&'static str, Option<&'a SensorReading>)>> {
+    if view == AppView::MainMenu {
+        return None;
+    }
+
+    Some(vec![
+        ("CPU", snapshot.cpu.as_ref()),
+        ("GPU", snapshot.gpu.as_ref()),
+        ("VRAM", snapshot.gpu_memory.as_ref()),
+        ("SSD", snapshot.drive.as_ref()),
+        ("RAM", snapshot.memory.as_ref()),
+    ])
 }
 
 fn sensor_minimized_label(rows: &[(&str, Option<&SensorReading>)]) -> String {

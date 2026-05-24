@@ -1,5 +1,7 @@
 impl BenchScopeApp {
     fn ui_device_info(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+
         egui::Panel::top("device_info_top_panel").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui_large_back_button(ui).clicked() {
@@ -130,6 +132,8 @@ impl BenchScopeApp {
                     }
                 });
         });
+
+        self.ui_sensor_window(&ctx);
     }
 }
 

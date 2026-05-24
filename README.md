@@ -21,6 +21,8 @@ Double-click `scripts\RUN_TESTER.bat`, or run the release binary directly:
 .\target\release\BenchScope.exe
 ```
 
+The source-tree launcher checks for Cargo first. If Rust is missing, it runs `scripts\Bootstrap-Developer.ps1 -InstallRust` through `winget`, then retries the release build.
+
 If the release binary has not been built yet:
 
 ```powershell

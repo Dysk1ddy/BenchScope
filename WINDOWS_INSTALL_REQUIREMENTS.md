@@ -4,7 +4,7 @@ This file tracks software or tools BenchScope may need beyond a default Windows 
 
 ## Short Answer
 
-A packaged BenchScope release should not require Rust, Python, Visual Studio, the Windows Driver Kit, or .NET if the release includes the compiled companion binaries it needs. It should install or bundle the Microsoft Visual C++ runtime because the current release binaries import `VCRUNTIME140.dll`. The current source-tree launcher does require developer tooling because `scripts\RUN_TESTER.bat` builds the Rust app before running it.
+A packaged BenchScope release should not require Rust, Python, Visual Studio, the Windows Driver Kit, or .NET if the release includes the compiled companion binaries it needs. It should install or bundle the Microsoft Visual C++ runtime because the current release binaries import `VCRUNTIME140.dll`. The current source-tree launcher does require developer tooling because `scripts\RUN_TESTER.bat` builds the Rust app before running it, but it now bootstraps Rust through `scripts\Bootstrap-Developer.ps1 -InstallRust` when Cargo is missing.
 
 BenchScope uses several Windows components that are normally preinstalled on Windows 10/11:
 
@@ -41,7 +41,7 @@ These are not needed by a normal packaged release, but they are needed for the c
 
 | Software/tool | Needed for | Required? | Autoinstaller/bundle candidate | Notes |
 | --- | --- | --- | --- | --- |
-| Rust toolchain with Cargo | `cargo build`, `cargo run`, tests, and `scripts\RUN_TESTER.bat` | Yes for source checkout | Yes for a developer bootstrapper | Install through `rustup`. This should be a dev setup flow, not an end-user app installer requirement. |
+| Rust toolchain with Cargo | `cargo build`, `cargo run`, tests, and `scripts\RUN_TESTER.bat` | Yes for source checkout | Yes for a developer bootstrapper | `scripts\RUN_TESTER.bat` auto-runs `scripts\Bootstrap-Developer.ps1 -InstallRust` when Cargo is missing. This should remain a dev setup flow, not an end-user app installer requirement. |
 | MSVC C++ build tools and Windows SDK | Rust MSVC linking on Windows | Usually yes for source checkout | Conditional | Can be automated with the Visual Studio Build Tools bootstrapper, but it is large and developer-focused. |
 | Internet access to crates.io | First Rust dependency restore | Yes unless dependencies are cached/vendorized | No | For seamless offline installs, vendor/cache Rust dependencies in CI or release artifacts instead. |
 | .NET SDK 10 | Building `sensor-helper/` | Optional | Conditional | Only needed if rebuilding the C# helper. A packaged helper can be self-contained to avoid a user-installed .NET runtime. |
