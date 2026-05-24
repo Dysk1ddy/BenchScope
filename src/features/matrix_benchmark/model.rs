@@ -104,10 +104,9 @@ struct RepeatProgress {
     latest_ms: f64,
     average_total_ms: f64,
     average_compute_ms: Option<f64>,
+    theoretical_fp16_tc_fp32_accum_tflops: Option<MetricRange>,
     canceled: bool,
 }
-
-const MATRIX_STRESS_FP16_TC_FP32_ACCUM_THEORETICAL_TFLOPS: f64 = 209.5;
 
 impl RepeatProgress {
     fn iterations_per_second(&self) -> Option<f64> {
@@ -127,9 +126,13 @@ impl RepeatProgress {
         Some(flops_per_iteration / (average_ms / 1000.0) / 1.0e12)
     }
 
-    fn fp16_tensor_core_efficiency_percent(&self) -> Option<f64> {
-        self.throughput_tflops()
-            .map(|tflops| tflops / MATRIX_STRESS_FP16_TC_FP32_ACCUM_THEORETICAL_TFLOPS * 100.0)
+    fn fp16_tensor_core_efficiency_percent(&self) -> Option<MetricRange> {
+        let throughput = self.throughput_tflops()?;
+        let theoretical = self.theoretical_fp16_tc_fp32_accum_tflops?;
+        Some(MetricRange::new(
+            throughput / theoretical.max * 100.0,
+            throughput / theoretical.min * 100.0,
+        ))
     }
 }
 

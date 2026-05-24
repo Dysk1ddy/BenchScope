@@ -208,6 +208,8 @@ impl BenchScopeApp {
             latest_ms: 0.0,
             average_total_ms: 0.0,
             average_compute_ms: None,
+            theoretical_fp16_tc_fp32_accum_tflops:
+                theoretical_fp16_tc_fp32_accum_tflops_for_adapter(&adapter.name),
             canceled: false,
         });
         self.eta_text = duration

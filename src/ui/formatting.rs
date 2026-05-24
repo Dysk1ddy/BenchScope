@@ -156,9 +156,23 @@ fn format_stress_iterations_per_second(value: Option<f64>) -> String {
     }
 }
 
-fn format_optional_percent_f64(value: Option<f64>) -> String {
+fn format_metric_range(value: MetricRange, suffix: &str) -> String {
+    if value.is_single() {
+        format!("{:.1}{suffix}", value.max)
+    } else {
+        format!("{:.1}-{:.1}{suffix}", value.min, value.max)
+    }
+}
+
+fn format_optional_tflops_range(value: Option<MetricRange>) -> String {
     value
-        .map(|value| format!("{value:.1}%"))
+        .map(|value| format_metric_range(value, ""))
+        .unwrap_or_else(|| "N/A".to_owned())
+}
+
+fn format_optional_percent_range(value: Option<MetricRange>) -> String {
+    value
+        .map(|value| format_metric_range(value, "%"))
         .unwrap_or_else(|| "N/A".to_owned())
 }
 

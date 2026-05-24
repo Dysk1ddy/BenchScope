@@ -301,6 +301,7 @@ mod tests {
             latest_ms: 2.0,
             average_total_ms: 3.0,
             average_compute_ms: Some(2.0),
+            theoretical_fp16_tc_fp32_accum_tflops: Some(MetricRange::single(100.0)),
             canceled: false,
         };
 
@@ -308,10 +309,44 @@ mod tests {
         assert!((progress.throughput_tflops().unwrap() - 1.0).abs() < 0.0001);
         assert!(
             (progress.fp16_tensor_core_efficiency_percent().unwrap()
-                - (100.0 / MATRIX_STRESS_FP16_TC_FP32_ACCUM_THEORETICAL_TFLOPS))
+                .max
+                - 1.0)
                 .abs()
                 < 0.0001
         );
+    }
+
+    #[test]
+    fn gpu_theoretical_database_matches_desktop_laptop_and_regional_models() {
+        assert!(GPU_THEORETICAL_SPECS.len() >= 62);
+
+        let rtx_5090 =
+            theoretical_fp16_tc_fp32_accum_tflops_for_adapter("NVIDIA GeForce RTX 5090").unwrap();
+        assert!(rtx_5090.is_single());
+        assert!((rtx_5090.max - 209.8).abs() < 0.1);
+
+        let rtx_5090_d =
+            theoretical_fp16_tc_fp32_accum_tflops_for_adapter("NVIDIA GeForce RTX 5090 D v2")
+                .unwrap();
+        assert!(rtx_5090_d.is_single());
+        assert!((rtx_5090_d.max - 148.4).abs() < 0.1);
+
+        let laptop =
+            theoretical_fp16_tc_fp32_accum_tflops_for_adapter("NVIDIA GeForce RTX 4090 Laptop GPU")
+                .unwrap();
+        assert!(!laptop.is_single());
+        assert!((laptop.min - 56.6).abs() < 0.1);
+        assert!((laptop.max - 79.4).abs() < 0.1);
+
+        assert_eq!(
+            theoretical_gpu_model_name_for_adapter("NVIDIA GeForce RTX 4070 Ti SUPER"),
+            Some("GeForce RTX 4070 Ti Super")
+        );
+        assert_eq!(
+            theoretical_gpu_model_name_for_adapter("NVIDIA GeForce RTX 3050 Laptop GPU"),
+            Some("GeForce RTX 3050 Laptop GPU")
+        );
+        assert_eq!(theoretical_gpu_model_name_for_adapter("AMD Radeon"), None);
     }
 
     #[test]

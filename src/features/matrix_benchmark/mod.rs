@@ -1,4 +1,5 @@
 include!("hardware.rs");
+include!("gpu_theoretical.rs");
 include!("model.rs");
 include!("runner.rs");
 include!("sizing.rs");

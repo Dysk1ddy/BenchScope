@@ -4149,6 +4149,8 @@ fn run_repeat(
     let compute_count = 0_u64;
     let mut latest_ms = 0.0;
     let mut last_emit = Instant::now() - Duration::from_secs(1);
+    let theoretical_fp16_tc_fp32_accum_tflops =
+        theoretical_fp16_tc_fp32_accum_tflops_for_adapter(&adapter.name);
 
     let progress_tx = tx.clone();
     let mut emit = move |iterations: u64,
@@ -4180,6 +4182,7 @@ fn run_repeat(
             } else {
                 Some(total_compute_ms / compute_count as f64)
             },
+            theoretical_fp16_tc_fp32_accum_tflops,
             canceled,
         };
         if force || now.duration_since(last_emit) >= Duration::from_millis(PROGRESS_SAMPLE_MS) {

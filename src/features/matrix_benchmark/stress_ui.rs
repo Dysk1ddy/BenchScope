@@ -79,6 +79,18 @@ impl BenchScopeApp {
                     } else {
                         ui.small("Memory limit estimate: unavailable for this adapter/backend");
                     }
+                    if let Some(theoretical_tflops) =
+                        theoretical_fp16_tc_fp32_accum_tflops_for_adapter(&adapter.name)
+                    {
+                        let model_name =
+                            theoretical_gpu_model_name_for_adapter(&adapter.name).unwrap_or("RTX GPU");
+                        ui.small(format!(
+                            "FP16 TC FP32 acc baseline: {} TFLOP/s ({model_name})",
+                            format_optional_tflops_range(Some(theoretical_tflops))
+                        ));
+                    } else {
+                        ui.small("FP16 TC FP32 acc baseline: unavailable for this adapter");
+                    }
                 }
 
                 ui.add_space(6.0);
@@ -305,18 +317,25 @@ impl BenchScopeApp {
                                         result_cell(ui, format_optional_tflops(progress.throughput_tflops()));
                                         result_cell(
                                             ui,
-                                            format!(
-                                                "{:.1}",
-                                                MATRIX_STRESS_FP16_TC_FP32_ACCUM_THEORETICAL_TFLOPS
+                                            format_optional_tflops_range(
+                                                progress.theoretical_fp16_tc_fp32_accum_tflops,
                                             ),
                                         );
                                         result_cell(
                                             ui,
-                                            format_optional_percent_f64(
+                                            format_optional_percent_range(
                                                 progress.fp16_tensor_core_efficiency_percent(),
                                             ),
                                         );
                                     } else {
+                                        let theoretical_tflops =
+                                            self.adapters.get(self.selected_adapter).and_then(
+                                                |adapter| {
+                                                    theoretical_fp16_tc_fp32_accum_tflops_for_adapter(
+                                                        &adapter.name,
+                                                    )
+                                                },
+                                            );
                                         result_cell(ui, self.repeat_mode.to_string());
                                         result_cell(
                                             ui,
@@ -334,10 +353,7 @@ impl BenchScopeApp {
                                         result_cell(ui, "N/A");
                                         result_cell(
                                             ui,
-                                            format!(
-                                                "{:.1}",
-                                                MATRIX_STRESS_FP16_TC_FP32_ACCUM_THEORETICAL_TFLOPS
-                                            ),
+                                            format_optional_tflops_range(theoretical_tflops),
                                         );
                                         result_cell(ui, "N/A");
                                     }
