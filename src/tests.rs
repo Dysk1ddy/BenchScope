@@ -2041,8 +2041,15 @@ mod tests {
             let (min_log, max_log) = panel_log_resize_bounds(usable_height, 150.0);
             assert!(min_log <= max_log);
             assert!(min_log >= 32.0);
-            assert!(max_log <= 150.0);
+            assert!(max_log <= usable_height.max(32.0));
         }
+    }
+
+    #[test]
+    fn panel_log_resize_can_grow_past_default_max() {
+        let (_min_log, max_log) = panel_log_resize_bounds(640.0, 150.0);
+
+        assert!(max_log > 150.0);
     }
 
     #[cfg(windows)]
@@ -2572,5 +2579,36 @@ mod tests {
         assert!(labels.contains(&"SSD util".to_owned()));
         assert!(!labels.contains(&"SSD temp".to_owned()));
         assert!(!labels.contains(&"Throughput".to_owned()));
+    }
+
+    #[test]
+    fn timeline_legend_wraps_inside_chart_bounds() {
+        let items = timeline_legend_layout(&[90.0, 95.0, 85.0, 80.0], 12.0, 190.0, 8.0);
+
+        assert!(items.iter().all(|item| item.x >= 12.0));
+        assert!(items.iter().all(|item| item.x + item.width <= 190.1));
+        assert!(items
+            .iter()
+            .any(|item| item.y >= 8.0 + TIMELINE_LEGEND_ROW_HEIGHT));
+    }
+
+    #[test]
+    fn timeline_chart_left_margin_keeps_axis_label_clear() {
+        assert!(timeline_chart_left_margin(520.0) >= 88.0);
+        assert!(timeline_chart_left_margin(360.0) >= 78.0);
+        assert!(timeline_chart_left_margin(260.0) >= 68.0);
+    }
+
+    #[test]
+    fn timeline_legend_uses_compact_labels_on_small_charts() {
+        let series = TimelineGraphSeries {
+            label: "RAM util".to_owned(),
+            color: egui::Color32::WHITE,
+            unit: "%".to_owned(),
+            values: Vec::new(),
+        };
+
+        assert_eq!(timeline_legend_label(&series, true), "RAM %");
+        assert_eq!(timeline_legend_label(&series, false), "RAM util (%)");
     }
 }

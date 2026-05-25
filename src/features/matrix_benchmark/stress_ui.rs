@@ -282,25 +282,25 @@ impl BenchScopeApp {
             });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            let available_height = ui.available_height();
-            let (summary_height, log_height) =
-                resizable_panel_content_log_heights(
-                    ui,
-                    "matrix_stress_log",
-                    available_height,
-                    0.35,
-                    220.0,
-                );
-
-            ui.heading("Stress Readout");
-            ui.add_space(6.0);
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), summary_height),
-                egui::Layout::top_down(egui::Align::LEFT),
+            ui_resizable_log_panel(
+                ui,
+                "matrix_stress_log",
+                "matrix_stress_log_scroll",
+                0.35,
+                220.0,
                 |ui| {
-                    egui::ScrollArea::both()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
+                    for line in &self.log {
+                        ui_log_line(ui, line);
+                    }
+                },
+            );
+
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                ui.heading("Stress Readout");
+                ui.add_space(6.0);
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                             egui::Grid::new("stress_readout_grid")
                                 .striped(true)
                                 .num_columns(12)
@@ -391,26 +391,8 @@ impl BenchScopeApp {
                                 });
                             ui.separator();
                             self.ui_timeline_panel(ui, TimelineScope::MatrixStress);
-                        });
-                },
-            );
-
-            ui_log_resize_handle(
-                ui,
-                "matrix_stress_log",
-                available_height,
-                log_height,
-                220.0,
-            );
-            ui.heading("Log");
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .max_height(log_height)
-                .show(ui, |ui| {
-                    for line in &self.log {
-                        ui_log_line(ui, line);
-                    }
-                });
+                    });
+            });
         });
 
         self.ui_sensor_window(&ctx);

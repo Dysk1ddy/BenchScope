@@ -82,23 +82,23 @@ impl BenchScopeApp {
             });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            let available_height = ui.available_height();
-            let (content_height, log_height) =
-                resizable_panel_content_log_heights(
-                    ui,
-                    "device_info_log",
-                    available_height,
-                    0.20,
-                    180.0,
-                );
-
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), content_height),
-                egui::Layout::top_down(egui::Align::LEFT),
+            ui_resizable_log_panel(
+                ui,
+                "device_info_log",
+                "device_info_log_scroll",
+                0.20,
+                180.0,
                 |ui| {
-                    egui::ScrollArea::both()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
+                    for line in &self.device_info.log {
+                        ui_log_line(ui, line);
+                    }
+                },
+            );
+
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                             if let Some(snapshot) = &self.device_info.snapshot {
                                 match self.device_info.selected_page {
                                     DeviceInfoPage::Overview => ui_device_info_overview(ui, snapshot),
@@ -123,26 +123,8 @@ impl BenchScopeApp {
                                 ui.heading("Hardware Inventory");
                                 ui.label("Refresh hardware inventory to collect system, firmware, device, and driver details.");
                             }
-                        });
-                },
-            );
-
-            ui_log_resize_handle(
-                ui,
-                "device_info_log",
-                available_height,
-                log_height,
-                180.0,
-            );
-            ui.heading("Log");
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .max_height(log_height)
-                .show(ui, |ui| {
-                    for line in &self.device_info.log {
-                        ui_log_line(ui, line);
-                    }
-                });
+                    });
+            });
         });
 
         self.ui_sensor_window(&ctx);

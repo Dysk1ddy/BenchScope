@@ -15,13 +15,22 @@ The primary implementation is now Rust + `wgpu` + `egui`. The earlier Python Dir
 
 ## Run
 
-Double-click `scripts\RUN_TESTER.bat`, or run the release binary directly:
+Double-click `Open BenchScope.lnk` or `scripts\RUN_TESTER.bat` when working from
+source. That launcher rebuilds first, copies the fresh release executable to an
+unlocked run location, and then starts the app:
 
 ```powershell
-.\target\release\BenchScope.exe
+.\scripts\RUN_TESTER.bat
 ```
 
-The source-tree launcher checks for Cargo first. If Rust is missing, it runs `scripts\Bootstrap-Developer.ps1 -InstallRust` through `winget`, then retries the release build.
+The source-tree launcher checks for Cargo first. If Rust is missing, it runs `scripts\Bootstrap-Developer.ps1 -InstallRust` through `winget`, then retries an incremental release build of the GUI binary. After a successful build it mirrors the fresh executable to `.\target\release\BenchScope.exe` for older shortcuts and launches `.\target\run\BenchScope.exe` so a running app does not lock Cargo's build output.
+
+You can run the shared-target release binary directly after a manual build, but
+that bypasses the automatic rebuild step:
+
+```powershell
+..\.cargo-target\BenchScope\release\BenchScope.exe
+```
 
 If the release binary has not been built yet:
 

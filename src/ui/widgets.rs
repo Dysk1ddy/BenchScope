@@ -93,99 +93,55 @@ fn panel_content_log_heights_with_chrome(
     (usable_height - log_height, log_height)
 }
 
-fn resizable_panel_content_log_heights(
-    ui: &mut egui::Ui,
-    log_id: &'static str,
-    available_height: f32,
-    log_fraction: f32,
-    log_max: f32,
-) -> (f32, f32) {
-    let fixed_height = PANEL_VERTICAL_CHROME_HEIGHT + LOG_RESIZE_HANDLE_HEIGHT;
-    let usable_height = (available_height - fixed_height).max(0.0);
-    let (_, default_log_height) =
-        panel_content_log_heights_with_chrome(available_height, log_fraction, log_max, fixed_height);
-    let (min_log_height, max_log_height) = panel_log_resize_bounds(usable_height, log_max);
-    let height_id = panel_log_height_id(log_id);
-    let saved_log_height = ui
-        .ctx()
-        .data_mut(|data| data.get_persisted::<f32>(height_id));
-    let log_height = saved_log_height
-        .unwrap_or(default_log_height)
-        .clamp(min_log_height, max_log_height);
-
-    ((usable_height - log_height).max(40.0), log_height)
-}
-
-fn ui_log_resize_handle(
-    ui: &mut egui::Ui,
-    log_id: &'static str,
-    available_height: f32,
-    current_log_height: f32,
-    log_max: f32,
-) {
-    let height_id = panel_log_height_id(log_id);
-    let drag_start_id = panel_log_drag_start_id(log_id);
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), LOG_RESIZE_HANDLE_HEIGHT),
-        egui::Sense::drag(),
-    );
-    let response = response
-        .on_hover_cursor(egui::CursorIcon::ResizeVertical)
-        .on_hover_text("Drag to resize log");
-
-    if response.drag_started() {
-        ui.ctx()
-            .data_mut(|data| data.insert_temp(drag_start_id, current_log_height));
-    }
-
-    if response.dragged() {
-        let usable_height =
-            (available_height - PANEL_VERTICAL_CHROME_HEIGHT - LOG_RESIZE_HANDLE_HEIGHT).max(0.0);
-        let (min_log_height, max_log_height) = panel_log_resize_bounds(usable_height, log_max);
-        let start_log_height = ui
-            .ctx()
-            .data_mut(|data| data.get_temp::<f32>(drag_start_id))
-            .unwrap_or(current_log_height);
-        let resized_log_height =
-            (start_log_height - response.drag_delta().y).clamp(min_log_height, max_log_height);
-        ui.ctx()
-            .data_mut(|data| data.insert_persisted(height_id, resized_log_height));
-        ui.ctx().request_repaint();
-    }
-
-    let visuals = ui.style().interact(&response);
-    let color = if response.dragged() {
-        visuals.fg_stroke.color
-    } else if response.hovered() {
-        visuals.bg_stroke.color
-    } else {
-        ui.visuals().widgets.noninteractive.bg_stroke.color
-    };
-    let grip_width = (rect.width() * 0.18).clamp(48.0, 160.0);
-    let grip_rect =
-        egui::Rect::from_center_size(rect.center(), egui::vec2(grip_width, 3.0));
-    ui.painter()
-        .rect_filled(grip_rect, egui::CornerRadius::same(2), color);
-}
-
-fn panel_log_resize_bounds(usable_height: f32, log_max: f32) -> (f32, f32) {
+#[cfg(test)]
+fn panel_log_resize_bounds(usable_height: f32, _default_log_max: f32) -> (f32, f32) {
     if usable_height <= MIN_CONTENT_HEIGHT + MIN_LOG_HEIGHT {
-        let max_log_height = (usable_height * 0.5).max(32.0).min(log_max);
+        let max_log_height = (usable_height * 0.5).max(32.0);
         return (32.0_f32.min(max_log_height), max_log_height);
     }
 
     let max_log_height = (usable_height - MIN_CONTENT_HEIGHT)
-        .min(log_max)
         .max(MIN_LOG_HEIGHT);
     (MIN_LOG_HEIGHT.min(max_log_height), max_log_height)
 }
 
-fn panel_log_height_id(log_id: &'static str) -> egui::Id {
-    egui::Id::new(("panel_log_height", log_id))
+fn ui_resizable_log_panel(
+    ui: &mut egui::Ui,
+    log_id: &'static str,
+    scroll_id: &'static str,
+    log_fraction: f32,
+    log_max: f32,
+    add_log: impl FnOnce(&mut egui::Ui),
+) {
+    const LOG_PANEL_HEADER_HEIGHT: f32 = 38.0;
+    let available_height = ui.available_height();
+    let (_, default_log_height) =
+        panel_content_log_heights_with_chrome(available_height, log_fraction, log_max, 0.0);
+    let min_panel_height = (MIN_LOG_HEIGHT + LOG_PANEL_HEADER_HEIGHT).min(available_height);
+    let max_panel_height = (available_height - MIN_CONTENT_HEIGHT)
+        .max(min_panel_height)
+        .min(available_height);
+    let default_panel_height = (default_log_height + LOG_PANEL_HEADER_HEIGHT)
+        .clamp(min_panel_height, max_panel_height);
+
+    egui::Panel::bottom(panel_log_panel_id(log_id))
+        .resizable(true)
+        .show_separator_line(true)
+        .min_size(min_panel_height)
+        .max_size(max_panel_height)
+        .default_size(default_panel_height)
+        .show_inside(ui, |ui| {
+            ui.heading("Log");
+            egui::ScrollArea::vertical()
+                .id_salt(scroll_id)
+                .stick_to_bottom(true)
+                .auto_shrink([false, false])
+                .show(ui, |ui| add_log(ui));
+        });
 }
 
-fn panel_log_drag_start_id(log_id: &'static str) -> egui::Id {
-    egui::Id::new(("panel_log_drag_start", log_id))
+fn panel_log_panel_id(log_id: &'static str) -> egui::Id {
+    egui::Id::new(("panel_log_panel", log_id))
 }
 
 fn ui_log_line(ui: &mut egui::Ui, line: &str) {
@@ -309,6 +265,8 @@ fn configure_ui_style(ctx: &egui::Context) {
     style.spacing.button_padding = egui::vec2(14.0, 9.0);
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);
     style.spacing.interact_size = egui::vec2(44.0, 34.0);
+    style.interaction.resize_grab_radius_side =
+        style.interaction.resize_grab_radius_side.max(10.0);
     ctx.set_global_style(style);
 }
 

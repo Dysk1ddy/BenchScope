@@ -32,6 +32,9 @@ debug = 1
 incremental = true
 
 [profile.release]
-lto = "thin"
-codegen-units = 1
+# The source-tree launcher rebuilds this profile after app updates. Keep it
+# optimized while favoring incremental relinks over final-binary size tuning.
+incremental = true
+lto = false
+codegen-units = 16
 strip = "symbols"

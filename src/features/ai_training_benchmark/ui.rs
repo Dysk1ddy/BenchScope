@@ -333,23 +333,23 @@ impl BenchScopeApp {
             });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            let available_height = ui.available_height();
-            let (content_height, log_height) =
-                resizable_panel_content_log_heights(
-                    ui,
-                    "ai_training_log",
-                    available_height,
-                    0.24,
-                    210.0,
-                );
-
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), content_height),
-                egui::Layout::top_down(egui::Align::LEFT),
+            ui_resizable_log_panel(
+                ui,
+                "ai_training_log",
+                "ai_training_log_scroll",
+                0.24,
+                210.0,
                 |ui| {
-                    egui::ScrollArea::both()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
+                    for line in &self.ai_training.log {
+                        ui_log_line(ui, line);
+                    }
+                },
+            );
+
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                             ui.heading("Benchmark Summary");
                             ui.add_space(8.0);
                             ui_ai_training_summary(ui, &self.ai_training);
@@ -360,26 +360,8 @@ impl BenchScopeApp {
                             ui_ai_training_results_table(ui, &self.ai_training.results);
                             ui.separator();
                             self.ui_timeline_panel(ui, TimelineScope::AiTraining);
-                        });
-                },
-            );
-
-            ui_log_resize_handle(
-                ui,
-                "ai_training_log",
-                available_height,
-                log_height,
-                210.0,
-            );
-            ui.heading("Log");
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .max_height(log_height)
-                .show(ui, |ui| {
-                    for line in &self.ai_training.log {
-                        ui_log_line(ui, line);
-                    }
-                });
+                    });
+            });
         });
 
         self.ui_sensor_window(&ctx);

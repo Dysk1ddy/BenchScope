@@ -226,25 +226,25 @@ impl BenchScopeApp {
             });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            let available_height = ui.available_height();
-            let (results_height, log_height) =
-                resizable_panel_content_log_heights(
-                    ui,
-                    "gpu_memory_log",
-                    available_height,
-                    0.18,
-                    150.0,
-                );
-
-            ui.heading("GPU Memory Results");
-            ui.add_space(6.0);
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), results_height),
-                egui::Layout::top_down(egui::Align::LEFT),
+            ui_resizable_log_panel(
+                ui,
+                "gpu_memory_log",
+                "gpu_memory_log_scroll",
+                0.18,
+                150.0,
                 |ui| {
-                    egui::ScrollArea::both()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
+                    for line in &self.gpu_memory.log {
+                        ui_log_line(ui, line);
+                    }
+                },
+            );
+
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                ui.heading("GPU Memory Results");
+                ui.add_space(6.0);
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                             egui::Grid::new("gpu_memory_results_grid")
                                 .striped(true)
                                 .num_columns(11)
@@ -297,26 +297,8 @@ impl BenchScopeApp {
                                 });
                             ui.separator();
                             self.ui_timeline_panel(ui, TimelineScope::GpuMemory);
-                        });
-                },
-            );
-
-            ui_log_resize_handle(
-                ui,
-                "gpu_memory_log",
-                available_height,
-                log_height,
-                150.0,
-            );
-            ui.heading("Log");
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .max_height(log_height)
-                .show(ui, |ui| {
-                    for line in &self.gpu_memory.log {
-                        ui_log_line(ui, line);
-                    }
-                });
+                    });
+            });
         });
 
         self.ui_sensor_window(&ctx);

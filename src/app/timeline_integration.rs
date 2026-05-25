@@ -171,7 +171,38 @@ fn ui_timeline_graph(ui: &mut egui::Ui, timeline: &RunTimeline, state: &Timeline
         return;
     }
 
-    let desired_size = egui::vec2(ui.available_width().max(360.0), 280.0);
+    let chart_width = ui.available_width().max(1.0);
+    let compact_legend = chart_width < 520.0;
+    let legend_labels = series
+        .iter()
+        .map(|graph_series| timeline_legend_label(graph_series, compact_legend))
+        .collect::<Vec<_>>();
+    let legend_font = egui::FontId::proportional(12.0);
+    let axis_font = egui::FontId::proportional(12.0);
+    let legend_widths = legend_labels
+        .iter()
+        .map(|label| {
+            ui.painter()
+                .layout_no_wrap(
+                    label.clone(),
+                    legend_font.clone(),
+                    egui::Color32::from_rgb(190, 198, 210),
+                )
+                .size()
+                .x
+                + TIMELINE_LEGEND_SWATCH_WIDTH
+                + TIMELINE_LEGEND_TEXT_GAP
+        })
+        .collect::<Vec<_>>();
+    let legend_rows = timeline_legend_row_count(
+        &legend_widths,
+        (chart_width - TIMELINE_CHART_INNER_PADDING * 2.0).max(1.0),
+    );
+    let desired_size = egui::vec2(
+        chart_width,
+        TIMELINE_CHART_BASE_HEIGHT
+            + legend_rows.saturating_sub(1) as f32 * TIMELINE_LEGEND_ROW_HEIGHT,
+    );
     let (rect, _) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, egui::CornerRadius::same(6), egui::Color32::from_rgb(18, 21, 26));
@@ -182,9 +213,18 @@ fn ui_timeline_graph(ui: &mut egui::Ui, timeline: &RunTimeline, state: &Timeline
         egui::StrokeKind::Inside,
     );
 
+    let left_margin = timeline_chart_left_margin(rect.width());
+    let right_margin = if rect.width() < 320.0 { 8.0 } else { 14.0 };
+    let legend_left = rect.left() + TIMELINE_CHART_INNER_PADDING;
+    let legend_right = rect.right() - TIMELINE_CHART_INNER_PADDING;
+    let legend_top = rect.top() + 8.0;
+    let legend_items =
+        timeline_legend_layout(&legend_widths, legend_left, legend_right, legend_top);
+    let plot_top =
+        legend_top + legend_rows as f32 * TIMELINE_LEGEND_ROW_HEIGHT + TIMELINE_PLOT_TOP_GAP;
     let plot = egui::Rect::from_min_max(
-        rect.min + egui::vec2(52.0, 28.0),
-        rect.max - egui::vec2(12.0, 42.0),
+        egui::pos2(rect.left() + left_margin, plot_top),
+        egui::pos2(rect.right() - right_margin, rect.bottom() - 42.0),
     );
     let max_x = timeline
         .samples
@@ -206,30 +246,37 @@ fn ui_timeline_graph(ui: &mut egui::Ui, timeline: &RunTimeline, state: &Timeline
             egui::Stroke::new(0.7, egui::Color32::from_rgb(35, 40, 48)),
         );
         painter.text(
-            egui::pos2(plot.left() - 8.0, y),
+            egui::pos2(plot.left() - 10.0, y),
             egui::Align2::RIGHT_CENTER,
             format!("{}", i * 25),
-            egui::FontId::proportional(12.0),
+            axis_font.clone(),
             egui::Color32::from_rgb(170, 178, 190),
         );
     }
 
-    let mut legend_x = plot.left();
-    let legend_y = rect.top() + 8.0;
     for graph_series in &series {
         draw_timeline_series(&painter, plot, max_x, graph_series);
-        let label = format!("{} ({})", graph_series.label, graph_series.unit);
+    }
+    for ((item, graph_series), label) in legend_items.iter().zip(&series).zip(&legend_labels) {
+        let swatch_y = item.y + TIMELINE_LEGEND_ROW_HEIGHT * 0.48;
+        let swatch_width = TIMELINE_LEGEND_SWATCH_WIDTH.min(item.width);
+        painter.line_segment(
+            [
+                egui::pos2(item.x, swatch_y),
+                egui::pos2(item.x + swatch_width, swatch_y),
+            ],
+            egui::Stroke::new(2.0, graph_series.color),
+        );
         painter.text(
-            egui::pos2(legend_x, legend_y),
+            egui::pos2(
+                item.x + TIMELINE_LEGEND_SWATCH_WIDTH + TIMELINE_LEGEND_TEXT_GAP,
+                item.y,
+            ),
             egui::Align2::LEFT_TOP,
             label,
-            egui::FontId::proportional(12.0),
+            legend_font.clone(),
             graph_series.color,
         );
-        legend_x += 118.0;
-        if legend_x > plot.right() - 110.0 {
-            legend_x = plot.left();
-        }
     }
 
     painter.line_segment(
@@ -244,30 +291,126 @@ fn ui_timeline_graph(ui: &mut egui::Ui, timeline: &RunTimeline, state: &Timeline
         egui::pos2(plot.left(), plot.bottom() + 6.0),
         egui::Align2::LEFT_TOP,
         "0s",
-        egui::FontId::proportional(12.0),
+        axis_font.clone(),
         egui::Color32::from_rgb(170, 178, 190),
     );
     painter.text(
         egui::pos2(plot.right(), plot.bottom() + 6.0),
         egui::Align2::RIGHT_TOP,
         format_elapsed(max_x),
-        egui::FontId::proportional(12.0),
+        axis_font.clone(),
         egui::Color32::from_rgb(170, 178, 190),
     );
     painter.text(
         egui::pos2(plot.center().x, rect.bottom() - 16.0),
         egui::Align2::CENTER_CENTER,
         "Elapsed time",
-        egui::FontId::proportional(12.0),
+        axis_font.clone(),
         egui::Color32::from_rgb(190, 198, 210),
     );
-    painter.text(
-        egui::pos2(rect.left() + 10.0, plot.center().y),
-        egui::Align2::LEFT_CENTER,
+    draw_rotated_timeline_label(
+        &painter,
+        egui::pos2(
+            rect.left() + (left_margin * 0.24).clamp(14.0, 22.0),
+            plot.center().y,
+        ),
         "Temp C / Util %",
-        egui::FontId::proportional(12.0),
+        axis_font,
         egui::Color32::from_rgb(190, 198, 210),
     );
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TimelineLegendItemLayout {
+    x: f32,
+    y: f32,
+    width: f32,
+}
+
+const TIMELINE_CHART_BASE_HEIGHT: f32 = 288.0;
+const TIMELINE_CHART_INNER_PADDING: f32 = 12.0;
+const TIMELINE_LEGEND_ROW_HEIGHT: f32 = 17.0;
+const TIMELINE_LEGEND_COLUMN_GAP: f32 = 14.0;
+const TIMELINE_LEGEND_SWATCH_WIDTH: f32 = 14.0;
+const TIMELINE_LEGEND_TEXT_GAP: f32 = 5.0;
+const TIMELINE_PLOT_TOP_GAP: f32 = 8.0;
+
+fn timeline_chart_left_margin(width: f32) -> f32 {
+    if width < 300.0 {
+        68.0
+    } else if width < 420.0 {
+        78.0
+    } else {
+        88.0
+    }
+}
+
+fn timeline_legend_label(series: &TimelineGraphSeries, compact: bool) -> String {
+    if !compact {
+        return format!("{} ({})", series.label, series.unit);
+    }
+
+    if let Some(device) = series.label.strip_suffix(" temp") {
+        return format!("{device} {}", series.unit);
+    }
+    if let Some(device) = series.label.strip_suffix(" util") {
+        return format!("{device} {}", series.unit);
+    }
+    format!("{} {}", series.label, series.unit)
+}
+
+fn timeline_legend_row_count(item_widths: &[f32], available_width: f32) -> usize {
+    if item_widths.is_empty() {
+        return 0;
+    }
+    timeline_legend_layout(item_widths, 0.0, available_width.max(1.0), 0.0)
+        .iter()
+        .map(|item| ((item.y / TIMELINE_LEGEND_ROW_HEIGHT).round() as usize).saturating_add(1))
+        .max()
+        .unwrap_or(1)
+}
+
+fn timeline_legend_layout(
+    item_widths: &[f32],
+    left: f32,
+    right: f32,
+    top: f32,
+) -> Vec<TimelineLegendItemLayout> {
+    let available_width = (right - left).max(1.0);
+    let mut items = Vec::with_capacity(item_widths.len());
+    let mut x = left;
+    let mut y = top;
+
+    for width in item_widths {
+        let item_width = width.min(available_width);
+        if x > left && x + item_width > right {
+            x = left;
+            y += TIMELINE_LEGEND_ROW_HEIGHT;
+        }
+        items.push(TimelineLegendItemLayout {
+            x,
+            y,
+            width: item_width,
+        });
+        x += item_width + TIMELINE_LEGEND_COLUMN_GAP;
+    }
+
+    items
+}
+
+fn draw_rotated_timeline_label(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    text: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+) {
+    let galley = painter.layout_no_wrap(text.to_owned(), font, color);
+    let pos = center - galley.size() * 0.5;
+    painter.add(egui::Shape::Text(
+        egui::epaint::TextShape::new(pos, galley, color)
+            .with_angle_and_anchor(-std::f32::consts::FRAC_PI_2, egui::Align2::CENTER_CENTER),
+    ));
 }
 
 fn draw_timeline_series(

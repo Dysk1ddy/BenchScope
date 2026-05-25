@@ -143,24 +143,24 @@ impl BenchScopeApp {
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let snapshot = self.storage_health.snapshot.clone();
-            let available_height = ui.available_height();
-            let (content_height, log_height) =
-                resizable_panel_content_log_heights(
-                    ui,
-                    "storage_health_log",
-                    available_height,
-                    0.18,
-                    150.0,
-                );
-
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), content_height),
-                egui::Layout::top_down(egui::Align::LEFT),
+            ui_resizable_log_panel(
+                ui,
+                "storage_health_log",
+                "storage_health_log_scroll",
+                0.18,
+                150.0,
                 |ui| {
-                    egui::ScrollArea::both()
-                        .id_salt("storage_health_content_scroll")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
+                    for line in &self.storage_health.log {
+                        ui_log_line(ui, line);
+                    }
+                },
+            );
+
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                egui::ScrollArea::both()
+                    .id_salt("storage_health_content_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                             if let Some(snapshot) = &snapshot {
                                 ui.horizontal(|ui| {
                                     ui.heading("Overall Health");
@@ -419,26 +419,8 @@ impl BenchScopeApp {
                                 ui.heading("Overall Health");
                                 ui.label("Choose a drive and refresh the health snapshot to read SMART/NVMe data.");
                             }
-                        });
-                },
-            );
-
-            ui_log_resize_handle(
-                ui,
-                "storage_health_log",
-                available_height,
-                log_height,
-                150.0,
-            );
-            ui.heading("Log");
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .max_height(log_height)
-                .show(ui, |ui| {
-                    for line in &self.storage_health.log {
-                        ui_log_line(ui, line);
-                    }
-                });
+                    });
+            });
         });
 
         self.ui_sensor_window(&ctx);

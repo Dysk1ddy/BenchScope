@@ -228,34 +228,34 @@ impl BenchScopeApp {
             });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            let available_height = ui.available_height();
-            let (content_height, log_height) =
-                resizable_panel_content_log_heights(
-                    ui,
-                    "network_diagnostic_log",
-                    available_height,
-                    0.18,
-                    150.0,
-                );
-
-            ui.horizontal(|ui| {
-                ui.heading("Network Findings");
-                if let Some(adapter) = self.network.selected_adapter() {
-                    ui.separator();
-                    ui.colored_label(
-                        adapter.status.color(),
-                        egui::RichText::new(adapter.status.label()).strong(),
-                    );
-                }
-            });
-            ui.add_space(6.0);
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), content_height),
-                egui::Layout::top_down(egui::Align::LEFT),
+            ui_resizable_log_panel(
+                ui,
+                "network_diagnostic_log",
+                "network_diagnostic_log_scroll",
+                0.18,
+                150.0,
                 |ui| {
-                    egui::ScrollArea::both()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
+                    for line in &self.network.log {
+                        ui_log_line(ui, line);
+                    }
+                },
+            );
+
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Network Findings");
+                    if let Some(adapter) = self.network.selected_adapter() {
+                        ui.separator();
+                        ui.colored_label(
+                            adapter.status.color(),
+                            egui::RichText::new(adapter.status.label()).strong(),
+                        );
+                    }
+                });
+                ui.add_space(6.0);
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                             ui.label(egui::RichText::new("Findings").strong());
                             if self.network.findings.is_empty() {
                                 ui.label("Run a quick diagnosis or start the monitor to populate findings.");
@@ -388,26 +388,8 @@ impl BenchScopeApp {
                                         }
                                     });
                             }
-                        });
-                },
-            );
-
-            ui_log_resize_handle(
-                ui,
-                "network_diagnostic_log",
-                available_height,
-                log_height,
-                150.0,
-            );
-            ui.heading("Log");
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .max_height(log_height)
-                .show(ui, |ui| {
-                    for line in &self.network.log {
-                        ui_log_line(ui, line);
-                    }
-                });
+                    });
+            });
         });
 
         self.ui_sensor_window(&ctx);
