@@ -568,6 +568,7 @@ impl BenchScopeApp {
                             self.log(err);
                         }
                     }
+                    self.refresh_setup_detection();
                 }
                 WorkerEvent::PyTorchInstallDone(result) => {
                     self.pytorch_install_running = false;
@@ -594,6 +595,7 @@ impl BenchScopeApp {
                             self.log(err);
                         }
                     }
+                    self.refresh_setup_detection();
                 }
                 WorkerEvent::Log(message) => self.log(message),
             }

@@ -13,6 +13,7 @@ enum StartupEvent {
 struct StartupData {
     adapters: Vec<AdapterInfo>,
     cpu_info: CpuInfo,
+    setup_detection: SetupDetection,
     drive: DriveBenchmarkState,
     storage_health: StorageHealthState,
     ram: RamTestState,
@@ -21,6 +22,24 @@ struct StartupData {
     device_info: DeviceInfoState,
     ai_training: AiTrainingBenchmarkState,
     gpu_memory: GpuMemoryBenchmarkState,
+}
+
+#[derive(Clone, Debug)]
+struct SetupDetection {
+    elevated: bool,
+    vcruntime_available: bool,
+    nvidia_smi_available: Option<bool>,
+    hardware_monitor_wmi_available: bool,
+    sensor_service_available: bool,
+    managed_pytorch_python: Option<String>,
+    managed_pytorch_install_base_available: bool,
+}
+
+#[derive(Clone, Debug)]
+struct SetupAssistantState {
+    visible: bool,
+    dismissed_this_session: bool,
+    dismissed_persisted: bool,
 }
 
 struct BenchScopeRoot {
@@ -35,6 +54,8 @@ struct BenchScopeApp {
     main_menu_category: Option<MenuCategory>,
     adapters: Vec<AdapterInfo>,
     cpu_info: CpuInfo,
+    setup_detection: SetupDetection,
+    setup_assistant: SetupAssistantState,
     selected_adapter: usize,
     size_text: String,
     stress_size_text: String,
@@ -89,6 +110,7 @@ struct BenchScopeApp {
 }
 
 include!("view.rs");
+include!("setup.rs");
 include!("common.rs");
 include!("window.rs");
 include!("runtime.rs");

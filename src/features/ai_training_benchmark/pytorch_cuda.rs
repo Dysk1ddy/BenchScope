@@ -45,6 +45,7 @@ struct PyTorchCudaBenchmarkOutput {
 const PYTORCH_CUDA_PIP_INDEX_URL: &str = "https://download.pytorch.org/whl/cu128";
 const PYTORCH_CUDA_INSTALL_PACKAGES: [&str; 3] = ["torch", "torchvision", "torchaudio"];
 const PYTORCH_CUDA_INSTALL_DOWNLOAD_NOTE: &str = "about 3 GB";
+const PYTORCH_CUDA_MANAGED_ENV_DIR: &str = "pytorch-cu128";
 
 impl PyTorchCudaEnvironment {
     fn summary_lines(&self) -> Vec<String> {
@@ -101,7 +102,7 @@ fn default_pytorch_python_executable() -> String {
 }
 
 fn probe_pytorch_cuda(python: &str) -> Result<PyTorchCudaEnvironment> {
-    let output = run_pytorch_cuda_probe_script(python, Duration::from_secs(15))?;
+    let output = run_pytorch_cuda_probe_script(python, Duration::from_secs(60))?;
     Ok(parse_pytorch_cuda_probe_output(&output, python))
 }
 
@@ -189,6 +190,151 @@ where
     }
 }
 
+fn install_managed_pytorch_cuda<F>(mut log: F) -> Result<PyTorchCudaEnvironment>
+where
+    F: FnMut(String),
+{
+    let env_dir = managed_pytorch_cuda_env_dir()
+        .ok_or_else(|| anyhow!("LOCALAPPDATA is not available for the managed PyTorch install"))?;
+    let python = env_dir.join("Scripts").join("python.exe");
+
+    if !python.is_file() {
+        let base_python = find_python_for_managed_pytorch_cuda()?;
+        if let Some(parent) = env_dir.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create BenchScope environment directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+
+        log(format!(
+            "Creating managed Python environment at {}",
+            env_dir.display()
+        ));
+        let env_dir_text = env_dir.display().to_string();
+        run_pytorch_install_command(
+            &base_python,
+            &["-m", "venv", env_dir_text.as_str()],
+            Duration::from_secs(10 * 60),
+            &mut log,
+        )?;
+        copy_python_runtime_dlls_to_venv(&base_python, &python, &mut log);
+    }
+
+    install_pytorch_cuda(&python.display().to_string(), log)
+}
+
+fn managed_pytorch_cuda_python_executable() -> Option<String> {
+    std::env::var("LOCALAPPDATA")
+        .ok()
+        .map(|local_app_data| managed_pytorch_cuda_python_path_from_local_app_data(&local_app_data))
+}
+
+fn managed_pytorch_cuda_python_path_from_local_app_data(local_app_data: &str) -> String {
+    PathBuf::from(local_app_data)
+        .join("BenchScope")
+        .join(PYTORCH_CUDA_MANAGED_ENV_DIR)
+        .join("Scripts")
+        .join("python.exe")
+        .display()
+        .to_string()
+}
+
+fn managed_pytorch_cuda_env_dir() -> Option<PathBuf> {
+    std::env::var("LOCALAPPDATA").ok().map(|local_app_data| {
+        PathBuf::from(local_app_data)
+            .join("BenchScope")
+            .join(PYTORCH_CUDA_MANAGED_ENV_DIR)
+    })
+}
+
+fn find_python_for_managed_pytorch_cuda() -> Result<String> {
+    let managed = managed_pytorch_cuda_python_executable().map(|path| normalize_python_candidate(&path));
+    for candidate in pytorch_managed_install_base_candidates() {
+        if managed
+            .as_ref()
+            .is_some_and(|managed| normalize_python_candidate(&candidate) == *managed)
+        {
+            continue;
+        }
+        if python_can_create_venv(&candidate) {
+            return Ok(candidate);
+        }
+    }
+
+    Err(anyhow!(
+        "No usable Python executable was found to create the managed PyTorch environment. Install Python 3.10+ or use a BenchScope package that bundles a Python runtime."
+    ))
+}
+
+fn pytorch_managed_install_base_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Ok(python) = std::env::var("PYTHON") {
+        push_python_candidate(&mut candidates, &python);
+    }
+    for candidate in discover_py_launcher_python_paths() {
+        push_python_candidate(&mut candidates, &candidate);
+    }
+    push_standard_python_candidates(&mut candidates);
+    push_python_candidate(&mut candidates, "python");
+    push_python_candidate(&mut candidates, "python3");
+    candidates
+}
+
+fn python_can_create_venv(candidate: &str) -> bool {
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        return false;
+    }
+    let mut command = Command::new(candidate);
+    command.arg("-c").arg("import venv, sys; print(sys.executable)");
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW_RAW);
+    command
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn copy_python_runtime_dlls_to_venv<F>(base_python: &str, venv_python: &PathBuf, log: &mut F)
+where
+    F: FnMut(String),
+{
+    let Some(base_dir) = PathBuf::from(base_python).parent().map(PathBuf::from) else {
+        return;
+    };
+    let Some(venv_dir) = venv_python.parent() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(&base_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let lower = file_name.to_ascii_lowercase();
+        let should_copy = (lower.starts_with("python") && lower.ends_with(".dll"))
+            || (lower.starts_with("vcruntime") && lower.ends_with(".dll"));
+        if !should_copy {
+            continue;
+        }
+
+        let destination = venv_dir.join(file_name);
+        if destination.is_file() {
+            continue;
+        }
+        match fs::copy(&path, &destination) {
+            Ok(_) => log(format!("Copied runtime DLL {file_name} into the managed environment")),
+            Err(err) => log(format!("Could not copy runtime DLL {file_name}: {err}")),
+        }
+    }
+}
+
 fn pytorch_cuda_install_command_preview(python: &str) -> String {
     format!(
         "{} -m pip install --upgrade {} --index-url {}",
@@ -213,35 +359,43 @@ fn pytorch_python_candidates() -> Vec<String> {
         push_python_candidate(&mut candidates, &python);
     }
 
+    #[cfg(windows)]
+    if let Some(python) = managed_pytorch_cuda_python_executable() {
+        push_python_file_candidate(&mut candidates, python);
+    }
+
     for candidate in discover_py_launcher_python_paths() {
         push_python_candidate(&mut candidates, &candidate);
     }
 
+    push_standard_python_candidates(&mut candidates);
+    push_python_candidate(&mut candidates, "python");
+    push_python_candidate(&mut candidates, "python3");
+    candidates
+}
+
+fn push_standard_python_candidates(candidates: &mut Vec<String>) {
     #[cfg(windows)]
     {
         for version in ["314", "313", "312", "311", "310", "39"] {
             if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
                 push_python_file_candidate(
-                    &mut candidates,
+                    candidates,
                     format!(r"{local_app_data}\Programs\Python\Python{version}\python.exe"),
                 );
             }
             push_python_file_candidate(
-                &mut candidates,
+                candidates,
                 format!(r"C:\Python{version}\python.exe"),
             );
         }
         if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
             push_python_file_candidate(
-                &mut candidates,
+                candidates,
                 format!(r"{local_app_data}\Python\bin\python.exe"),
             );
         }
     }
-
-    push_python_candidate(&mut candidates, "python");
-    push_python_candidate(&mut candidates, "python3");
-    candidates
 }
 
 fn discover_py_launcher_python_paths() -> Vec<String> {

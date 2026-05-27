@@ -693,6 +693,14 @@ mod tests {
     }
 
     #[test]
+    fn managed_pytorch_python_path_uses_benchscope_local_app_data() {
+        let path = managed_pytorch_cuda_python_path_from_local_app_data("LocalData");
+        let normalized = path.replace('\\', "/");
+
+        assert!(normalized.ends_with("LocalData/BenchScope/pytorch-cu128/Scripts/python.exe"));
+    }
+
+    #[test]
     fn preferred_pytorch_python_candidates_are_deduplicated() {
         let candidates = pytorch_python_candidates_with_preferred("python");
 

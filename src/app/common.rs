@@ -104,11 +104,14 @@ fn load_startup_data(tx: &Sender<StartupEvent>) -> StartupData {
     let ai_training = AiTrainingBenchmarkState::new();
     startup_progress(tx, 0.975, "Preparing GPU memory benchmark");
     let gpu_memory = GpuMemoryBenchmarkState::new();
-    startup_progress(tx, 0.98, "Starting safe sensor sampler");
+    startup_progress(tx, 0.98, "Checking setup requirements");
+    let setup_detection = detect_setup_environment(&adapters);
+    startup_progress(tx, 0.99, "Starting safe sensor sampler");
 
     StartupData {
         adapters,
         cpu_info,
+        setup_detection,
         drive,
         storage_health,
         ram,
@@ -132,6 +135,7 @@ impl BenchScopeApp {
         let StartupData {
             adapters,
             cpu_info,
+            setup_detection,
             drive,
             storage_health,
             ram,
@@ -156,6 +160,8 @@ impl BenchScopeApp {
             main_menu_category: None,
             adapters,
             cpu_info,
+            setup_detection,
+            setup_assistant: SetupAssistantState::new(),
             selected_adapter,
             size_text: DEFAULT_SIZES[6].to_string(),
             stress_size_text: DEFAULT_SIZES[0].to_string(),
@@ -209,6 +215,9 @@ impl BenchScopeApp {
             fullscreen: false,
         };
         app.log("Application started");
+        if app.setup_should_open() {
+            app.setup_assistant.visible = true;
+        }
         if app.adapters.is_empty() {
             app.status = "No wgpu adapters found".to_owned();
             app.log("No wgpu adapters found");

@@ -139,6 +139,7 @@ impl BenchScopeApp {
             AppView::MatrixStressTest => self.ui_matrix_stress_test(ui),
             AppView::MatrixBenchmark => self.ui_matrix_benchmark(ui, &ctx),
         }
+        self.ui_setup_assistant(&ctx);
     }
 
     fn sync_pytorch_cuda_from_ai_training(&mut self) {
