@@ -1,24 +1,16 @@
-const TIMELINE_SAMPLE_INTERVAL_MS: u64 = 1_000;
+const TIMELINE_SAMPLE_INTERVAL_MS: u64 = 500;
 const TIMELINE_MAX_SAMPLES: usize = 3_600;
 const TIMELINE_COMPLETED_LIMIT: usize = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TimelineScope {
-    MatrixBenchmark,
     MatrixStress,
-    GpuMemory,
-    DriveBenchmark,
-    AiTraining,
 }
 
 impl TimelineScope {
     fn label(self) -> &'static str {
         match self {
-            Self::MatrixBenchmark => "Matrix benchmark",
             Self::MatrixStress => "Matrix stress",
-            Self::GpuMemory => "GPU memory",
-            Self::DriveBenchmark => "Drive benchmark",
-            Self::AiTraining => "AI training",
         }
     }
 }
@@ -357,7 +349,13 @@ fn analyze_timeline(timeline: &RunTimeline) -> TimelineSummary {
         .max_by(|left, right| left.value.total_cmp(&right.value));
     let throughput_drop_percent = timeline_throughput_drop_percent(&throughput_samples);
     let max_temp_rise = timeline_max_temperature_rise(timeline);
-    let peak_temp_warning = timeline_peak_warning(timeline.scope, peak_cpu_temp_c, peak_gpu_temp_c, peak_gpu_memory_temp_c, peak_drive_temp_c, peak_memory_temp_c);
+    let peak_temp_warning = timeline_peak_warning(
+        peak_cpu_temp_c,
+        peak_gpu_temp_c,
+        peak_gpu_memory_temp_c,
+        peak_drive_temp_c,
+        peak_memory_temp_c,
+    );
     let mut findings = Vec::new();
     if let Some(drop) = throughput_drop_percent {
         if drop >= 20.0 {
@@ -484,7 +482,6 @@ fn timeline_max_temperature_rise(timeline: &RunTimeline) -> Option<f32> {
 }
 
 fn timeline_peak_warning(
-    scope: TimelineScope,
     cpu: Option<f32>,
     gpu: Option<f32>,
     vram: Option<f32>,
@@ -506,9 +503,6 @@ fn timeline_peak_warning(
     }
     if let Some(value) = memory.filter(|value| *value >= SensorKind::Memory.warning_c()) {
         candidates.push(("RAM", value));
-    }
-    if scope == TimelineScope::DriveBenchmark {
-        candidates.sort_by_key(|(label, _)| if *label == "SSD" { 0 } else { 1 });
     }
     candidates.into_iter().max_by(|left, right| left.1.total_cmp(&right.1))
 }

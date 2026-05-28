@@ -35,13 +35,6 @@ struct SetupDetection {
     managed_pytorch_install_base_available: bool,
 }
 
-#[derive(Clone, Debug)]
-struct SetupAssistantState {
-    visible: bool,
-    dismissed_this_session: bool,
-    dismissed_persisted: bool,
-}
-
 struct BenchScopeRoot {
     startup_rx: Receiver<StartupEvent>,
     startup_progress: StartupProgress,
@@ -52,10 +45,10 @@ struct BenchScopeRoot {
 struct BenchScopeApp {
     view: AppView,
     main_menu_category: Option<MenuCategory>,
+    main_menu_search_text: String,
     adapters: Vec<AdapterInfo>,
     cpu_info: CpuInfo,
     setup_detection: SetupDetection,
-    setup_assistant: SetupAssistantState,
     selected_adapter: usize,
     size_text: String,
     stress_size_text: String,

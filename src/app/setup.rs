@@ -20,12 +20,11 @@ struct SetupAssistantItem {
     action: Option<SetupAction>,
 }
 
-impl SetupAssistantState {
-    fn new() -> Self {
-        Self {
-            visible: false,
-            dismissed_this_session: false,
-            dismissed_persisted: setup_dismissed_marker_exists(),
+impl SetupAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::InstallManagedPytorchCuda => "Install",
+            Self::ProbeManagedPytorchCuda => "Probe",
         }
     }
 }
@@ -48,15 +47,6 @@ fn detect_setup_environment(adapters: &[AdapterInfo]) -> SetupDetection {
 }
 
 impl BenchScopeApp {
-    fn setup_should_open(&self) -> bool {
-        !self.setup_assistant.dismissed_this_session
-            && !self.setup_assistant.dismissed_persisted
-            && self
-                .setup_items()
-                .iter()
-                .any(|item| item.state == SetupItemState::Attention)
-    }
-
     fn refresh_setup_detection(&mut self) {
         self.setup_detection = detect_setup_environment(&self.adapters);
     }
@@ -228,98 +218,103 @@ impl BenchScopeApp {
         items
     }
 
-    fn ui_setup_assistant(&mut self, ctx: &egui::Context) {
-        if !self.setup_assistant.visible {
+    fn ui_setup_panel(&mut self, ui: &mut egui::Ui) {
+        let items = self
+            .setup_items()
+            .into_iter()
+            .filter(|item| item.state != SetupItemState::Ready)
+            .collect::<Vec<_>>();
+        if items.is_empty() {
             return;
         }
 
-        let mut open = true;
-        egui::Window::new("BenchScope setup")
-            .collapsible(false)
-            .resizable(true)
-            .default_width(760.0)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.label("Review required runtime pieces and optional accelerators for this device.");
-                ui.add_space(8.0);
-                egui::ScrollArea::vertical()
-                    .max_height(360.0)
-                    .show(ui, |ui| {
-                        egui::Grid::new("setup_assistant_grid")
-                            .num_columns(5)
-                            .striped(true)
-                            .spacing([12.0, 8.0])
-                            .show(ui, |ui| {
-                                ui.strong("Status");
-                                ui.strong("Item");
-                                ui.strong("Type");
-                                ui.strong("Details");
-                                ui.strong("Action");
-                                ui.end_row();
-
-                                for item in self.setup_items() {
-                                    let (label, color) = setup_state_label_color(item.state);
-                                    ui.colored_label(color, label);
-                                    ui.label(item.title);
-                                    ui.label(item.requirement);
-                                    ui.label(item.detail);
-                                    match item.action {
-                                        Some(SetupAction::InstallManagedPytorchCuda) => {
-                                            let enabled = !self.running
-                                                && !self.pytorch_probe_running
-                                                && !self.pytorch_install_running
-                                                && !self.ai_training.pytorch_probe_running
-                                                && !self.ai_training.pytorch_install_running;
-                                            ui.add_enabled_ui(enabled, |ui| {
-                                                if ui.button("Install").clicked() {
-                                                    self.start_managed_pytorch_cuda_install();
-                                                }
-                                            });
-                                        }
-                                        Some(SetupAction::ProbeManagedPytorchCuda) => {
-                                            let enabled = !self.running
-                                                && !self.pytorch_probe_running
-                                                && !self.pytorch_install_running
-                                                && !self.ai_training.pytorch_probe_running
-                                                && !self.ai_training.pytorch_install_running;
-                                            ui.add_enabled_ui(enabled, |ui| {
-                                                if ui.button("Probe").clicked() {
-                                                    self.start_managed_pytorch_cuda_probe();
-                                                }
-                                            });
-                                        }
-                                        None => {
-                                            ui.label("");
-                                        }
-                                    }
-                                    ui.end_row();
-                                }
-                            });
-                    });
-
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgb(22, 25, 31))
+            .stroke(egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgb(68, 76, 90),
+            ))
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(16, 14))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("Setup & dependencies")
+                            .strong()
+                            .size(17.0)
+                            .color(egui::Color32::from_rgb(236, 240, 246)),
+                    );
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!("{} item(s) need attention", items.len()))
+                            .size(14.5)
+                            .color(egui::Color32::from_rgb(176, 185, 198)),
+                    );
                     if ui.button("Refresh").clicked() {
                         self.refresh_setup_detection();
                     }
-                    if ui.button("Remind me later").clicked() {
-                        self.setup_assistant.visible = false;
-                        self.setup_assistant.dismissed_this_session = true;
+                });
+
+                ui.add_space(8.0);
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        ui.separator();
                     }
-                    if ui.button("Don't show again").clicked() {
-                        if let Err(err) = persist_setup_dismissed_marker() {
-                            self.log(format!("Could not persist setup dismissal: {err:#}"));
-                        }
-                        self.setup_assistant.visible = false;
-                        self.setup_assistant.dismissed_this_session = true;
-                        self.setup_assistant.dismissed_persisted = true;
+                    self.ui_setup_panel_item(ui, item);
+                }
+            });
+    }
+
+    fn ui_setup_panel_item(&mut self, ui: &mut egui::Ui, item: &SetupAssistantItem) {
+        let (status, color) = setup_state_label_color(item.state);
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(color, status);
+            ui.label(
+                egui::RichText::new(item.title)
+                    .strong()
+                    .color(egui::Color32::from_rgb(234, 238, 244)),
+            );
+            ui.label(
+                egui::RichText::new(item.requirement)
+                    .size(13.0)
+                    .color(egui::Color32::from_rgb(151, 162, 178)),
+            );
+            if let Some(action) = item.action {
+                let enabled = self.setup_action_enabled();
+                ui.add_enabled_ui(enabled, |ui| {
+                    if ui
+                        .add_sized([92.0, 30.0], egui::Button::new(action.label()))
+                        .clicked()
+                    {
+                        self.run_setup_action(action);
                     }
                 });
-            });
+            }
+        });
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(&item.detail)
+                    .size(14.0)
+                    .color(egui::Color32::from_rgb(181, 191, 204)),
+            )
+            .wrap(),
+        );
+    }
 
-        if !open {
-            self.setup_assistant.visible = false;
-            self.setup_assistant.dismissed_this_session = true;
+    fn setup_action_enabled(&self) -> bool {
+        !self.running
+            && !self.pytorch_probe_running
+            && !self.pytorch_install_running
+            && !self.ai_training.pytorch_probe_running
+            && !self.ai_training.pytorch_install_running
+    }
+
+    fn run_setup_action(&mut self, action: SetupAction) {
+        match action {
+            SetupAction::InstallManagedPytorchCuda => self.start_managed_pytorch_cuda_install(),
+            SetupAction::ProbeManagedPytorchCuda => self.start_managed_pytorch_cuda_probe(),
         }
     }
 
@@ -385,28 +380,6 @@ fn setup_state_label_color(state: SetupItemState) -> (&'static str, egui::Color3
         SetupItemState::Attention => ("Needs setup", egui::Color32::YELLOW),
         SetupItemState::Installing => ("Working", egui::Color32::LIGHT_BLUE),
     }
-}
-
-fn setup_dismissed_marker_exists() -> bool {
-    setup_dismissed_marker_path().is_some_and(|path| path.is_file())
-}
-
-fn persist_setup_dismissed_marker() -> Result<()> {
-    let path = setup_dismissed_marker_path()
-        .ok_or_else(|| anyhow!("LOCALAPPDATA is not available"))?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create setup marker directory {}", parent.display())
-        })?;
-    }
-    fs::write(&path, "dismissed\n")
-        .with_context(|| format!("failed to write setup marker {}", path.display()))
-}
-
-fn setup_dismissed_marker_path() -> Option<PathBuf> {
-    std::env::var("LOCALAPPDATA")
-        .ok()
-        .map(|local| PathBuf::from(local).join("BenchScope").join("setup-dismissed.txt"))
 }
 
 fn vcruntime_available() -> bool {

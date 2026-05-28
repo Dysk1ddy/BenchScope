@@ -2469,6 +2469,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn main_menu_sub_option_search_keeps_empty_query_order() {
+        let items = main_menu_items_for_category(MenuCategory::Gpu);
+        let filtered = main_menu_filter_items(&items, "   ");
+        let filtered_views = filtered
+            .into_iter()
+            .map(|item| item.view)
+            .collect::<Vec<_>>();
+
+        assert_eq!(filtered_views, main_menu_views_for_category(MenuCategory::Gpu));
+    }
+
+    #[test]
+    fn main_menu_sub_option_search_matches_title_and_description() {
+        let gpu_items = main_menu_items_for_category(MenuCategory::Gpu);
+        let training_matches = main_menu_filter_items(&gpu_items, "training precision")
+            .into_iter()
+            .map(|item| item.view)
+            .collect::<Vec<_>>();
+        assert_eq!(training_matches, vec![AppView::AiTrainingBenchmark]);
+
+        let io_items = main_menu_items_for_category(MenuCategory::Io);
+        let network_matches = main_menu_filter_items(&io_items, "dns packet")
+            .into_iter()
+            .map(|item| item.view)
+            .collect::<Vec<_>>();
+        assert_eq!(network_matches, vec![AppView::NetworkDiagnostic]);
+    }
+
     fn make_test_timeline(scope: TimelineScope, samples: Vec<TimelineSample>) -> RunTimeline {
         RunTimeline {
             run_id: "test-timeline".to_owned(),
@@ -2519,6 +2548,11 @@ mod tests {
             finding.message.contains("Throughput dropped")
                 || finding.message.contains("Temperature rose")
         }));
+    }
+
+    #[test]
+    fn timeline_sample_interval_supports_two_hz_graph_polling() {
+        assert!(TIMELINE_SAMPLE_INTERVAL_MS <= 500);
     }
 
     #[test]

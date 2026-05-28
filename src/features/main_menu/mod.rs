@@ -116,6 +116,22 @@ impl MainMenuItem {
     fn belongs_to(self, category: MenuCategory) -> bool {
         self.categories.contains(&category)
     }
+
+    fn matches_search_tokens(self, tokens: &[String]) -> bool {
+        let title = self.title.to_ascii_lowercase();
+        let description = self.description.to_ascii_lowercase();
+        let categories = self
+            .categories
+            .iter()
+            .map(|category| category.label().to_ascii_lowercase())
+            .collect::<Vec<_>>();
+
+        tokens.iter().all(|token| {
+            title.contains(token)
+                || description.contains(token)
+                || categories.iter().any(|category| category.contains(token))
+        })
+    }
 }
 
 impl BenchScopeApp {
@@ -128,7 +144,11 @@ impl BenchScopeApp {
                 .ctx()
                 .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
-            next_category = None;
+            if self.main_menu_search_text.is_empty() {
+                next_category = None;
+            } else {
+                self.main_menu_search_text.clear();
+            }
         }
 
         egui::CentralPanel::default()
@@ -152,6 +172,7 @@ impl BenchScopeApp {
                                     .clicked()
                                 {
                                     next_category = None;
+                                    self.main_menu_search_text.clear();
                                 }
                             }
                         });
@@ -186,14 +207,27 @@ impl BenchScopeApp {
 
                                 if let Some(category) = selected_category {
                                     let menu_items = main_menu_items_for_category(category);
-                                    let cards = menu_items
+                                    ui_main_menu_search_bar(
+                                        ui,
+                                        content_width,
+                                        &mut self.main_menu_search_text,
+                                    );
+                                    ui.add_space(16.0);
+
+                                    let filtered_items = main_menu_filter_items(
+                                        &menu_items,
+                                        &self.main_menu_search_text,
+                                    );
+                                    let cards = filtered_items
                                         .iter()
                                         .map(|item| item.card())
                                         .collect::<Vec<_>>();
-                                    if let Some(index) =
+                                    if cards.is_empty() {
+                                        ui_main_menu_empty_search(ui, &self.main_menu_search_text);
+                                    } else if let Some(index) =
                                         ui_main_menu_card_grid(ui, content_width, &cards)
                                     {
-                                        selected_view = Some(menu_items[index].view);
+                                        selected_view = Some(filtered_items[index].view);
                                     }
                                 } else {
                                     let category_items = main_menu_category_items();
@@ -214,6 +248,7 @@ impl BenchScopeApp {
                                     &self.cpu_info,
                                     self.adapters.len(),
                                 );
+                                self.ui_setup_panel(ui);
                                 ui.add_space(10.0);
                             });
                     });
@@ -354,6 +389,27 @@ fn main_menu_items_for_category(category: MenuCategory) -> Vec<MainMenuItem> {
         .collect()
 }
 
+fn main_menu_filter_items(items: &[MainMenuItem], query: &str) -> Vec<MainMenuItem> {
+    let tokens = main_menu_search_tokens(query);
+    if tokens.is_empty() {
+        return items.to_vec();
+    }
+
+    items
+        .iter()
+        .copied()
+        .filter(|item| item.matches_search_tokens(&tokens))
+        .collect()
+}
+
+fn main_menu_search_tokens(query: &str) -> Vec<String> {
+    query
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
 #[cfg(test)]
 fn main_menu_views_for_category(category: MenuCategory) -> Vec<AppView> {
     main_menu_items_for_category(category)
@@ -412,6 +468,46 @@ fn ui_main_menu_card_grid(
         }
     }
     clicked_index
+}
+
+fn ui_main_menu_search_bar(ui: &mut egui::Ui, content_width: f32, query: &mut String) {
+    let search_width = content_width.min(620.0).max(1.0);
+    ui.vertical_centered(|ui| {
+        ui.set_width(search_width);
+        ui.horizontal(|ui| {
+            let input_width = (ui.available_width() - 48.0).max(1.0);
+            ui.add_sized(
+                [input_width, 38.0],
+                egui::TextEdit::singleline(query)
+                    .hint_text("Search sub-options")
+                    .desired_width(input_width),
+            )
+            .on_hover_text("Filter tools in this category");
+
+            if ui
+                .add_enabled(
+                    !query.is_empty(),
+                    egui::Button::new("X").min_size(egui::vec2(38.0, 38.0)),
+                )
+                .on_hover_text("Clear search")
+                .clicked()
+            {
+                query.clear();
+            }
+        });
+    });
+}
+
+fn ui_main_menu_empty_search(ui: &mut egui::Ui, query: &str) {
+    ui.add_space(16.0);
+    ui.vertical_centered(|ui| {
+        ui.label(
+            egui::RichText::new(format!("No sub-options match \"{}\"", query.trim()))
+                .size(17.0)
+                .color(egui::Color32::from_rgb(190, 198, 210)),
+        );
+    });
+    ui.add_space(18.0);
 }
 
 fn ui_main_menu_card(

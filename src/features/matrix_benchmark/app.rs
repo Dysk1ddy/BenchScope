@@ -95,10 +95,6 @@ impl BenchScopeApp {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         self.begin_temperature_run(TemperatureScope::Matrix);
-        self.start_timeline(
-            TimelineScope::MatrixBenchmark,
-            format!("Matrix benchmark {size}x{size} on {}", adapter.label()),
-        );
         self.cancel = Some(cancel);
         self.running = true;
         self.progress = 0.0;
@@ -416,16 +412,6 @@ impl BenchScopeApp {
                                 result.cpu_temperature = report.cpu;
                                 result.gpu_temperature = report.gpu;
                             }
-                            let final_throughput = Some(matrix_result_timeline_throughput(&result));
-                            let final_phase = format!(
-                                "Benchmark complete: GPU total {} ms",
-                                format_ms(Some(result.gpu_total_ms))
-                            );
-                            self.finish_timeline_run(
-                                TimelineScope::MatrixBenchmark,
-                                final_throughput,
-                                final_phase,
-                            );
                             self.log(format!(
                                 "Benchmark complete: CPU {} ms ({}, {}), GPU total {} ms, GPU compute {} ms, path {}, dispatches {}, max dispatch {} ms",
                                 format_cpu_ms(&result),
@@ -445,11 +431,6 @@ impl BenchScopeApp {
                         }
                         Err(err) => {
                             let _ = self.finish_and_log_temperature_run();
-                            self.finish_timeline_run(
-                                TimelineScope::MatrixBenchmark,
-                                None,
-                                err.clone(),
-                            );
                             if !err.to_ascii_lowercase().contains("canceled") {
                                 let _ = crashlog_write_error_report("Matrix benchmark error", &err);
                             }

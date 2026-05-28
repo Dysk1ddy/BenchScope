@@ -158,10 +158,10 @@ impl BenchScopeApp {
         let mut app = Self {
             view: AppView::MainMenu,
             main_menu_category: None,
+            main_menu_search_text: String::new(),
             adapters,
             cpu_info,
             setup_detection,
-            setup_assistant: SetupAssistantState::new(),
             selected_adapter,
             size_text: DEFAULT_SIZES[6].to_string(),
             stress_size_text: DEFAULT_SIZES[0].to_string(),
@@ -215,9 +215,6 @@ impl BenchScopeApp {
             fullscreen: false,
         };
         app.log("Application started");
-        if app.setup_should_open() {
-            app.setup_assistant.visible = true;
-        }
         if app.adapters.is_empty() {
             app.status = "No wgpu adapters found".to_owned();
             app.log("No wgpu adapters found");

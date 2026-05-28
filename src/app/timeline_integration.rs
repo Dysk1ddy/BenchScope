@@ -44,17 +44,7 @@ impl BenchScopeApp {
 
     fn current_timeline_phase(&self, scope: TimelineScope) -> String {
         match scope {
-            TimelineScope::MatrixBenchmark => self.status.clone(),
             TimelineScope::MatrixStress => self.status.clone(),
-            TimelineScope::GpuMemory => self.gpu_memory.status.clone(),
-            TimelineScope::DriveBenchmark => self.drive.status.clone(),
-            TimelineScope::AiTraining => {
-                if self.ai_training.phase.trim().is_empty() {
-                    self.ai_training.status.clone()
-                } else {
-                    self.ai_training.phase.clone()
-                }
-            }
         }
     }
 
@@ -74,48 +64,6 @@ impl BenchScopeApp {
                         })
                     })
             }
-            TimelineScope::GpuMemory => {
-                (self.gpu_memory.running
-                    && self.gpu_memory.timeline_elapsed_s > 0.0
-                    && self.gpu_memory.timeline_bytes_processed > 0)
-                    .then(|| {
-                        timeline_throughput(
-                            "GPU memory bandwidth",
-                            self.gpu_memory.timeline_bytes_processed as f64
-                                / self.gpu_memory.timeline_elapsed_s
-                                / 1_000_000_000.0,
-                            "GB/s",
-                        )
-                    })
-            }
-            TimelineScope::DriveBenchmark => {
-                (self.drive.running
-                    && self.drive.timeline_elapsed_s > 0.0
-                    && self.drive.timeline_bytes_processed > 0)
-                    .then(|| {
-                        timeline_throughput(
-                            "Drive throughput",
-                            self.drive.timeline_bytes_processed as f64
-                                / self.drive.timeline_elapsed_s
-                                / 1_000_000.0,
-                            "MB/s",
-                        )
-                    })
-            }
-            TimelineScope::AiTraining => {
-                (self.ai_training.running
-                    && self.ai_training.timeline_elapsed_s > 0.0
-                    && self.ai_training.timeline_completed_steps > 0)
-                    .then(|| {
-                        timeline_throughput(
-                            "Training progress",
-                            self.ai_training.timeline_completed_steps as f64
-                                / self.ai_training.timeline_elapsed_s,
-                            "steps/s",
-                        )
-                    })
-            }
-            TimelineScope::MatrixBenchmark => None,
         }
     }
 
@@ -564,44 +512,4 @@ fn ui_timeline_findings(ui: &mut egui::Ui, summary: &TimelineSummary) {
         };
         ui.colored_label(color, &finding.message);
     }
-}
-
-fn drive_result_timeline_throughput(
-    result: &DriveBenchmarkResult,
-) -> Option<TimelineThroughputSample> {
-    let value = if result.test.is_read() {
-        result.read_mbps
-    } else {
-        result.write_mbps
-    }?;
-    Some(timeline_throughput(result.test.label(), value, "MB/s"))
-}
-
-fn gpu_memory_result_timeline_throughput(
-    result: &GpuMemoryBenchmarkResult,
-) -> TimelineThroughputSample {
-    timeline_throughput(
-        result.test.label(),
-        result.average_bandwidth_gbps,
-        "GB/s",
-    )
-}
-
-fn ai_training_result_timeline_throughput(
-    result: &AiTrainingResult,
-) -> Option<TimelineThroughputSample> {
-    result
-        .throughput_value
-        .map(|value| timeline_throughput(result.workload.label(), value, result.throughput_label))
-}
-
-fn matrix_result_timeline_throughput(result: &BenchmarkResult) -> TimelineThroughputSample {
-    let n = result.size as f64;
-    let flops = 2.0 * n * n * n;
-    let value = if result.gpu_total_ms > 0.0 {
-        flops / (result.gpu_total_ms / 1000.0) / 1.0e12
-    } else {
-        0.0
-    };
-    timeline_throughput("GPU total throughput", value, "TFLOP/s")
 }
