@@ -162,6 +162,8 @@ impl BenchScopeApp {
             adapters,
             cpu_info,
             setup_detection,
+            setup_task_running: false,
+            setup_task_progress: None,
             selected_adapter,
             size_text: DEFAULT_SIZES[6].to_string(),
             stress_size_text: DEFAULT_SIZES[0].to_string(),

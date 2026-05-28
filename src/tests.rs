@@ -701,6 +701,54 @@ mod tests {
     }
 
     #[test]
+    fn setup_progress_parser_reads_installer_progress_lines() {
+        let progress = parse_setup_progress_line(
+            "BENCHSCOPE_PROGRESS\t0.42\tDownloading LibreHardwareMonitor",
+            "LibreHardwareMonitor WMI",
+        )
+        .unwrap();
+
+        assert_eq!(progress.title, "LibreHardwareMonitor WMI");
+        assert_eq!(progress.detail, "Downloading LibreHardwareMonitor");
+        assert_eq!(progress.progress, 0.42);
+    }
+
+    #[test]
+    fn setup_install_actions_are_deduplicated_in_panel_order() {
+        let items = vec![
+            SetupAssistantItem {
+                title: "A",
+                requirement: "Required",
+                state: SetupItemState::Attention,
+                detail: String::new(),
+                action: Some(SetupAction::InstallManagedPytorchCuda),
+            },
+            SetupAssistantItem {
+                title: "B",
+                requirement: "Optional",
+                state: SetupItemState::Attention,
+                detail: String::new(),
+                action: Some(SetupAction::BuildSensorServiceCompanion),
+            },
+            SetupAssistantItem {
+                title: "C",
+                requirement: "Optional",
+                state: SetupItemState::Attention,
+                detail: String::new(),
+                action: Some(SetupAction::InstallManagedPytorchCuda),
+            },
+        ];
+
+        assert_eq!(
+            setup_install_actions(&items),
+            vec![
+                SetupAction::InstallManagedPytorchCuda,
+                SetupAction::BuildSensorServiceCompanion
+            ]
+        );
+    }
+
+    #[test]
     fn preferred_pytorch_python_candidates_are_deduplicated() {
         let candidates = pytorch_python_candidates_with_preferred("python");
 
@@ -2470,7 +2518,7 @@ mod tests {
     }
 
     #[test]
-    fn main_menu_sub_option_search_keeps_empty_query_order() {
+    fn main_menu_search_keeps_empty_query_order() {
         let items = main_menu_items_for_category(MenuCategory::Gpu);
         let filtered = main_menu_filter_items(&items, "   ");
         let filtered_views = filtered
@@ -2482,7 +2530,7 @@ mod tests {
     }
 
     #[test]
-    fn main_menu_sub_option_search_matches_title_and_description() {
+    fn main_menu_search_matches_title_and_description() {
         let gpu_items = main_menu_items_for_category(MenuCategory::Gpu);
         let training_matches = main_menu_filter_items(&gpu_items, "training precision")
             .into_iter()

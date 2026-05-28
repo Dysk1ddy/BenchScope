@@ -35,6 +35,19 @@ struct SetupDetection {
     managed_pytorch_install_base_available: bool,
 }
 
+#[derive(Clone, Debug)]
+struct SetupTaskProgress {
+    title: String,
+    detail: String,
+    progress: f32,
+}
+
+#[derive(Clone, Debug)]
+struct SetupTaskOutcome {
+    message: String,
+    pytorch_environment: Option<PyTorchCudaEnvironment>,
+}
+
 struct BenchScopeRoot {
     startup_rx: Receiver<StartupEvent>,
     startup_progress: StartupProgress,
@@ -49,6 +62,8 @@ struct BenchScopeApp {
     adapters: Vec<AdapterInfo>,
     cpu_info: CpuInfo,
     setup_detection: SetupDetection,
+    setup_task_running: bool,
+    setup_task_progress: Option<SetupTaskProgress>,
     selected_adapter: usize,
     size_text: String,
     stress_size_text: String,

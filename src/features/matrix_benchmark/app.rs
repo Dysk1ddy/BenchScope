@@ -519,6 +519,8 @@ impl BenchScopeApp {
                 }
                 WorkerEvent::PyTorchProbeDone(result) => {
                     self.pytorch_probe_running = false;
+                    self.setup_task_running = false;
+                    self.setup_task_progress = None;
                     self.eta_text.clear();
                     match result {
                         Ok(environment) => {
@@ -554,6 +556,8 @@ impl BenchScopeApp {
                 WorkerEvent::PyTorchInstallDone(result) => {
                     self.pytorch_install_running = false;
                     self.pytorch_probe_running = false;
+                    self.setup_task_running = false;
+                    self.setup_task_progress = None;
                     self.pending_pytorch_install = false;
                     self.eta_text.clear();
                     match result {
@@ -570,6 +574,36 @@ impl BenchScopeApp {
                                 self.log(line);
                             }
                             self.pytorch_probe = Some(environment);
+                        }
+                        Err(err) => {
+                            self.status = err.clone();
+                            self.log(err);
+                        }
+                    }
+                    self.refresh_setup_detection();
+                }
+                WorkerEvent::SetupTaskProgress(progress) => {
+                    self.eta_text = progress.detail.clone();
+                    self.setup_task_progress = Some(progress);
+                }
+                WorkerEvent::SetupTaskDone(result) => {
+                    self.setup_task_running = false;
+                    self.setup_task_progress = None;
+                    self.eta_text.clear();
+                    match result {
+                        Ok(outcome) => {
+                            self.status = outcome.message.clone();
+                            self.log(outcome.message);
+                            if let Some(environment) = outcome.pytorch_environment {
+                                self.pytorch_python = environment.python_executable.clone();
+                                self.ai_training.pytorch_python =
+                                    environment.python_executable.clone();
+                                self.ai_training.pytorch_probe = Some(environment.clone());
+                                for line in environment.summary_lines() {
+                                    self.log(line);
+                                }
+                                self.pytorch_probe = Some(environment);
+                            }
                         }
                         Err(err) => {
                             self.status = err.clone();

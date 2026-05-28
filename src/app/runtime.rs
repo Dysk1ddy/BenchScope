@@ -85,6 +85,7 @@ impl BenchScopeApp {
             || self.pytorch_install_running
             || self.ai_training.pytorch_probe_running
             || self.ai_training.pytorch_install_running
+            || self.setup_task_running
         {
             ctx.request_repaint_after(Duration::from_millis(100));
         } else if self.view != AppView::MainMenu {

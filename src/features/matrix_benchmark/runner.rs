@@ -6,6 +6,8 @@ enum WorkerEvent {
     RepeatDone(Result<RepeatProgress, String>),
     PyTorchProbeDone(Result<PyTorchCudaEnvironment, String>),
     PyTorchInstallDone(Result<PyTorchCudaEnvironment, String>),
+    SetupTaskProgress(SetupTaskProgress),
+    SetupTaskDone(Result<SetupTaskOutcome, String>),
     Log(String),
 }
 

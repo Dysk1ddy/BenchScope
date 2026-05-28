@@ -139,15 +139,14 @@ impl BenchScopeApp {
         let selected_category = self.main_menu_category;
         let mut next_category = selected_category;
         let mut selected_view = None;
-        if selected_category.is_some()
-            && ui
-                .ctx()
-                .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        if ui
+            .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
-            if self.main_menu_search_text.is_empty() {
-                next_category = None;
-            } else {
+            if !self.main_menu_search_text.is_empty() {
                 self.main_menu_search_text.clear();
+            } else if selected_category.is_some() {
+                next_category = None;
             }
         }
 
@@ -207,6 +206,16 @@ impl BenchScopeApp {
 
                                 if let Some(category) = selected_category {
                                     let menu_items = main_menu_items_for_category(category);
+                                    let cards = menu_items
+                                        .iter()
+                                        .map(|item| item.card())
+                                        .collect::<Vec<_>>();
+                                    if let Some(index) =
+                                        ui_main_menu_card_grid(ui, content_width, &cards)
+                                    {
+                                        selected_view = Some(menu_items[index].view);
+                                    }
+                                } else {
                                     ui_main_menu_search_bar(
                                         ui,
                                         content_width,
@@ -214,31 +223,37 @@ impl BenchScopeApp {
                                     );
                                     ui.add_space(16.0);
 
-                                    let filtered_items = main_menu_filter_items(
-                                        &menu_items,
-                                        &self.main_menu_search_text,
-                                    );
-                                    let cards = filtered_items
-                                        .iter()
-                                        .map(|item| item.card())
-                                        .collect::<Vec<_>>();
-                                    if cards.is_empty() {
-                                        ui_main_menu_empty_search(ui, &self.main_menu_search_text);
-                                    } else if let Some(index) =
-                                        ui_main_menu_card_grid(ui, content_width, &cards)
-                                    {
-                                        selected_view = Some(filtered_items[index].view);
-                                    }
-                                } else {
-                                    let category_items = main_menu_category_items();
-                                    let cards = category_items
-                                        .iter()
-                                        .map(|item| item.card())
-                                        .collect::<Vec<_>>();
-                                    if let Some(index) =
-                                        ui_main_menu_card_grid(ui, content_width, &cards)
-                                    {
-                                        next_category = Some(category_items[index].category);
+                                    if self.main_menu_search_text.trim().is_empty() {
+                                        let category_items = main_menu_category_items();
+                                        let cards = category_items
+                                            .iter()
+                                            .map(|item| item.card())
+                                            .collect::<Vec<_>>();
+                                        if let Some(index) =
+                                            ui_main_menu_card_grid(ui, content_width, &cards)
+                                        {
+                                            next_category = Some(category_items[index].category);
+                                        }
+                                    } else {
+                                        let menu_items = main_menu_tool_items();
+                                        let filtered_items = main_menu_filter_items(
+                                            &menu_items,
+                                            &self.main_menu_search_text,
+                                        );
+                                        let cards = filtered_items
+                                            .iter()
+                                            .map(|item| item.card())
+                                            .collect::<Vec<_>>();
+                                        if cards.is_empty() {
+                                            ui_main_menu_empty_search(
+                                                ui,
+                                                &self.main_menu_search_text,
+                                            );
+                                        } else if let Some(index) =
+                                            ui_main_menu_card_grid(ui, content_width, &cards)
+                                        {
+                                            selected_view = Some(filtered_items[index].view);
+                                        }
                                     }
                                 }
 
@@ -479,7 +494,7 @@ fn ui_main_menu_search_bar(ui: &mut egui::Ui, content_width: f32, query: &mut St
             ui.add_sized(
                 [input_width, 38.0],
                 egui::TextEdit::singleline(query)
-                    .hint_text("Search sub-options")
+                    .hint_text("Search")
                     .desired_width(input_width),
             )
             .on_hover_text("Filter tools in this category");
